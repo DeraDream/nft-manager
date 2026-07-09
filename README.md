@@ -27,13 +27,24 @@ chmod +x nft.sh
 sudo ./nft.sh
 ```
 
-国内服务器可使用 GitHub 代理：
+国内服务器可使用 jsDelivr CDN：
 
 ```bash
-curl -L https://gh-proxy.com/https://raw.githubusercontent.com/DeraDream/nft-manager/main/nft.sh -o nft.sh
+curl -L https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/nft.sh -o nft.sh
+head -3 nft.sh
 chmod +x nft.sh
 sudo ./nft.sh
 ```
+
+正常情况下，`head -3 nft.sh` 应显示：
+
+```bash
+#!/usr/bin/env bash
+#
+# nftables 端口转发管理工具 v1.0
+```
+
+如果看到 `<!DOCTYPE html>`、`Cloudflare`、`403`、`404` 等内容，说明下载到的是网页错误页，不要执行。
 
 进入菜单后选择：
 
@@ -74,7 +85,7 @@ echo 'https://raw.githubusercontent.com/DeraDream/nft-manager/main/nft.sh' | sud
 
 ```bash
 sudo mkdir -p /etc/nftables.d
-echo 'https://gh-proxy.com/https://raw.githubusercontent.com/DeraDream/nft-manager/main/nft.sh' | sudo tee /etc/nftables.d/update-url
+echo 'https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/nft.sh' | sudo tee /etc/nftables.d/update-url
 ```
 
 之后进入菜单选择：
