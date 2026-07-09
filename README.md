@@ -104,7 +104,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 /var/log/nft-forward.log
 ```
 
-## 卸载管理器
+## 卸载
 
 进入菜单选择：
 
@@ -112,7 +112,19 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 1) 卸载 nftables 管理器
 ```
 
-卸载会移除全局命令和 systemd 保活服务，但不会自动清空已有转发规则，也不会卸载系统的 `nftables` 软件包。
+卸载为完整卸载，会删除：
+
+- 全局命令 `/usr/local/bin/nft`
+- 安装目录 `/usr/local/lib/nft-forward`
+- systemd 保活服务
+- 端口转发配置
+- 目标主机库
+- 更新源配置
+- 脚本日志
+- 脚本写入的 sysctl 配置
+- 脚本写入的 logrotate 配置
+
+卸载过程中会询问是否清空当前全部 nftables 运行规则。脚本不会卸载系统的 `nftables` 软件包。
 
 ## 注意
 

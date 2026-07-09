@@ -10,7 +10,6 @@ CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
 UPDATE_URL_FILE="${CONF_DIR}/update-url"
-BACKUP_DIR="${CONF_DIR}/backups"
 MAIN_CONF="/etc/nftables.conf"
 SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
 LOG_FILE="/var/log/nft-forward.log"
@@ -299,7 +298,7 @@ check_port_conflict() {
 
 # ============== 初始化配置文件结构 ==============
 init_conf() {
-    mkdir -p "${CONF_DIR}" "${BACKUP_DIR}" 2>/dev/null || {
+    mkdir -p "${CONF_DIR}" 2>/dev/null || {
         err "无法创建配置目录 ${CONF_DIR}，请检查权限。"
         return 1
     }
@@ -632,15 +631,6 @@ reload_rules() {
     return 0
 }
 
-# ============== 备份配置 ==============
-backup_conf() {
-    if [[ -f "${CONF_FILE}" ]]; then
-        local ts
-        ts=$(date '+%Y%m%d_%H%M%S')
-        cp "${CONF_FILE}" "${BACKUP_DIR}/port-forward.conf.${ts}" 2>/dev/null || true
-    fi
-}
-
 # ============== 开启内核参数：IP 转发 + BBR/fq ==============
 enable_ip_forward() {
     local current
@@ -831,7 +821,7 @@ do_update() {
     info "当前版本: v${SCRIPT_VERSION}"
     info "更新源: ${UPDATE_URL}"
 
-    local tmp_file remote_version install_target backup_file ts
+    local tmp_file remote_version install_target
     tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-forward-update.$$") || true
     if ! download_update_script "$tmp_file"; then
         rm -f "$tmp_file" 2>/dev/null || true
@@ -884,17 +874,6 @@ do_update() {
         return
     }
 
-    ts=$(date '+%Y%m%d_%H%M%S')
-    if [[ -f "$install_target" ]]; then
-        backup_file="${install_target}.bak.${ts}"
-        cp -a "$install_target" "$backup_file" 2>/dev/null || {
-            rm -f "$tmp_file" 2>/dev/null || true
-            err "无法备份当前脚本。"
-            return
-        }
-        info "已备份当前脚本: ${backup_file}"
-    fi
-
     install -m 755 "$tmp_file" "$install_target" 2>/dev/null || {
         rm -f "$tmp_file" 2>/dev/null || true
         err "写入新版脚本失败。"
@@ -939,13 +918,7 @@ install_manager_files() {
     fi
 
     if [[ -e "${GLOBAL_CMD}" ]] && ! grep -qF "exec \"${SCRIPT_INSTALL_FILE}\"" "${GLOBAL_CMD}" 2>/dev/null; then
-        local ts
-        ts=$(date '+%Y%m%d_%H%M%S')
-        mv "${GLOBAL_CMD}" "${GLOBAL_CMD}.bak.${ts}" 2>/dev/null || {
-            err "无法备份已有全局命令 ${GLOBAL_CMD}"
-            return 1
-        }
-        warn "已备份已有 ${GLOBAL_CMD} → ${GLOBAL_CMD}.bak.${ts}"
+        warn "检测到已有 ${GLOBAL_CMD}，将直接覆盖为 nft-manager 入口。"
     fi
 
     cat > "${GLOBAL_CMD}" <<EOF
@@ -998,19 +971,21 @@ install_manager_runtime() {
 
 do_uninstall_manager() {
     echo ""
-    warn "即将卸载 nftables 端口转发管理器。"
-    warn "这会移除全局命令 ${GLOBAL_CMD} 和保活服务 ${KEEPALIVE_SERVICE_NAME}。"
-    warn "不会自动卸载系统 nftables 软件包，也不会清空现有转发规则。"
+    warn "即将完整卸载 nftables 端口转发管理器。"
+    warn "将删除全局命令、安装目录、systemd 保活服务、转发配置、目标主机库、更新源、日志和脚本写入的 sysctl 配置。"
+    warn "不会卸载系统 nftables 软件包。"
     read -rp "确认卸载？[y/N]: " confirm1
     if [[ ! "$confirm1" =~ ^[Yy]$ ]]; then
         info "已取消。"
         return
     fi
-    read -rp "请再次确认卸载管理器？[y/N]: " confirm2
-    if [[ ! "$confirm2" =~ ^[Yy]$ ]]; then
+    read -rp "请再次输入 UNINSTALL 确认完整卸载: " confirm2
+    if [[ "$confirm2" != "UNINSTALL" ]]; then
         info "已取消。"
         return
     fi
+
+    local clear_ruleset
 
     if command -v systemctl &>/dev/null; then
         systemctl disable --now "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -1021,10 +996,37 @@ do_uninstall_manager() {
     fi
 
     rm -f "${GLOBAL_CMD}" 2>/dev/null || true
+    rm -f "${GLOBAL_CMD}.bak."* 2>/dev/null || true
     rm -rf "${SCRIPT_INSTALL_DIR}" 2>/dev/null || true
 
-    info "nftables 端口转发管理器已卸载。"
-    log_action "卸载 nftables 端口转发管理器"
+    if nft_available; then
+        "$NFT_BIN" flush table ip "${TABLE_NAME}" 2>/dev/null || true
+        "$NFT_BIN" delete table ip "${TABLE_NAME}" 2>/dev/null || true
+        read -rp "是否清空当前全部 nftables 运行规则？[y/N]: " clear_ruleset
+        if [[ "$clear_ruleset" =~ ^[Yy]$ ]]; then
+            "$NFT_BIN" flush ruleset 2>/dev/null || true
+            info "已清空当前 nftables 运行规则。"
+        fi
+    fi
+
+    rm -f "${CONF_FILE}" 2>/dev/null || true
+    rm -f "${TARGETS_FILE}" 2>/dev/null || true
+    rm -f "${UPDATE_URL_FILE}" 2>/dev/null || true
+    rm -f "${CONF_DIR}"/*.conf.bak.* 2>/dev/null || true
+    rm -rf "${CONF_DIR}/backups" 2>/dev/null || true
+    rmdir "${CONF_DIR}" 2>/dev/null || true
+
+    rm -f "${SYSCTL_CONF}" 2>/dev/null || true
+    rm -f "${LOGROTATE_CONF}" 2>/dev/null || true
+    rm -f "${LOG_FILE}" 2>/dev/null || true
+    rm -rf /root/nft-manager-uninstall-backup-* 2>/dev/null || true
+
+    if [[ -f "${MAIN_CONF}" ]] && grep -qF 'include "/etc/nftables.d/*.conf"' "${MAIN_CONF}" 2>/dev/null; then
+        rm -f "${MAIN_CONF}" 2>/dev/null || true
+    fi
+    rm -f "${MAIN_CONF}.bak."* 2>/dev/null || true
+
+    info "nftables 端口转发管理器已完整卸载。"
     exit 0
 }
 
@@ -1190,33 +1192,20 @@ do_install() {
         "$NFT_BIN" --version 2>/dev/null || true
         echo ""
         warn "安装将清空所有已有 nftables 配置，由本脚本统一接管。"
-        warn "已有的配置文件将被备份（重命名为 .bak）。"
         read -rp "是否继续？[y/N]: " confirm
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
             info "已取消，退出脚本。"
             exit 0
         fi
 
-        # 备份已有配置文件（重命名，不删除）
-        local ts
-        ts=$(date '+%Y%m%d_%H%M%S')
-        if [[ -f "${MAIN_CONF}" ]]; then
-            mv "${MAIN_CONF}" "${MAIN_CONF}.bak.${ts}" 2>/dev/null || true
-            info "已备份 ${MAIN_CONF} → ${MAIN_CONF}.bak.${ts}"
-        fi
-        if [[ -d "${CONF_DIR}" ]]; then
-            local f
-            for f in "${CONF_DIR}"/*.conf; do
-                [[ -f "$f" ]] || continue
-                mv "$f" "${f}.bak.${ts}" 2>/dev/null || true
-                info "已备份 ${f} → ${f}.bak.${ts}"
-            done
-        fi
+        rm -f "${MAIN_CONF}" 2>/dev/null || true
+        rm -f "${CONF_FILE}" "${TARGETS_FILE}" "${UPDATE_URL_FILE}" 2>/dev/null || true
+        rm -rf "${CONF_DIR}/backups" 2>/dev/null || true
 
         # 清空当前运行中的规则
         "$NFT_BIN" flush ruleset 2>/dev/null || true
         info "已清空当前 nftables 规则集。"
-        log_action "清空已有配置并由脚本接管 (备份时间戳: ${ts})"
+        log_action "清空已有配置并由脚本接管"
 
         enable_ip_forward
         enable_bbr_fq
@@ -1606,8 +1595,7 @@ do_add() {
         return
     fi
 
-    # 备份并写入
-    backup_conf
+    # 写入
     local -a old_rules=("${RULES[@]}")
     RULES+=("${lport}|${dip}|${dport}|${rule_alias}")
     if ! write_conf_file; then
@@ -1733,8 +1721,7 @@ do_delete() {
         return
     fi
 
-    # 备份并移除
-    backup_conf
+    # 移除
     unset "RULES[$rule_index]"
     RULES=("${RULES[@]}")
 
@@ -1775,8 +1762,6 @@ do_clear_all() {
         info "已取消。"
         return
     fi
-
-    backup_conf
 
     # 先清理所有防火墙规则（清空场景用 force，无需检查共享）
     local rule lport dip dport alias
