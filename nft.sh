@@ -787,6 +787,7 @@ check_update_status() {
     UPDATE_CHECKED=true
     UPDATE_AVAILABLE=false
     UPDATE_REMOTE_VERSION=""
+    UPDATE_URL=$(load_update_url)
 
     if [[ -z "$UPDATE_URL" ]]; then
         UPDATE_STATUS_TEXT="未配置更新源"
