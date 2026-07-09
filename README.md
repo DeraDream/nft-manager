@@ -1,6 +1,7 @@
 # nft-manager
 
 一个基于 `nftables` 的交互式端口转发管理脚本，支持 TCP/UDP DNAT + SNAT、目标主机别名、转发规则别名、systemd 保活和在线更新。
+适合在 VPS 上快速配置和维护端口转发。
 
 ## 功能
 
