@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v2.6
+# nftables 端口转发管理工具 v2.7
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="2.6"
+SCRIPT_VERSION="2.7"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -1046,6 +1046,10 @@ manager_installed() {
     [[ -x "${SCRIPT_INSTALL_FILE}" && -x "${GLOBAL_CMD}" ]]
 }
 
+web_panel_installed() {
+    [[ -x "${WEB_PANEL_FILE}" && -f "${WEB_SERVICE_FILE}" ]]
+}
+
 install_manager_files() {
     mkdir -p "${SCRIPT_INSTALL_DIR}" 2>/dev/null || {
         err "无法创建 ${SCRIPT_INSTALL_DIR}"
@@ -1235,6 +1239,20 @@ install_manager_runtime() {
     install_keepalive_service
     install_web_service || return 1
     install_nexttrace || true
+}
+
+bootstrap_legacy_web_panel() {
+    if ! manager_installed || web_panel_installed; then
+        return 0
+    fi
+
+    info "检测到旧版 SSH 管理器，正在补装 Web 面板，不会清空现有转发配置。"
+    if install_web_service force; then
+        install_nexttrace || warn "NextTrace 未能完成安装，路由追踪功能暂不可用。"
+        info "Web 面板补装完成。旧规则将在 Web 服务启动时校验并迁移。"
+    else
+        warn "Web 面板补装失败；现有 SSH 转发未被改动。请检查网络后重新执行 nft。"
+    fi
 }
 
 do_uninstall_manager() {
@@ -2131,4 +2149,5 @@ if [[ "${1:-}" == "--keepalive" ]]; then
 fi
 
 check_root
+bootstrap_legacy_web_panel
 main_menu
