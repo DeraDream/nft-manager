@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v2.4
+# nftables 端口转发管理工具 v2.5
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="2.4"
+SCRIPT_VERSION="2.5"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -19,6 +19,7 @@ GLOBAL_CMD="/usr/local/bin/nft"
 SCRIPT_INSTALL_DIR="/usr/local/lib/nft-forward"
 SCRIPT_INSTALL_FILE="${SCRIPT_INSTALL_DIR}/nft.sh"
 WEB_PANEL_FILE="${SCRIPT_INSTALL_DIR}/web_panel.py"
+NEXTTRACE_MARKER="${SCRIPT_INSTALL_DIR}/nexttrace-managed"
 WEB_PORT="5555"
 WEB_AUTH_FILE="${CONF_DIR}/web-auth.conf"
 WEB_PANEL_URL="${NFT_MANAGER_WEB_PANEL_URL:-https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/web_panel.py}"
@@ -1028,6 +1029,7 @@ EOF
             err "Web 面板更新失败，脚本已写入但服务未完整同步。请检查网络后重新执行更新。"
             return
         fi
+        install_nexttrace || warn "NextTrace 未能完成安装，路由追踪功能暂不可用。"
     fi
 
     info "更新完成: v${SCRIPT_VERSION} → v${remote_version}"
@@ -1188,17 +1190,57 @@ EOF
     fi
 }
 
+install_nexttrace() {
+    local installer nexttrace_bin
+    nexttrace_bin=$(command -v nexttrace 2>/dev/null || true)
+    if [[ -n "$nexttrace_bin" ]]; then
+        info "NextTrace 已就绪: ${nexttrace_bin}"
+        return 0
+    fi
+
+    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+        warn "未检测到 curl 或 wget，无法自动安装 NextTrace。"
+        return 1
+    fi
+
+    info "未检测到 NextTrace，正在安装路由追踪组件..."
+    installer=$(mktemp 2>/dev/null || echo "/tmp/nexttrace-install.$$") || true
+    if ! download_remote_file "https://nxtrace.org/nt" "$installer" 90; then
+        rm -f "$installer" 2>/dev/null || true
+        warn "NextTrace 安装包下载失败，Web 面板的路由追踪暂不可用。"
+        return 1
+    fi
+
+    if ! bash "$installer"; then
+        rm -f "$installer" 2>/dev/null || true
+        warn "NextTrace 安装失败，Web 面板的路由追踪暂不可用。"
+        return 1
+    fi
+    rm -f "$installer" 2>/dev/null || true
+
+    nexttrace_bin=$(command -v nexttrace 2>/dev/null || true)
+    if [[ -z "$nexttrace_bin" ]]; then
+        warn "NextTrace 安装后未找到 nexttrace 命令。"
+        return 1
+    fi
+
+    printf '%s\n' "$nexttrace_bin" > "$NEXTTRACE_MARKER" 2>/dev/null || true
+    info "NextTrace 已安装: ${nexttrace_bin}"
+    log_action "安装 NextTrace: ${nexttrace_bin}"
+}
+
 install_manager_runtime() {
     install_manager_files || return 1
     persist_update_url
     install_keepalive_service
-    install_web_service
+    install_web_service || return 1
+    install_nexttrace || true
 }
 
 do_uninstall_manager() {
     echo ""
     warn "即将完整卸载 nftables 端口转发管理器。"
-    warn "将删除全局命令、安装目录、systemd 保活服务、转发配置、目标主机库、更新源、日志和脚本写入的 sysctl 配置。"
+    warn "将删除全局命令、安装目录、systemd 保活服务、转发配置、目标主机库、更新源、日志、脚本写入的 sysctl 配置以及本脚本安装的 NextTrace。"
     warn "不会卸载系统 nftables 软件包。"
     read -rp "确认卸载？[y/N]: " confirm1
     if [[ ! "$confirm1" =~ ^[Yy]$ ]]; then
@@ -1211,7 +1253,10 @@ do_uninstall_manager() {
         return
     fi
 
-    local clear_ruleset
+    local clear_ruleset managed_nexttrace=""
+    if [[ -f "${NEXTTRACE_MARKER}" ]]; then
+        managed_nexttrace=$(cat "${NEXTTRACE_MARKER}" 2>/dev/null || true)
+    fi
 
     if command -v systemctl &>/dev/null; then
         systemctl disable --now "${WEB_SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -1226,6 +1271,9 @@ do_uninstall_manager() {
     rm -f "${GLOBAL_CMD}" 2>/dev/null || true
     rm -f "${GLOBAL_CMD}.bak."* 2>/dev/null || true
     rm -rf "${SCRIPT_INSTALL_DIR}" 2>/dev/null || true
+    if [[ -n "$managed_nexttrace" && -x "$managed_nexttrace" ]]; then
+        rm -f "$managed_nexttrace" 2>/dev/null || true
+    fi
     web_firewall_close
 
     if nft_available; then
