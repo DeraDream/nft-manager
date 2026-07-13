@@ -18,6 +18,7 @@ CONF_FILE = os.path.join(CONF_DIR, "port-forward.conf")
 TARGETS_FILE = os.path.join(CONF_DIR, "targets.conf")
 AUTH_FILE = os.path.join(CONF_DIR, "web-auth.conf")
 STATS_FILE = os.path.join(CONF_DIR, "web-stats.json")
+HISTORY_FILE = os.path.join(CONF_DIR, "web-history.json")
 TABLE_NAME = "port_forward"
 HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
@@ -189,7 +190,7 @@ def parse_rules():
     for line in text:
         if "META_RULE|" in line:
             meta = line.split("META_RULE|", 1)[1]
-            parts = (meta.split("|") + ["", "", ""])[:6]
+            parts = (meta.split("|") + [""] * 8)[:8]
             try:
                 lport, ip, dport = int(parts[0]), parts[1], int(parts[2])
             except ValueError:
@@ -201,6 +202,8 @@ def parse_rules():
                     "dport": dport,
                     "alias": clean_label(parts[3]),
                     "desc": clean_label(parts[5] if len(parts) > 5 else ""),
+                    "statsMode": parts[6] if parts[6] in ("upload", "download", "total") else "total",
+                    "enabled": parts[7] != "0",
                 })
                 seen_lports.add(lport)
     for line in text:
@@ -210,7 +213,7 @@ def parse_rules():
         lport = int(m.group(1))
         if lport in seen_lports:
             continue
-        rules.append({"lport": lport, "ip": m.group(2), "dport": int(m.group(3)), "alias": "", "desc": ""})
+        rules.append({"lport": lport, "ip": m.group(2), "dport": int(m.group(3)), "alias": "", "desc": "", "statsMode": "total", "enabled": True})
         seen_lports.add(lport)
     return rules
 
@@ -220,21 +223,38 @@ def write_rules(rules):
     lip = local_ip()
     with open(CONF_FILE, "w", encoding="utf-8") as f:
         f.write("#!/usr/sbin/nft -f\n\n")
-        f.write("# WEB_META|1\n\n")
+        f.write("# WEB_META|2\n\n")
         f.write(f"define LOCAL_IP = {lip}\n\n")
         f.write(f"table ip {TABLE_NAME} {{\n")
         f.write("    chain prerouting {\n        type nat hook prerouting priority -100; policy accept;\n")
         for r in rules:
             alias = clean_label(r.get("alias", ""))
             desc = clean_label(r.get("desc", ""))
-            f.write(f"\n        # META_RULE|{r['lport']}|{r['ip']}|{r['dport']}|{alias}||{desc}\n")
+            stats_mode = r.get("statsMode", "total")
+            enabled = "1" if r.get("enabled", True) else "0"
+            f.write(f"\n        # META_RULE|{r['lport']}|{r['ip']}|{r['dport']}|{alias}||{desc}|{stats_mode}|{enabled}\n")
+            if not r.get("enabled", True):
+                continue
             f.write(f"        tcp dport {r['lport']} counter dnat to {r['ip']}:{r['dport']}\n")
             f.write(f"        udp dport {r['lport']} counter dnat to {r['ip']}:{r['dport']}\n")
         f.write("    }\n\n")
         f.write("    chain postrouting {\n        type nat hook postrouting priority 100; policy accept;\n")
         for r in rules:
+            if not r.get("enabled", True):
+                continue
             f.write(f"\n        ip daddr {r['ip']} tcp dport {r['dport']} ct status dnat snat to $LOCAL_IP\n")
             f.write(f"        ip daddr {r['ip']} udp dport {r['dport']} ct status dnat snat to $LOCAL_IP\n")
+        f.write("    }\n\n")
+        f.write("    chain forward {\n        type filter hook forward priority filter; policy accept;\n")
+        for r in rules:
+            if not r.get("enabled", True):
+                continue
+            f.write(f"\n        # META_COUNTER_UPLOAD|{r['lport']}|{r['ip']}|{r['dport']}\n")
+            f.write(f"        ip daddr {r['ip']} tcp dport {r['dport']} ct status dnat counter\n")
+            f.write(f"        ip daddr {r['ip']} udp dport {r['dport']} ct status dnat counter\n")
+            f.write(f"\n        # META_COUNTER_DOWNLOAD|{r['lport']}|{r['ip']}|{r['dport']}\n")
+            f.write(f"        ip saddr {r['ip']} tcp sport {r['dport']} ct status dnat counter\n")
+            f.write(f"        ip saddr {r['ip']} udp sport {r['dport']} ct status dnat counter\n")
         f.write("    }\n}\n")
 
 
@@ -269,7 +289,7 @@ def migrate_legacy_data():
     except OSError:
         return
 
-    needs_migration = "WEB_META|1" not in text or "counter dnat to" not in text
+    needs_migration = "WEB_META|2" not in text or "META_COUNTER_UPLOAD" not in text
     if not needs_migration:
         return
 
@@ -281,20 +301,39 @@ def migrate_legacy_data():
         pass
 
 
+def hourly_history(delta):
+    now_hour = int(time.time() // 3600) * 3600
+    hours = {}
+    if os.path.exists(HISTORY_FILE):
+        try:
+            hours = json.load(open(HISTORY_FILE, encoding="utf-8")).get("hours", {})
+        except Exception:
+            hours = {}
+    hours = {str(k): int(v) for k, v in hours.items() if int(k) >= now_hour - 23 * 3600}
+    key = str(now_hour)
+    hours[key] = int(hours.get(key, 0)) + max(0, int(delta))
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump({"hours": hours}, f)
+    return [{"hour": stamp, "bytes": int(hours.get(str(stamp), 0))} for stamp in range(now_hour - 23 * 3600, now_hour + 1, 3600)]
+
+
 def nft_counters():
     out = run_nft(["list", "table", "ip", TABLE_NAME], timeout=2).stdout
     counters = {}
     current = None
+    direction = None
     for line in out.splitlines():
-        if "META_RULE|" in line:
-            parts = line.split("META_RULE|", 1)[1].split("|")
+        if "META_COUNTER_UPLOAD|" in line or "META_COUNTER_DOWNLOAD|" in line:
+            marker = "META_COUNTER_UPLOAD|" if "META_COUNTER_UPLOAD|" in line else "META_COUNTER_DOWNLOAD|"
+            parts = line.split(marker, 1)[1].split("|")
             if len(parts) >= 3:
                 current = f"{parts[0]}|{parts[1]}|{parts[2]}"
+                direction = "upload" if marker == "META_COUNTER_UPLOAD|" else "download"
             continue
-        if current and " dport " in line and "counter packets" in line and "dnat to" in line:
+        if current and direction and "counter packets" in line:
             m = re.search(r"counter packets (\d+) bytes (\d+)", line)
             if m:
-                item = counters.setdefault(current, {"packets": 0, "bytes": 0})
+                item = counters.setdefault(current, {"upload": {"packets": 0, "bytes": 0}, "download": {"packets": 0, "bytes": 0}})[direction]
                 item["packets"] += int(m.group(1))
                 item["bytes"] += int(m.group(2))
     previous = {}
@@ -305,12 +344,20 @@ def nft_counters():
             previous = {}
     now = int(time.time())
     result = {}
+    delta_total = 0
     for key, val in counters.items():
         old = previous.get(key, {})
-        result[key] = {**val, "active": val["bytes"] > int(old.get("bytes", -1)), "sampled_at": now}
+        upload = val["upload"]["bytes"]
+        download = val["download"]["bytes"]
+        old_upload = int(old.get("upload", {}).get("bytes", upload))
+        old_download = int(old.get("download", {}).get("bytes", download))
+        delta_upload = upload - old_upload if upload >= old_upload else 0
+        delta_download = download - old_download if download >= old_download else 0
+        delta_total += delta_upload + delta_download
+        result[key] = {**val, "active": (delta_upload + delta_download) > 0, "sampled_at": now}
     with open(STATS_FILE, "w", encoding="utf-8") as f:
         json.dump(counters, f)
-    return result
+    return result, hourly_history(delta_total)
 
 
 def parse_port_tokens(tokens):
@@ -353,11 +400,14 @@ def expand_forward(payload):
         raise ValueError("映射方式无效，仅支持与入口端口一致或指定出口起始端口")
     prefix = clean_label(payload.get("alias", ""))
     desc = clean_label(payload.get("desc", ""))
+    stats_mode = payload.get("statsMode", "total")
+    if stats_mode not in ("upload", "download", "total"):
+        raise ValueError("统计口径无效")
     batch = len(in_ports) > 1
     rules = []
     for lp, dp in zip(in_ports, out_ports):
         alias = f"{prefix}-{lp}" if prefix and batch else prefix
-        rules.append({"lport": lp, "ip": ip, "dport": dp, "alias": alias, "desc": desc})
+        rules.append({"lport": lp, "ip": ip, "dport": dp, "alias": alias, "desc": desc, "statsMode": stats_mode, "enabled": True})
     return rules
 
 
@@ -376,12 +426,15 @@ def add_rules(payload):
 def update_rule(payload):
     old_lport = int(payload.get("oldLport", 0))
     rules = parse_rules()
+    old_rule = next((r for r in rules if r["lport"] == old_lport), None)
     rest = [r for r in rules if r["lport"] != old_lport]
     new_rules = expand_forward(payload)
     if len(new_rules) != 1:
         raise ValueError("编辑时只能保存为单条规则")
     if any(r["lport"] == new_rules[0]["lport"] for r in rest):
         raise ValueError("入口端口已存在")
+    if old_rule:
+        new_rules[0]["enabled"] = old_rule.get("enabled", True)
     write_rules(rest + new_rules)
     reload_rules()
 
@@ -392,21 +445,38 @@ def delete_rules(payload):
     reload_rules()
 
 
+def toggle_rule(payload):
+    lport = int(payload.get("lport", 0))
+    enabled = bool(payload.get("enabled"))
+    rules = parse_rules()
+    for rule in rules:
+        if rule["lport"] == lport:
+            rule["enabled"] = enabled
+            write_rules(rules)
+            reload_rules()
+            return
+    raise ValueError("未找到转发规则")
+
+
 def dashboard():
     targets = read_targets()
     rules = parse_rules()
-    counters = nft_counters()
+    counters, history = nft_counters()
     enriched = []
     total_bytes = 0
     active = 0
     aliases = {t["ip"]: t["alias"] for t in targets}
     for r in rules:
         key = f"{r['lport']}|{r['ip']}|{r['dport']}"
-        c = counters.get(key, {"packets": 0, "bytes": 0, "active": False})
-        total_bytes += c["bytes"]
+        c = counters.get(key, {"upload": {"packets": 0, "bytes": 0}, "download": {"packets": 0, "bytes": 0}, "active": False})
+        upload_bytes, download_bytes = c["upload"]["bytes"], c["download"]["bytes"]
+        both_bytes = upload_bytes + download_bytes
+        selected = r.get("statsMode", "total")
+        selected_bytes = upload_bytes if selected == "upload" else download_bytes if selected == "download" else both_bytes
+        total_bytes += both_bytes
         active += 1 if c.get("active") else 0
-        enriched.append({**r, "targetAlias": aliases.get(r["ip"], ""), "packets": c["packets"], "bytes": c["bytes"], "active": c["active"]})
-    return {"targets": targets, "rules": enriched, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
+        enriched.append({**r, "targetAlias": aliases.get(r["ip"], ""), "uploadBytes": upload_bytes, "downloadBytes": download_bytes, "totalBytes": both_bytes, "bytes": selected_bytes, "active": c["active"]})
+    return {"targets": targets, "rules": enriched, "history": history, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
 
 
 HTML = r"""<!doctype html>
@@ -418,14 +488,14 @@ HTML = r"""<!doctype html>
 button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-radius:6px;background:#243b63;color:#fff;padding:9px 14px}button:disabled{cursor:not-allowed;opacity:.65}button.primary{background:var(--blue)}button.danger{background:var(--danger)}button.ghost{background:#2b2d35}.login{height:100vh;display:grid;place-items:center}.login form{width:360px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px}.login input{width:100%;margin:8px 0 14px;padding:12px;border-radius:6px;border:1px solid var(--line);background:#111318;color:#fff}
 .app{display:flex;min-height:100vh}.side{width:238px;background:#020303;border-right:1px solid #2a2d35;padding:28px 16px;position:fixed;inset:0 auto 0 0}.brand{font-weight:800;font-size:18px;margin-bottom:2px}.ver{font-size:12px;color:var(--muted);margin-bottom:34px}.nav button{width:100%;text-align:left;margin:5px 0;background:transparent;color:#d9dde7}.nav button.active{background:#112846;color:#0b84ff}.foot{position:absolute;bottom:18px;color:#737b89;font-size:12px;left:70px}
 .main{margin-left:238px;flex:1}.top{height:54px;border-bottom:1px solid #2a2d35;display:flex;align-items:center;justify-content:flex-end;padding:0 26px}.user{font-weight:700}
-.content{padding:18px 24px 40px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.muted{color:var(--muted)}.pill{display:inline-flex;align-items:center;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.actions button{padding:6px 10px;margin-right:6px}.hidden{display:none!important}
+.content{padding:18px 24px 40px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.muted{color:var(--muted)}.pill{display:inline-flex;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.metric.upload{color:#46a6ff}.metric.download{color:#20d98a}.metric.total{color:#b779ff}.actions button{padding:6px 10px;margin-right:6px}.hidden{display:none!important}.view-switch{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}.view-switch button{border-radius:0;background:#17181c;padding:7px 11px}.view-switch button.active{background:#1d4d8a}.switch{position:relative;display:inline-flex;width:38px;height:22px;vertical-align:middle}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#4a252a;border-radius:22px}.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}.switch input:checked+.slider{background:#16855b}.switch input:checked+.slider:before{transform:translateX(16px)}.rule-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.rule-card{border:1px solid var(--line);background:#111318;padding:14px;border-radius:8px}.rule-card.disabled{opacity:.6}.rule-card h3{font-size:15px;margin:0 0 8px}.rule-card .route{color:#cdd4e0;margin:7px 0}.rule-card .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid #2a2d35;padding-top:10px;margin-top:10px}.rule-card .metrics span{font-size:12px}.chart-svg{display:block;width:100%;height:280px}.chart-grid{stroke:#3c414d;stroke-dasharray:3 4}.chart-line{fill:none;stroke:#8e4cff;stroke-width:3}.chart-fill{fill:rgba(142,76,255,.14)}.chart-label{fill:#89919f;font-size:11px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}
 @media(max-width:900px){.side{position:static;width:100%}.app{display:block}.main{margin:0}.cards{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
 </style></head><body><div id="root"></div><script>
 const appRoot=document.getElementById('root');
 const authToken=()=>localStorage.getItem('nft_manager_token')||'';
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
-let state={view:'dash',data:null,edit:null};
+let state={view:'dash',data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat'};
 const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
@@ -439,20 +509,25 @@ function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(eve
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err))}finally{btn.disabled=false;btn.textContent=old}}
 async function load(){try{state.data=await api('/api/state');render()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){state.view=v;render()}
-function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v2.2</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
-function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>目标主机</h3><div class=big>${d.stats.targetCount}</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div><div class=card><h3>活跃转发</h3><div class=big>${d.stats.activeCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2><div class=chart></div></div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
- if(state.view==='rules')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">转发管理</h2><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}</div>`);
+function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v2.3</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
+function hourText(stamp){return String(new Date(stamp*1000).getHours()).padStart(2,'0')+':00'}
+function trafficChart(){let h=state.data.history||[],w=960,ht=250,p=34,max=Math.max(1,...h.map(x=>x.bytes)),pts=h.map((x,i)=>`${p+i*(w-p*2)/23},${ht-p-(x.bytes/max)*(ht-p*2)}`),area=`${p},${ht-p} ${pts.join(' ')} ${w-p},${ht-p}`,grid=[0,1,2,3,4].map(i=>{let y=p+i*(ht-p*2)/4;return `<line class=chart-grid x1=${p} y1=${y} x2=${w-p} y2=${y}/><text class=chart-label x=2 y=${y+4}>${fmt(max*(4-i)/4)}</text>`}).join(''),hours=h.map((x,i)=>i%3===0?`<text class=chart-label x=${p+i*(w-p*2)/23-10} y=${ht-6}>${hourText(x.hour)}</text>`:'').join('');return `<svg class=chart-svg viewBox="0 0 ${w} ${ht}" role="img"><g>${grid}</g><polygon class=chart-fill points="${area}"/><polyline class=chart-line points="${pts.join(' ')}"/>${hours}</svg>`}
+function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
+ if(state.view==='rules')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">转发管理</h2><div class=view-switch><button class="${state.ruleView==='flat'?'active':''}" onclick="setRuleView('flat')">平铺</button><button class="${state.ruleView==='grid'?'active':''}" onclick="setRuleView('grid')">方块</button></div><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}</div>`);
  if(state.view==='targets')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">主机管理</h2><button class=primary onclick="openTarget()">新增主机</button></div>${targetsTable()}</div>`);
  return shell(`<div class=panel><h2>系统设置</h2><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
-function rulesTable(limit){let rows=state.data.rules.slice(0,limit?8:9999).map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${r.alias||'-'}</td><td>${r.lport}</td><td>${r.dport}</td><td>${fmt(r.bytes)}</td><td class="status ${r.active?'on':''}">${r.active?'活跃':'空闲'}</td><td class=actions><button onclick='openRule(${JSON.stringify(r)})'>编辑</button><button class=danger onclick="delRules([${r.lport}])">删除</button></td></tr>`).join('');return `<table class=table><tr><th>目标主机</th><th>别名</th><th>入口端口</th><th>出口端口</th><th>流量</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=7 class=muted>暂无转发</td></tr>'}</table>`}
+function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
+function ruleControls(r){return `<label class=switch title="${r.enabled?'关闭转发':'开启转发'}"><input type=checkbox ${r.enabled?'checked':''} onchange="toggleRule(${r.lport},this.checked)"><span class=slider></span></label><button onclick='openRule(${JSON.stringify(r)})'>编辑</button><button class=danger onclick="delRules([${r.lport}])">删除</button>`}
+function rulesTable(limit){let rules=state.data.rules.slice(0,limit?8:9999);if(!limit&&state.ruleView==='grid'){let cards=rules.map(r=>`<article class="rule-card ${r.enabled?'':'disabled'}"><h3>${r.alias||'未命名转发'}</h3><div class=muted>${r.targetAlias||'-'} / ${r.ip}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div><p class="status ${r.active?'on':''}">${r.enabled?(r.active?'活跃':'空闲'):'已关闭'} · 统计：${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</p><div class=actions>${ruleControls(r)}</div></article>`).join('');return `<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}let rows=rules.map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${r.alias||'-'}</td><td>${r.lport}</td><td>${r.dport}</td><td class="metric upload">${fmt(r.uploadBytes)}</td><td class="metric download">${fmt(r.downloadBytes)}</td><td class="metric total">${fmt(r.totalBytes)}</td><td>${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</td><td class="status ${r.active?'on':''}">${r.enabled?(r.active?'活跃':'空闲'):'关闭'}</td><td class=actions>${ruleControls(r)}</td></tr>`).join('');return `<table class=table><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>统计</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=10 class=muted>暂无转发</td></tr>'}</table>`}
+async function toggleRule(lport,enabled){try{await api('/api/rules/toggle',{method:'POST',body:JSON.stringify({lport,enabled}),timeout:30000});await load()}catch(e){toast(msg(e));await load()}}
 function targetsTable(){let counts={};state.data.rules.forEach(r=>counts[r.ip]=(counts[r.ip]||0)+1);let rows=state.data.targets.map(t=>`<tr><td>${t.alias}</td><td>${t.ip}</td><td>${counts[t.ip]||0}</td><td class=actions><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`).join('');return `<table class=table><tr><th>别名</th><th>IP</th><th>规则数</th><th>操作</th></tr>${rows||'<tr><td colspan=4 class=muted>暂无主机</td></tr>'}</table>`}
 function modal(html){document.body.insertAdjacentHTML('beforeend',`<div class=modal><div class=dialog><div class=error-box></div>${html}</div></div>`);let layer=document.body.lastElementChild;layer.addEventListener('click',e=>{if(e.target===layer)layer.remove()});return layer}
 function showInfo(title,text){let layer=modal(`<h2>${title}</h2><p class=dialog-copy>${text}</p><div class=dialog-actions><button class=primary data-confirm>确定</button></div>`);layer.querySelector('[data-confirm]').addEventListener('click',()=>layer.remove())}
 function confirmDialog(title,text,action){let layer=modal(`<h2>${title}</h2><p class=dialog-copy>${text}</p><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>确定</button></div>`),cancel=layer.querySelector('[data-cancel]'),confirmBtn=layer.querySelector('[data-confirm]');cancel.addEventListener('click',()=>layer.remove());confirmBtn.addEventListener('click',async()=>{let old=confirmBtn.textContent;confirmBtn.disabled=true;confirmBtn.textContent='处理中...';try{await action();layer.remove()}catch(e){if(e.status===401){layer.remove();expireSession()}else toast(msg(e))}finally{confirmBtn.disabled=false;confirmBtn.textContent=old}})}
 document.addEventListener('keydown',e=>{let layers=document.querySelectorAll('.modal'),layer=layers[layers.length-1];if(!layer)return;if(e.key==='Escape'){e.preventDefault();layer.remove();return}if(e.key==='Enter'&&!e.shiftKey&&e.target.tagName!=='TEXTAREA'){let button=layer.querySelector('[data-confirm],button.primary');if(button&&!button.disabled){e.preventDefault();button.click()}}})
 function parsePorts(value){let ports=value.trim().split(/[ ,]+/).filter(Boolean);if(!ports.length)throw new Error('请至少输入一个入口端口');let seen=new Set;for(let port of ports){if(!/^[0-9]+$/.test(port)||Number(port)<1||Number(port)>65535)throw new Error(`端口无效: ${port}；仅支持单个端口，请用空格或英文逗号分隔`);if(seen.has(port))throw new Error(`端口重复: ${port}`);seen.add(port)}return ports}
-function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join('');modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveRule(this)">保存</button></div>`)}
-async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});document.querySelector('.modal').remove();await load()})}
+function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,stats=r?.statsMode||'total',opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join('');modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>统计口径</label><select id=statsMode><option value=upload ${stats==='upload'?'selected':''}>上传流量</option><option value=download ${stats==='download'?'selected':''}>下载流量</option><option value=total ${stats==='total'?'selected':''}>上传 + 下载总计</option></select></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveRule(this)">保存</button></div>`)}
+async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});document.querySelector('.modal').remove();await load()})}
 function delRules(lports){confirmDialog('删除转发','确认删除该端口转发？',async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports}),timeout:30000});await load()})}
 function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP</label><input id=tip value="${t?.ip||''}"></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
 async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});document.querySelector('.modal').remove();await load()})}
@@ -558,6 +633,8 @@ class Handler(BaseHTTPRequestHandler):
                 update_rule(data)
             elif path == "/api/rules/delete":
                 delete_rules(data)
+            elif path == "/api/rules/toggle":
+                toggle_rule(data)
             else:
                 self.send_json({"error": "not found"}, 404)
                 return

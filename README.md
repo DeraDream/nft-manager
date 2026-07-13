@@ -17,7 +17,7 @@
 - 安装后自动创建 systemd 保活服务
 - 安装后自动创建 Web 面板，默认端口 `5555`
 - Web 面板支持一次添加多个单端口
-- Web 面板支持流量统计和活跃状态展示
+- Web 面板支持上传、下载、总计流量统计、24 小时趋势和规则开关
 - 支持在线检查和更新脚本
 
 ## 安装
@@ -44,7 +44,7 @@ sudo ./nft.sh
 ```bash
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v2.2
+# nftables 端口转发管理工具 v2.3
 ```
 
 如果看到 `<!DOCTYPE html>`、`Cloudflare`、`403`、`404` 等内容，说明下载到的是网页错误页，不要执行。
@@ -172,6 +172,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 /etc/nftables.d/update-url
 /etc/nftables.d/web-auth.conf
 /etc/nftables.d/web-stats.json
+/etc/nftables.d/web-history.json
 /etc/sysctl.d/99-nft-forward.conf
 /var/log/nft-forward.log
 ```
