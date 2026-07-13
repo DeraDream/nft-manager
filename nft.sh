@@ -18,8 +18,14 @@ TABLE_NAME="port_forward"
 GLOBAL_CMD="/usr/local/bin/nft"
 SCRIPT_INSTALL_DIR="/usr/local/lib/nft-forward"
 SCRIPT_INSTALL_FILE="${SCRIPT_INSTALL_DIR}/nft.sh"
+WEB_PANEL_FILE="${SCRIPT_INSTALL_DIR}/web_panel.py"
+WEB_PORT="5555"
+WEB_AUTH_FILE="${CONF_DIR}/web-auth.conf"
+WEB_PANEL_URL="${NFT_MANAGER_WEB_PANEL_URL:-https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/web_panel.py}"
 KEEPALIVE_SERVICE_NAME="nft-forward-keepalive.service"
 KEEPALIVE_SERVICE_FILE="/etc/systemd/system/${KEEPALIVE_SERVICE_NAME}"
+WEB_SERVICE_NAME="nft-manager-web.service"
+WEB_SERVICE_FILE="/etc/systemd/system/${WEB_SERVICE_NAME}"
 UPDATE_URL="${NFT_FORWARD_UPDATE_URL:-https://raw.githubusercontent.com/DeraDream/nft-manager/main/nft.sh}"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
 UPDATE_CHECKED=false
@@ -267,6 +273,39 @@ firewall_close_port() {
         # 注意: 不删除 ESTABLISHED,RELATED 规则，它是通用规则，其他转发可能还需要
         info "已从 iptables 中移除: INPUT ${lport}, FORWARD → ${dest_ip}:${dport}。"
         log_action "iptables 移除 INPUT:${lport} FORWARD:${dest_ip}:${dport}"
+        try_persist_iptables || true
+    fi
+}
+
+web_firewall_open() {
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --add-port="${WEB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        return
+    fi
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        ufw allow "${WEB_PORT}/tcp" >/dev/null 2>&1 || true
+        return
+    fi
+    if has_iptables; then
+        iptables -C INPUT -p tcp --dport "${WEB_PORT}" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p tcp --dport "${WEB_PORT}" -j ACCEPT 2>/dev/null || true
+        try_persist_iptables || true
+    fi
+}
+
+web_firewall_close() {
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --remove-port="${WEB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        return
+    fi
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        yes | ufw delete allow "${WEB_PORT}/tcp" >/dev/null 2>&1 || true
+        return
+    fi
+    if has_iptables; then
+        iptables -D INPUT -p tcp --dport "${WEB_PORT}" -j ACCEPT 2>/dev/null || true
         try_persist_iptables || true
     fi
 }
@@ -530,11 +569,11 @@ load_rules() {
         return
     fi
     if grep -qE '^[[:space:]]*#[[:space:]]*META_RULE\|' "${CONF_FILE}" 2>/dev/null; then
-        local line lport dip dport alias
+        local line lport dip dport alias _group _desc
         while IFS= read -r line; do
             [[ "$line" =~ ^[[:space:]]*#[[:space:]]*META_RULE\| ]] || continue
             line="${line#*META_RULE|}"
-            IFS='|' read -r lport dip dport alias <<< "$line"
+            IFS='|' read -r lport dip dport alias _group _desc <<< "$line"
             if validate_port "$lport" && validate_ip "$dip" && validate_port "$dport"; then
                 alias=$(clean_label "$alias")
                 RULES+=("${lport}|${dip}|${dport}|${alias}")
@@ -584,8 +623,8 @@ EOF
 
         # META_RULE|${lport}|${dip}|${dport}|${alias}
         # 转发: 本机:${lport} -> ${dip}:${dport}${alias:+ (${alias})}
-        tcp dport ${lport} dnat to ${dip}:${dport}
-        udp dport ${lport} dnat to ${dip}:${dport}
+        tcp dport ${lport} counter dnat to ${dip}:${dport}
+        udp dport ${lport} counter dnat to ${dip}:${dport}
 EOF
     done
 
@@ -888,6 +927,7 @@ exec "${SCRIPT_INSTALL_FILE}" "\$@"
 EOF
         chmod +x "${GLOBAL_CMD}" 2>/dev/null || true
         install_keepalive_service
+        install_web_service
     fi
 
     info "更新完成: v${SCRIPT_VERSION} → v${remote_version}"
@@ -963,10 +1003,104 @@ EOF
     fi
 }
 
+install_web_panel_file() {
+    local force_download="${1:-}"
+    mkdir -p "${SCRIPT_INSTALL_DIR}" 2>/dev/null || {
+        err "无法创建 ${SCRIPT_INSTALL_DIR}"
+        return 1
+    }
+
+    local source_dir tmp_file
+    source_dir="$(dirname "${SCRIPT_PATH}")"
+    if [[ "$force_download" != "force" && -f "${source_dir}/web_panel.py" ]]; then
+        install -m 755 "${source_dir}/web_panel.py" "${WEB_PANEL_FILE}" 2>/dev/null || {
+            err "无法安装 Web 面板文件到 ${WEB_PANEL_FILE}"
+            return 1
+        }
+        return 0
+    fi
+
+    tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-manager-web.$$") || true
+    if command -v curl &>/dev/null; then
+        curl -fsSL --connect-timeout 8 --max-time 30 "${WEB_PANEL_URL}" -o "$tmp_file" || {
+            rm -f "$tmp_file" 2>/dev/null || true
+            err "下载 Web 面板失败: ${WEB_PANEL_URL}"
+            return 1
+        }
+    elif command -v wget &>/dev/null; then
+        wget -q --timeout=30 -O "$tmp_file" "${WEB_PANEL_URL}" || {
+            rm -f "$tmp_file" 2>/dev/null || true
+            err "下载 Web 面板失败: ${WEB_PANEL_URL}"
+            return 1
+        }
+    else
+        rm -f "$tmp_file" 2>/dev/null || true
+        err "缺少 curl/wget，无法下载 Web 面板。"
+        return 1
+    fi
+
+    if ! python3 -m py_compile "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        err "Web 面板文件校验失败。"
+        return 1
+    fi
+
+    install -m 755 "$tmp_file" "${WEB_PANEL_FILE}" 2>/dev/null || {
+        rm -f "$tmp_file" 2>/dev/null || true
+        err "无法安装 Web 面板文件到 ${WEB_PANEL_FILE}"
+        return 1
+    }
+    rm -f "$tmp_file" 2>/dev/null || true
+}
+
+install_web_service() {
+    local force_download="${1:-}"
+    if ! command -v python3 &>/dev/null; then
+        warn "未检测到 python3，已跳过 Web 面板安装。"
+        return 0
+    fi
+    install_web_panel_file "$force_download" || return 1
+    mkdir -p "${CONF_DIR}" 2>/dev/null || true
+
+    if ! command -v systemctl &>/dev/null; then
+        warn "未检测到 systemd，已跳过 Web 面板服务安装。"
+        return 0
+    fi
+
+    cat > "${WEB_SERVICE_FILE}" <<EOF
+[Unit]
+Description=nft-manager web panel
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 ${WEB_PANEL_FILE}
+Restart=always
+RestartSec=3
+Environment=NFT_MANAGER_WEB_PORT=${WEB_PORT}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now "${WEB_SERVICE_NAME}" >/dev/null 2>&1; then
+        web_firewall_open
+        info "已安装并启用 Web 面板服务: ${WEB_SERVICE_NAME}"
+        info "Web 面板地址: http://$(get_local_ip):${WEB_PORT}"
+        info "默认账号/密码: admin / admin"
+        log_action "安装并启用 Web 面板服务 ${WEB_SERVICE_NAME}"
+    else
+        warn "Web 面板服务启用失败，请手动执行: systemctl enable --now ${WEB_SERVICE_NAME}"
+    fi
+}
+
 install_manager_runtime() {
     install_manager_files || return 1
     persist_update_url
     install_keepalive_service
+        install_web_service force
 }
 
 do_uninstall_manager() {
@@ -988,8 +1122,10 @@ do_uninstall_manager() {
     local clear_ruleset
 
     if command -v systemctl &>/dev/null; then
+        systemctl disable --now "${WEB_SERVICE_NAME}" >/dev/null 2>&1 || true
         systemctl disable --now "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 || true
     fi
+    rm -f "${WEB_SERVICE_FILE}" 2>/dev/null || true
     rm -f "${KEEPALIVE_SERVICE_FILE}" 2>/dev/null || true
     if command -v systemctl &>/dev/null; then
         systemctl daemon-reload >/dev/null 2>&1 || true
@@ -998,6 +1134,7 @@ do_uninstall_manager() {
     rm -f "${GLOBAL_CMD}" 2>/dev/null || true
     rm -f "${GLOBAL_CMD}.bak."* 2>/dev/null || true
     rm -rf "${SCRIPT_INSTALL_DIR}" 2>/dev/null || true
+    web_firewall_close
 
     if nft_available; then
         "$NFT_BIN" flush table ip "${TABLE_NAME}" 2>/dev/null || true
@@ -1012,6 +1149,8 @@ do_uninstall_manager() {
     rm -f "${CONF_FILE}" 2>/dev/null || true
     rm -f "${TARGETS_FILE}" 2>/dev/null || true
     rm -f "${UPDATE_URL_FILE}" 2>/dev/null || true
+    rm -f "${WEB_AUTH_FILE}" 2>/dev/null || true
+    rm -f "${CONF_DIR}/web-stats.json" 2>/dev/null || true
     rm -f "${CONF_DIR}"/*.conf.bak.* 2>/dev/null || true
     rm -rf "${CONF_DIR}/backups" 2>/dev/null || true
     rmdir "${CONF_DIR}" 2>/dev/null || true
@@ -1800,6 +1939,9 @@ main_menu() {
         echo "========================================"
         echo "   nftables 端口转发管理工具 v${SCRIPT_VERSION}"
         echo "   更新状态: ${UPDATE_STATUS_TEXT}"
+        if manager_installed; then
+            echo "   Web 面板: http://$(get_local_ip):${WEB_PORT}"
+        fi
         echo "========================================"
         echo "  1) ${install_label}"
         echo "  2) 更新脚本"

@@ -15,6 +15,9 @@
 - 查看和删除规则时按目标主机分区
 - 安装后提供全局命令 `nft` 唤起菜单
 - 安装后自动创建 systemd 保活服务
+- 安装后自动创建 Web 面板，默认端口 `5555`
+- Web 面板支持单端口、端口段和多个端口范围一起添加
+- Web 面板支持流量统计和活跃状态展示
 - 支持在线检查和更新脚本
 
 ## 安装
@@ -58,6 +61,20 @@ sudo ./nft.sh
 sudo nft
 ```
 
+Web 面板默认地址：
+
+```text
+http://服务器出口IPv4:5555
+```
+
+默认账号和密码：
+
+```text
+admin / admin
+```
+
+首次登录后建议在 Web 面板的系统设置中修改密码。
+
 ## 菜单
 
 ```text
@@ -71,6 +88,47 @@ sudo nft
 8) 诊断/自检
 0) 退出
 ```
+
+## Web 面板
+
+Web 面板默认监听 `0.0.0.0:5555`，安装完成后 SSH 菜单顶部会显示：
+
+```text
+Web 面板: http://当前VPS出口IPv4:5555
+```
+
+Web 面板包含：
+
+- 仪表板
+- 转发管理
+- 主机管理
+- 系统设置
+
+新增转发时，入口端口范围输入框支持：
+
+```text
+100
+100-200
+100-200、300、500-520
+```
+
+输入端口或端口段后按回车，或输入框失去焦点，会自动生成一个端口标签。一次可添加多个单端口或端口段。
+
+出口端口支持：
+
+- 与入口端口一致
+- 指定出口起始端口
+- 指定出口端口范围
+
+Web 面板会将端口段展开为多条 nftables 规则，并使用 nftables counter 统计流量。活跃状态根据流量计数是否增长判断。
+
+默认账号密码为：
+
+```text
+admin / admin
+```
+
+请在公网使用前修改默认密码，并确认服务器安全组/防火墙只向可信来源开放 `5555` 端口。
 
 ## 配置更新源
 
@@ -106,12 +164,16 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 
 ```text
 /usr/local/lib/nft-forward/nft.sh
+/usr/local/lib/nft-forward/web_panel.py
 /usr/local/bin/nft
 /etc/systemd/system/nft-forward-keepalive.service
+/etc/systemd/system/nft-manager-web.service
 /etc/nftables.conf
 /etc/nftables.d/port-forward.conf
 /etc/nftables.d/targets.conf
 /etc/nftables.d/update-url
+/etc/nftables.d/web-auth.conf
+/etc/nftables.d/web-stats.json
 /etc/sysctl.d/99-nft-forward.conf
 /var/log/nft-forward.log
 ```
@@ -129,9 +191,12 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 - 全局命令 `/usr/local/bin/nft`
 - 安装目录 `/usr/local/lib/nft-forward`
 - systemd 保活服务
+- Web 面板服务
 - 端口转发配置
 - 目标主机库
 - 更新源配置
+- Web 面板账号文件
+- Web 面板流量采样文件
 - 脚本日志
 - 脚本写入的 sysctl 配置
 - 脚本写入的 logrotate 配置
