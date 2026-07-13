@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v1.1
+# nftables 端口转发管理工具 v1.2
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -809,6 +809,22 @@ download_update_script() {
     fi
 }
 
+load_web_panel_url() {
+    if [[ -n "${NFT_MANAGER_WEB_PANEL_URL:-}" ]]; then
+        printf '%s' "$NFT_MANAGER_WEB_PANEL_URL"
+        return
+    fi
+
+    local update_url
+    update_url=$(load_update_url)
+    if [[ "$update_url" == */nft.sh ]]; then
+        printf '%s' "${update_url%/nft.sh}/web_panel.py"
+        return
+    fi
+
+    printf '%s' "$WEB_PANEL_URL"
+}
+
 check_update_status() {
     local force="${1:-}"
     if [[ "$UPDATE_CHECKED" == "true" && "$force" != "force" ]]; then
@@ -885,21 +901,12 @@ do_update() {
 
     if version_gt "$remote_version" "$SCRIPT_VERSION"; then
         info "发现新版本: v${remote_version}"
+    elif [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+        info "当前已是最新版本，将同步脚本、Web 面板和 systemd 服务。"
     else
         info "远程版本: v${remote_version}"
-        warn "远程版本不高于当前版本。"
-        read -rp "是否仍要覆盖更新？[y/N]: " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            rm -f "$tmp_file" 2>/dev/null || true
-            info "已取消。"
-            return
-        fi
-    fi
-
-    read -rp "确认更新脚本？[Y/n]: " confirm
-    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        warn "远程版本低于当前版本，已取消更新。"
         rm -f "$tmp_file" 2>/dev/null || true
-        info "已取消。"
         return
     fi
 
@@ -929,7 +936,10 @@ exec "${SCRIPT_INSTALL_FILE}" "\$@"
 EOF
         chmod +x "${GLOBAL_CMD}" 2>/dev/null || true
         install_keepalive_service
-        install_web_service force
+        if ! install_web_service force; then
+            err "Web 面板更新失败，脚本已写入但服务未完整同步。请检查网络后重新执行更新。"
+            return
+        fi
     fi
 
     info "更新完成: v${SCRIPT_VERSION} → v${remote_version}"
@@ -1015,10 +1025,10 @@ install_web_panel_file() {
         return 1
     }
 
-    local source_dir tmp_file
+    local source_dir tmp_file web_panel_url
     source_dir="$(dirname "${SCRIPT_PATH}")"
     if [[ "$force_download" != "force" && -f "${source_dir}/web_panel.py" ]]; then
-        install -m 755 "${source_dir}/web_panel.py" "${WEB_PANEL_FILE}" 2>/dev/null || {
+        cp -f "${source_dir}/web_panel.py" "${WEB_PANEL_FILE}" 2>/dev/null && chmod 755 "${WEB_PANEL_FILE}" 2>/dev/null || {
             err "无法安装 Web 面板文件到 ${WEB_PANEL_FILE}"
             return 1
         }
@@ -1026,16 +1036,17 @@ install_web_panel_file() {
     fi
 
     tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-manager-web.$$") || true
+    web_panel_url=$(load_web_panel_url)
     if command -v curl &>/dev/null; then
-        curl -fsSL --connect-timeout 8 --max-time 30 "${WEB_PANEL_URL}" -o "$tmp_file" || {
+        curl -fsSL --connect-timeout 8 --max-time 30 "${web_panel_url}" -o "$tmp_file" || {
             rm -f "$tmp_file" 2>/dev/null || true
-            err "下载 Web 面板失败: ${WEB_PANEL_URL}"
+            err "下载 Web 面板失败: ${web_panel_url}"
             return 1
         }
     elif command -v wget &>/dev/null; then
-        wget -q --timeout=30 -O "$tmp_file" "${WEB_PANEL_URL}" || {
+        wget -q --timeout=30 -O "$tmp_file" "${web_panel_url}" || {
             rm -f "$tmp_file" 2>/dev/null || true
-            err "下载 Web 面板失败: ${WEB_PANEL_URL}"
+            err "下载 Web 面板失败: ${web_panel_url}"
             return 1
         }
     else
@@ -1050,7 +1061,7 @@ install_web_panel_file() {
         return 1
     fi
 
-    install -m 755 "$tmp_file" "${WEB_PANEL_FILE}" 2>/dev/null || {
+    cp -f "$tmp_file" "${WEB_PANEL_FILE}" 2>/dev/null && chmod 755 "${WEB_PANEL_FILE}" 2>/dev/null || {
         rm -f "$tmp_file" 2>/dev/null || true
         err "无法安装 Web 面板文件到 ${WEB_PANEL_FILE}"
         return 1
@@ -1098,6 +1109,7 @@ EOF
         log_action "安装并启用 Web 面板服务 ${WEB_SERVICE_NAME}"
     else
         warn "Web 面板服务启用失败，请手动执行: systemctl enable ${WEB_SERVICE_NAME} && systemctl restart ${WEB_SERVICE_NAME}"
+        return 1
     fi
 }
 
