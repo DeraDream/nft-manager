@@ -42,10 +42,10 @@ def run(cmd, timeout=8):
 
 
 def local_ip():
-    out = run(["bash", "-lc", "ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K[0-9.]+' | head -1"]).stdout.strip()
+    out = run(["bash", "-lc", "ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K[0-9.]+' | head -1"], timeout=2).stdout.strip()
     if out:
         return out
-    out = run(["bash", "-lc", "hostname -I 2>/dev/null | awk '{print $1}'"]).stdout.strip()
+    out = run(["bash", "-lc", "hostname -I 2>/dev/null | awk '{print $1}'"], timeout=2).stdout.strip()
     return out or "127.0.0.1"
 
 
@@ -217,7 +217,7 @@ def write_rules(rules):
 def reload_rules():
     run(["nft", "flush", "table", "ip", TABLE_NAME])
     run(["nft", "delete", "table", "ip", TABLE_NAME])
-    res = run(["nft", "-f", CONF_FILE])
+    res = run(["nft", "-f", CONF_FILE], timeout=15)
     if res.returncode != 0:
         raise RuntimeError(res.stderr.strip() or "nft 规则加载失败")
 
@@ -258,7 +258,7 @@ def migrate_legacy_data():
 
 
 def nft_counters():
-    out = run(["nft", "list", "table", "ip", TABLE_NAME]).stdout
+    out = run(["nft", "list", "table", "ip", TABLE_NAME], timeout=2).stdout
     counters = {}
     current = None
     for line in out.splitlines():
@@ -380,7 +380,6 @@ def delete_rules(payload):
 
 
 def dashboard():
-    migrate_legacy_data()
     targets = read_targets()
     rules = parse_rules()
     counters = nft_counters()
@@ -421,7 +420,7 @@ function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(eve
 async function doLogin(e){e.preventDefault();try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){alert(err.message)}}
 async function load(){try{state.data=await api('/api/state');render()}catch(e){if(e.status===401){localStorage.removeItem('nft_manager_token');login()}else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){state.view=v;render()}
-function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v1.4</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
+function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v1.5</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>目标主机</h3><div class=big>${d.stats.targetCount}</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div><div class=card><h3>活跃转发</h3><div class=big>${d.stats.activeCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2><div class=chart></div></div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
  if(state.view==='rules')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">转发管理</h2><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}</div>`);
  if(state.view==='targets')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">主机管理</h2><button class=primary onclick="openTarget()">新增主机</button></div>${targetsTable()}</div>`);
@@ -439,7 +438,8 @@ async function saveTarget(old){await api('/api/targets/save',{method:'POST',body
 async function delTarget(t){if(confirm('确认删除主机？有转发规则时会阻止删除。')){await api('/api/targets/delete',{method:'POST',body:JSON.stringify({ip:t.ip})});await load()}}
 function openPassword(){modal(`<h2>修改密码</h2><div class=field><label>旧密码</label><input id=oldp type=password></div><div class=field><label>新密码</label><input id=newp type=password></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="chgPwd()">保存</button></div>`)}
 async function chgPwd(){await api('/api/password',{method:'POST',body:JSON.stringify({oldPassword:document.getElementById('oldp').value,newPassword:document.getElementById('newp').value})});alert('密码已修改');document.querySelector('.modal').remove()}
-loading();load();setInterval(()=>{if(state.data)load()},10000);
+if(authToken()){loading();load()}else login();
+setInterval(()=>{if(state.data)load()},10000);
 </script></body></html>"""
 
 
