@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +25,19 @@ MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
 
 
+def resolve_nft_bin():
+    for path in ("/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    path = shutil.which("nft")
+    if path and os.path.realpath(path) != "/usr/local/bin/nft":
+        return path
+    return ""
+
+
+NFT_BIN = resolve_nft_bin()
+
+
 def run(cmd, timeout=8):
     try:
         return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
@@ -39,6 +53,16 @@ def run(cmd, timeout=8):
             stdout = ""
             stderr = f"command timed out: {' '.join(cmd)}"
         return Result()
+
+
+def run_nft(args, timeout=8):
+    if not NFT_BIN:
+        class Result:
+            returncode = 127
+            stdout = ""
+            stderr = "未找到系统 nftables 命令"
+        return Result()
+    return run([NFT_BIN, *args], timeout=timeout)
 
 
 def local_ip():
@@ -215,9 +239,9 @@ def write_rules(rules):
 
 
 def reload_rules():
-    run(["nft", "flush", "table", "ip", TABLE_NAME])
-    run(["nft", "delete", "table", "ip", TABLE_NAME])
-    res = run(["nft", "-f", CONF_FILE], timeout=15)
+    run_nft(["flush", "table", "ip", TABLE_NAME])
+    run_nft(["delete", "table", "ip", TABLE_NAME])
+    res = run_nft(["-f", CONF_FILE], timeout=15)
     if res.returncode != 0:
         raise RuntimeError(res.stderr.strip() or "nft 规则加载失败")
 
@@ -258,7 +282,7 @@ def migrate_legacy_data():
 
 
 def nft_counters():
-    out = run(["nft", "list", "table", "ip", TABLE_NAME], timeout=2).stdout
+    out = run_nft(["list", "table", "ip", TABLE_NAME], timeout=2).stdout
     counters = {}
     current = None
     for line in out.splitlines():
@@ -395,7 +419,7 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-
 .app{display:flex;min-height:100vh}.side{width:238px;background:#020303;border-right:1px solid #2a2d35;padding:28px 16px;position:fixed;inset:0 auto 0 0}.brand{font-weight:800;font-size:18px;margin-bottom:2px}.ver{font-size:12px;color:var(--muted);margin-bottom:34px}.nav button{width:100%;text-align:left;margin:5px 0;background:transparent;color:#d9dde7}.nav button.active{background:#112846;color:#0b84ff}.foot{position:absolute;bottom:18px;color:#737b89;font-size:12px;left:70px}
 .main{margin-left:238px;flex:1}.top{height:54px;border-bottom:1px solid #2a2d35;display:flex;align-items:center;justify-content:flex-end;padding:0 26px}.user{font-weight:700}
 .content{padding:18px 24px 40px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.muted{color:var(--muted)}.pill{display:inline-flex;align-items:center;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.actions button{padding:6px 10px;margin-right:6px}.hidden{display:none!important}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}
 @media(max-width:900px){.side{position:static;width:100%}.app{display:block}.main{margin:0}.cards{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
 </style></head><body><div id="root"></div><script>
 const appRoot=document.getElementById('root');
@@ -415,21 +439,24 @@ function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(eve
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err))}finally{btn.disabled=false;btn.textContent=old}}
 async function load(){try{state.data=await api('/api/state');render()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){state.view=v;render()}
-function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v1.8</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
+function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v2.2</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>目标主机</h3><div class=big>${d.stats.targetCount}</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div><div class=card><h3>活跃转发</h3><div class=big>${d.stats.activeCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2><div class=chart></div></div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
  if(state.view==='rules')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">转发管理</h2><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}</div>`);
  if(state.view==='targets')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">主机管理</h2><button class=primary onclick="openTarget()">新增主机</button></div>${targetsTable()}</div>`);
- return shell(`<div class=panel><h2>系统设置</h2><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="alert('请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
+ return shell(`<div class=panel><h2>系统设置</h2><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
 function rulesTable(limit){let rows=state.data.rules.slice(0,limit?8:9999).map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${r.alias||'-'}</td><td>${r.lport}</td><td>${r.dport}</td><td>${fmt(r.bytes)}</td><td class="status ${r.active?'on':''}">${r.active?'活跃':'空闲'}</td><td class=actions><button onclick='openRule(${JSON.stringify(r)})'>编辑</button><button class=danger onclick="delRules([${r.lport}])">删除</button></td></tr>`).join('');return `<table class=table><tr><th>目标主机</th><th>别名</th><th>入口端口</th><th>出口端口</th><th>流量</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=7 class=muted>暂无转发</td></tr>'}</table>`}
 function targetsTable(){let counts={};state.data.rules.forEach(r=>counts[r.ip]=(counts[r.ip]||0)+1);let rows=state.data.targets.map(t=>`<tr><td>${t.alias}</td><td>${t.ip}</td><td>${counts[t.ip]||0}</td><td class=actions><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`).join('');return `<table class=table><tr><th>别名</th><th>IP</th><th>规则数</th><th>操作</th></tr>${rows||'<tr><td colspan=4 class=muted>暂无主机</td></tr>'}</table>`}
-function modal(html){document.body.insertAdjacentHTML('beforeend',`<div class=modal onclick="if(event.target.className==='modal')this.remove()"><div class=dialog><div class=error-box></div>${html}</div></div>`)}
+function modal(html){document.body.insertAdjacentHTML('beforeend',`<div class=modal><div class=dialog><div class=error-box></div>${html}</div></div>`);let layer=document.body.lastElementChild;layer.addEventListener('click',e=>{if(e.target===layer)layer.remove()});return layer}
+function showInfo(title,text){let layer=modal(`<h2>${title}</h2><p class=dialog-copy>${text}</p><div class=dialog-actions><button class=primary data-confirm>确定</button></div>`);layer.querySelector('[data-confirm]').addEventListener('click',()=>layer.remove())}
+function confirmDialog(title,text,action){let layer=modal(`<h2>${title}</h2><p class=dialog-copy>${text}</p><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>确定</button></div>`),cancel=layer.querySelector('[data-cancel]'),confirmBtn=layer.querySelector('[data-confirm]');cancel.addEventListener('click',()=>layer.remove());confirmBtn.addEventListener('click',async()=>{let old=confirmBtn.textContent;confirmBtn.disabled=true;confirmBtn.textContent='处理中...';try{await action();layer.remove()}catch(e){if(e.status===401){layer.remove();expireSession()}else toast(msg(e))}finally{confirmBtn.disabled=false;confirmBtn.textContent=old}})}
+document.addEventListener('keydown',e=>{let layers=document.querySelectorAll('.modal'),layer=layers[layers.length-1];if(!layer)return;if(e.key==='Escape'){e.preventDefault();layer.remove();return}if(e.key==='Enter'&&!e.shiftKey&&e.target.tagName!=='TEXTAREA'){let button=layer.querySelector('[data-confirm],button.primary');if(button&&!button.disabled){e.preventDefault();button.click()}}})
 function parsePorts(value){let ports=value.trim().split(/[ ,]+/).filter(Boolean);if(!ports.length)throw new Error('请至少输入一个入口端口');let seen=new Set;for(let port of ports){if(!/^[0-9]+$/.test(port)||Number(port)<1||Number(port)>65535)throw new Error(`端口无效: ${port}；仅支持单个端口，请用空格或英文逗号分隔`);if(seen.has(port))throw new Error(`端口重复: ${port}`);seen.add(port)}return ports}
 function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join('');modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveRule(this)">保存</button></div>`)}
 async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});document.querySelector('.modal').remove();await load()})}
-async function delRules(lports){if(confirm('确认删除转发？')){try{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports})});await load()}catch(e){toast(msg(e))}}}
+function delRules(lports){confirmDialog('删除转发','确认删除该端口转发？',async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports}),timeout:30000});await load()})}
 function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP</label><input id=tip value="${t?.ip||''}"></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
 async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});document.querySelector('.modal').remove();await load()})}
-async function delTarget(t){if(confirm('确认删除主机？有转发规则时会阻止删除。')){try{await api('/api/targets/delete',{method:'POST',body:JSON.stringify({ip:t.ip})});await load()}catch(e){toast(msg(e))}}}
+function delTarget(t){confirmDialog('删除主机','确认删除该主机？存在转发规则时将阻止删除。',async()=>{await api('/api/targets/delete',{method:'POST',body:JSON.stringify({ip:t.ip}),timeout:30000});await load()})}
 function openPassword(){modal(`<h2>修改密码</h2><div class=field><label>旧密码</label><input id=oldp type=password></div><div class=field><label>新密码</label><input id=newp type=password></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="chgPwd(this)">保存</button></div>`)}
 async function chgPwd(btn){await runAction(btn,async()=>{await api('/api/password',{method:'POST',body:JSON.stringify({oldPassword:document.getElementById('oldp').value,newPassword:document.getElementById('newp').value})});document.querySelector('.modal').remove();expireSession();toast('密码已修改，请使用新密码重新登录')})}
 if(authToken()){loading();load()}else login();
