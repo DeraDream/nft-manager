@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v2.9
+# nftables 端口转发管理工具 v3.0
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="2.9"
-WEB_PANEL_VERSION="2.9"
+SCRIPT_VERSION="3.0"
+WEB_PANEL_VERSION="3.0"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -1102,6 +1102,7 @@ EOF
         log_action "安装并启用保活服务 ${KEEPALIVE_SERVICE_NAME}"
     else
         warn "保活服务启用失败，请手动执行: systemctl enable ${KEEPALIVE_SERVICE_NAME} && systemctl restart ${KEEPALIVE_SERVICE_NAME}"
+        return 1
     fi
 }
 
@@ -1148,8 +1149,8 @@ install_web_service() {
     local force_download="${1:-}"
     local start_mode="${2:-start}"
     if ! command -v python3 &>/dev/null; then
-        warn "未检测到 python3，已跳过 Web 面板安装。"
-        return 0
+        warn "未检测到 python3，无法安装 Web 面板。"
+        return 1
     fi
     install_web_panel_file "$force_download" || return 1
     mkdir -p "${CONF_DIR}" 2>/dev/null || true
@@ -1236,8 +1237,37 @@ install_manager_runtime() {
     install_keepalive_service
 }
 
+restart_runtime_services() {
+    local restart_ok=true
+    if ! command -v systemctl &>/dev/null; then
+        return 0
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ -f "${KEEPALIVE_SERVICE_FILE}" ]]; then
+        if ! systemctl enable "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1; then
+            restart_ok=false
+            warn "保活服务启用失败: ${KEEPALIVE_SERVICE_NAME}"
+        fi
+        if ! systemctl restart "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1; then
+            restart_ok=false
+            warn "保活服务重启失败: ${KEEPALIVE_SERVICE_NAME}"
+        fi
+    fi
+    if [[ -x "${WEB_PANEL_FILE}" && -f "${WEB_SERVICE_FILE}" ]]; then
+        if ! systemctl enable "${WEB_SERVICE_NAME}" >/dev/null 2>&1; then
+            restart_ok=false
+            warn "Web 面板服务启用失败: ${WEB_SERVICE_NAME}"
+        fi
+        if ! systemctl restart "${WEB_SERVICE_NAME}" >/dev/null 2>&1; then
+            restart_ok=false
+            warn "Web 面板服务重启失败: ${WEB_SERVICE_NAME}"
+        fi
+    fi
+    [[ "$restart_ok" == "true" ]]
+}
+
 sync_updated_runtime() {
-    local needs_web=false migration_ok=true
+    local needs_web=false migration_ok=true sync_ok=true
     if ! web_panel_installed || web_panel_needs_sync; then
         needs_web=true
     fi
@@ -1249,29 +1279,34 @@ sync_updated_runtime() {
 
     if [[ "$needs_web" == "true" ]]; then
         info "检测到 Web 面板缺失或版本不一致，正在同步 v${WEB_PANEL_VERSION}..."
-        install_web_service force defer || return 1
+        if ! install_web_service force defer; then
+            sync_ok=false
+            warn "Web 面板同步失败，已保留当前文件并将在最后恢复已有服务。"
+        fi
     else
         info "Web 面板版本 v${WEB_PANEL_VERSION} 已匹配，跳过文件部署。"
     fi
 
-    install_nexttrace || warn "NextTrace 未能完成安装，路由追踪功能暂不可用。"
-    install_keepalive_service defer || return 1
+    if [[ "$sync_ok" == "true" ]]; then
+        install_nexttrace || warn "NextTrace 未能完成安装，路由追踪功能暂不可用。"
+    fi
+    if ! install_keepalive_service defer; then
+        sync_ok=false
+        warn "保活服务同步失败，已在最后尝试恢复已有服务。"
+    fi
 
-    if command -v python3 &>/dev/null && [[ -x "${WEB_PANEL_FILE}" ]]; then
+    if [[ "$sync_ok" == "true" ]] && command -v python3 &>/dev/null && [[ -x "${WEB_PANEL_FILE}" ]]; then
         if ! python3 "${WEB_PANEL_FILE}" --migrate-only; then
             migration_ok=false
             warn "配置迁移未完成，已保留原配置；服务仍会恢复运行。"
         fi
     fi
 
-    if command -v systemctl &>/dev/null; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable "${KEEPALIVE_SERVICE_NAME}" "${WEB_SERVICE_NAME}" >/dev/null 2>&1 || true
-        systemctl restart "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 || true
-        systemctl restart "${WEB_SERVICE_NAME}" >/dev/null 2>&1 || true
+    if ! restart_runtime_services; then
+        sync_ok=false
     fi
 
-    [[ "$migration_ok" == "true" ]]
+    [[ "$sync_ok" == "true" && "$migration_ok" == "true" ]]
 }
 
 do_post_update() {
