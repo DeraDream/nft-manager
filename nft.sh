@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v1.8
+# nftables 端口转发管理工具 v1.9
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="1.8"
+SCRIPT_VERSION="1.9"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -26,7 +26,10 @@ KEEPALIVE_SERVICE_NAME="nft-forward-keepalive.service"
 KEEPALIVE_SERVICE_FILE="/etc/systemd/system/${KEEPALIVE_SERVICE_NAME}"
 WEB_SERVICE_NAME="nft-manager-web.service"
 WEB_SERVICE_FILE="/etc/systemd/system/${WEB_SERVICE_NAME}"
-UPDATE_URL="${NFT_FORWARD_UPDATE_URL:-https://raw.githubusercontent.com/DeraDream/nft-manager/main/nft.sh}"
+DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/DeraDream/nft-manager/main/nft.sh"
+FALLBACK_UPDATE_URL="https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/nft.sh"
+UPDATE_URL="${NFT_FORWARD_UPDATE_URL:-$DEFAULT_UPDATE_URL}"
+UPDATE_DOWNLOADED_URL=""
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
 UPDATE_CHECKED=false
 UPDATE_AVAILABLE=false
@@ -773,7 +776,7 @@ load_update_url() {
         sed -nE '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d; 1p' "$UPDATE_URL_FILE" 2>/dev/null
         return
     fi
-    printf '%s' "$UPDATE_URL"
+    printf '%s' "$DEFAULT_UPDATE_URL"
 }
 
 persist_update_url() {
@@ -795,15 +798,45 @@ version_gt() {
 }
 
 download_update_script() {
-    local dest="$1"
-    UPDATE_URL=$(load_update_url)
-    if [[ -z "$UPDATE_URL" ]]; then
+    local dest="$1" source_url
+    source_url=$(load_update_url)
+    if [[ -z "$source_url" ]]; then
         return 2
     fi
+
+    if download_remote_file "$source_url" "$dest" 20; then
+        UPDATE_URL="$source_url"
+        UPDATE_DOWNLOADED_URL="$source_url"
+        return 0
+    fi
+
+    # 默认 GitHub raw 在部分网络环境不可用时，自动尝试官方 jsDelivr 镜像。
+    if [[ "$source_url" == "$DEFAULT_UPDATE_URL" ]] && download_remote_file "$FALLBACK_UPDATE_URL" "$dest" 20; then
+        UPDATE_URL="$FALLBACK_UPDATE_URL"
+        UPDATE_DOWNLOADED_URL="$FALLBACK_UPDATE_URL"
+        return 0
+    fi
+
+    return 1
+}
+
+cache_busted_url() {
+    local url="$1" sep="?"
+    case "$url" in
+        http://*|https://*) ;;
+        *) printf '%s' "$url"; return ;;
+    esac
+    [[ "$url" == *\?* ]] && sep="&"
+    printf '%s%snft_manager_cache=%s%s' "$url" "$sep" "$(date +%s)" "$RANDOM"
+}
+
+download_remote_file() {
+    local source_url="$1" dest="$2" timeout="${3:-30}" request_url
+    request_url=$(cache_busted_url "$source_url")
     if command -v curl &>/dev/null; then
-        curl -fsSL --connect-timeout 8 --max-time 20 "$UPDATE_URL" -o "$dest"
+        curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time "$timeout" "$request_url" -o "$dest"
     elif command -v wget &>/dev/null; then
-        wget -q --timeout=20 -O "$dest" "$UPDATE_URL"
+        wget -q --tries=3 --timeout="$timeout" -O "$dest" "$request_url"
     else
         return 3
     fi
@@ -815,10 +848,17 @@ load_web_panel_url() {
         return
     fi
 
-    local update_url
-    update_url=$(load_update_url)
-    if [[ "$update_url" == */nft.sh ]]; then
-        printf '%s' "${update_url%/nft.sh}/web_panel.py"
+    local update_url update_base update_query
+    update_url="${UPDATE_DOWNLOADED_URL:-$UPDATE_URL}"
+    [[ -n "$update_url" ]] || update_url=$(load_update_url)
+    update_base="${update_url%%\?*}"
+    update_query="${update_url#*\?}"
+    if [[ "$update_base" == */nft.sh ]]; then
+        if [[ "$update_url" == *\?* ]]; then
+            printf '%s?%s' "${update_base%/nft.sh}/web_panel.py" "$update_query"
+        else
+            printf '%s' "${update_base%/nft.sh}/web_panel.py"
+        fi
         return
     fi
 
@@ -1037,21 +1077,9 @@ install_web_panel_file() {
 
     tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-manager-web.$$") || true
     web_panel_url=$(load_web_panel_url)
-    if command -v curl &>/dev/null; then
-        curl -fsSL --connect-timeout 8 --max-time 30 "${web_panel_url}" -o "$tmp_file" || {
-            rm -f "$tmp_file" 2>/dev/null || true
-            err "下载 Web 面板失败: ${web_panel_url}"
-            return 1
-        }
-    elif command -v wget &>/dev/null; then
-        wget -q --timeout=30 -O "$tmp_file" "${web_panel_url}" || {
-            rm -f "$tmp_file" 2>/dev/null || true
-            err "下载 Web 面板失败: ${web_panel_url}"
-            return 1
-        }
-    else
+    if ! download_remote_file "$web_panel_url" "$tmp_file" 30; then
         rm -f "$tmp_file" 2>/dev/null || true
-        err "缺少 curl/wget，无法下载 Web 面板。"
+        err "下载 Web 面板失败: ${web_panel_url}"
         return 1
     fi
 
