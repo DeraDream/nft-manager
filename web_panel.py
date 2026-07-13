@@ -21,7 +21,7 @@ TABLE_NAME = "port_forward"
 HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
-SESSIONS = {}
+SESSION_MAX_AGE = 86400
 
 
 def run(cmd):
@@ -102,6 +102,29 @@ def set_password(old_password, new_password):
     with open(AUTH_FILE, "w", encoding="utf-8") as f:
         f.write(f"{user}|{salt}|{digest}\n")
     os.chmod(AUTH_FILE, 0o600)
+
+
+def sign_session(username, ts):
+    _, _, digest_b64 = read_auth()
+    msg = f"{username}|{ts}"
+    sig = hmac.new(digest_b64.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
+
+
+def verify_session(token):
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        username, ts_text, sig = raw.split("|", 2)
+        ts = int(ts_text)
+    except Exception:
+        return False
+    if time.time() - ts > SESSION_MAX_AGE:
+        return False
+    user, _, digest_b64 = read_auth()
+    if username != user:
+        return False
+    expected = hmac.new(digest_b64.encode(), f"{username}|{ts}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
 
 
 def read_targets():
@@ -342,11 +365,11 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-
 @media(max-width:900px){.side{position:static;width:100%}.app{display:block}.main{margin:0}.cards{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
 </style></head><body><div id="root"></div><script>
 let state={view:'dash',data:null,ports:[],edit:null};
-const api=(p,o={})=>fetch(p,{headers:{'Content-Type':'application/json'},credentials:'same-origin',...o}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||'请求失败');return j});
+const api=(p,o={})=>fetch(p,{headers:{'Content-Type':'application/json'},credentials:'same-origin',...o}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j});
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 function login(){root.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>nft-manager</h2><p class=muted>默认账号 admin / admin</p><input name=u value=admin placeholder=账号><input name=p type=password value=admin placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
 async function doLogin(e){e.preventDefault();try{await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});load()}catch(err){alert(err.message)}}
-async function load(){try{state.data=await api('/api/state');render()}catch(e){login()}}
+async function load(){try{state.data=await api('/api/state');render()}catch(e){if(e.status===401)login();else root.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){state.view=v;render()}
 function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');root.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v1.0</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>目标主机</h3><div class=big>${d.stats.targetCount}</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div><div class=card><h3>活跃转发</h3><div class=big>${d.stats.activeCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2><div class=chart></div></div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
@@ -386,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
     def authed(self):
         cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
         sid = cookie.get("sid")
-        return bool(sid and sid.value in SESSIONS)
+        return bool(sid and verify_session(sid.value))
 
     def require(self):
         if not self.authed():
@@ -414,13 +437,14 @@ class Handler(BaseHTTPRequestHandler):
             data = self.body()
             if path == "/api/login":
                 if verify_password(data.get("username", ""), data.get("password", "")):
-                    sid = secrets.token_urlsafe(32)
-                    SESSIONS[sid] = time.time()
+                    sid = sign_session(data.get("username", ""), int(time.time()))
+                    raw = b'{"ok":true}'
                     self.send_response(200)
-                    self.send_header("Set-Cookie", f"sid={sid}; HttpOnly; Path=/; SameSite=Lax")
+                    self.send_header("Set-Cookie", f"sid={sid}; Max-Age={SESSION_MAX_AGE}; HttpOnly; Path=/; SameSite=Lax")
                     self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
-                    self.wfile.write(b'{"ok":true}')
+                    self.wfile.write(raw)
                 else:
                     self.send_json({"error": "账号或密码错误"}, 403)
                 return
