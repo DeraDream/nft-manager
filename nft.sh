@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v1.9
+# nftables 端口转发管理工具 v2.0
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="1.9"
+SCRIPT_VERSION="2.0"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -942,7 +942,9 @@ do_update() {
     if version_gt "$remote_version" "$SCRIPT_VERSION"; then
         info "发现新版本: v${remote_version}"
     elif [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
-        info "当前已是最新版本，将同步脚本、Web 面板和 systemd 服务。"
+        info "当前已是最新版本，未执行更新。"
+        rm -f "$tmp_file" 2>/dev/null || true
+        return
     else
         info "远程版本: v${remote_version}"
         warn "远程版本低于当前版本，已取消更新。"
@@ -962,8 +964,20 @@ do_update() {
         return
     }
 
+    local services_stopped=false
+    if [[ "$install_target" == "$SCRIPT_INSTALL_FILE" ]] && command -v systemctl &>/dev/null; then
+        info "正在停止 nft-forward-keepalive 和 nft-manager-web 服务..."
+        systemctl stop "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 || true
+        systemctl stop "${WEB_SERVICE_NAME}" >/dev/null 2>&1 || true
+        services_stopped=true
+    fi
+
     install -m 755 "$tmp_file" "$install_target" 2>/dev/null || {
         rm -f "$tmp_file" 2>/dev/null || true
+        if [[ "$services_stopped" == "true" ]]; then
+            systemctl restart "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 || true
+            systemctl restart "${WEB_SERVICE_NAME}" >/dev/null 2>&1 || true
+        fi
         err "写入新版脚本失败。"
         return
     }
@@ -977,6 +991,10 @@ EOF
         chmod +x "${GLOBAL_CMD}" 2>/dev/null || true
         install_keepalive_service
         if ! install_web_service force; then
+            if [[ "$services_stopped" == "true" ]]; then
+                systemctl restart "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 || true
+                systemctl restart "${WEB_SERVICE_NAME}" >/dev/null 2>&1 || true
+            fi
             err "Web 面板更新失败，脚本已写入但服务未完整同步。请检查网络后重新执行更新。"
             return
         fi
@@ -987,7 +1005,6 @@ EOF
     if [[ "$install_target" == "$SCRIPT_INSTALL_FILE" ]]; then
         info "已同步更新 Web 面板并重启相关服务。"
     fi
-    warn "请重新执行 nft 进入新版菜单。"
     log_action "更新脚本: ${SCRIPT_VERSION} -> ${remote_version}"
     exit 0
 }
