@@ -296,22 +296,15 @@ def parse_port_tokens(tokens):
         token = str(token).strip()
         if not token:
             continue
-        if "-" in token:
-            a, b = token.split("-", 1)
-            if not (a.isdigit() and b.isdigit()):
-                raise ValueError(f"端口范围无效: {token}")
-            start, end = int(a), int(b)
-        else:
-            if not token.isdigit():
-                raise ValueError(f"端口无效: {token}")
-            start = end = int(token)
-        if not valid_port(start) or not valid_port(end) or start > end:
-            raise ValueError(f"端口范围无效: {token}")
-        for p in range(start, end + 1):
-            if p in seen:
-                raise ValueError(f"端口重复或重叠: {p}")
-            seen.add(p)
-            ports.append(p)
+        if not token.isdigit():
+            raise ValueError(f"端口无效: {token}；仅支持单个端口，请使用空格或英文逗号分隔多个端口")
+        port = int(token)
+        if not valid_port(port):
+            raise ValueError(f"端口无效: {token}")
+        if port in seen:
+            raise ValueError(f"端口重复: {port}")
+        seen.add(port)
+        ports.append(port)
     if not ports:
         raise ValueError("请至少输入一个入口端口")
     if len(ports) > MAX_BATCH_RULES:
@@ -332,12 +325,8 @@ def expand_forward(payload):
         if not valid_port(start) or start + len(in_ports) - 1 > 65535:
             raise ValueError("出口起始端口无效")
         out_ports = [start + i for i in range(len(in_ports))]
-    elif mode == "range":
-        out_ports = parse_port_tokens(payload.get("outPorts", []))
-        if len(out_ports) != len(in_ports):
-            raise ValueError("入口端口数量和出口端口数量必须一致")
     else:
-        raise ValueError("映射方式无效")
+        raise ValueError("映射方式无效，仅支持与入口端口一致或指定出口起始端口")
     prefix = clean_label(payload.get("alias", ""))
     desc = clean_label(payload.get("desc", ""))
     batch = len(in_ports) > 1
@@ -412,8 +401,8 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-
 const appRoot=document.getElementById('root');
 const authToken=()=>localStorage.getItem('nft_manager_token')||'';
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
-let state={view:'dash',data:null,ports:[],edit:null};
-const api=(p,o={})=>{let headers={'Content-Type':'application/json',...(o.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),12000);return fetch(p,{credentials:'same-origin',...o,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
+let state={view:'dash',data:null,edit:null};
+const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
 function toast(text){document.querySelectorAll('.toast').forEach(x=>x.remove());document.body.insertAdjacentHTML('beforeend',`<div class=toast>${text}</div>`);setTimeout(()=>document.querySelector('.toast')?.remove(),5000)}
@@ -426,7 +415,7 @@ function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(eve
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err))}finally{btn.disabled=false;btn.textContent=old}}
 async function load(){try{state.data=await api('/api/state');render()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){state.view=v;render()}
-function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v1.7</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
+function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v1.8</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>目标主机</h3><div class=big>${d.stats.targetCount}</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div><div class=card><h3>活跃转发</h3><div class=big>${d.stats.activeCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2><div class=chart></div></div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
  if(state.view==='rules')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">转发管理</h2><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}</div>`);
  if(state.view==='targets')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">主机管理</h2><button class=primary onclick="openTarget()">新增主机</button></div>${targetsTable()}</div>`);
@@ -434,10 +423,9 @@ function render(){let d=state.data;if(state.view==='dash')return shell(`<div cla
 function rulesTable(limit){let rows=state.data.rules.slice(0,limit?8:9999).map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${r.alias||'-'}</td><td>${r.lport}</td><td>${r.dport}</td><td>${fmt(r.bytes)}</td><td class="status ${r.active?'on':''}">${r.active?'活跃':'空闲'}</td><td class=actions><button onclick='openRule(${JSON.stringify(r)})'>编辑</button><button class=danger onclick="delRules([${r.lport}])">删除</button></td></tr>`).join('');return `<table class=table><tr><th>目标主机</th><th>别名</th><th>入口端口</th><th>出口端口</th><th>流量</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=7 class=muted>暂无转发</td></tr>'}</table>`}
 function targetsTable(){let counts={};state.data.rules.forEach(r=>counts[r.ip]=(counts[r.ip]||0)+1);let rows=state.data.targets.map(t=>`<tr><td>${t.alias}</td><td>${t.ip}</td><td>${counts[t.ip]||0}</td><td class=actions><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`).join('');return `<table class=table><tr><th>别名</th><th>IP</th><th>规则数</th><th>操作</th></tr>${rows||'<tr><td colspan=4 class=muted>暂无主机</td></tr>'}</table>`}
 function modal(html){document.body.insertAdjacentHTML('beforeend',`<div class=modal onclick="if(event.target.className==='modal')this.remove()"><div class=dialog><div class=error-box></div>${html}</div></div>`)}
-function addTag(input){let v=input.value.trim();if(!v)return true;let m=v.match(/^([0-9]+)(?:-([0-9]+))?$/);if(!m){setModalError('请输入端口或端口段，如 100 或 100-200');return false}let start=Number(m[1]),end=Number(m[2]||m[1]);if(start<1||end>65535||start>end){setModalError('端口范围必须在 1-65535 之间，且起始端口不能大于结束端口');return false}if(state.ports.includes(v)){setModalError('端口或端口段已添加');return false}state.ports.push(v);input.value='';clearModalError();drawTags();return true}
-function drawTags(){let box=document.querySelector('.tags');box.querySelectorAll('.tag').forEach(x=>x.remove());state.ports.forEach((p,i)=>box.insertAdjacentHTML('afterbegin',`<span class=tag>${p}<button onclick="state.ports.splice(${i},1);drawTags()">×</button></span>`))}
-function openRule(r=null){state.edit=r;state.ports=r?[String(r.lport)]:[];let opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join('');modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口范围</label><div class=tags><input class=tag-input onkeydown="if(event.key==='Enter'){event.preventDefault();addTag(this)}" onblur="addTag(this)" placeholder="输入 100 或 100-200 后回车"></div></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same>与入口端口一致</option><option value=start>指定出口起始端口</option><option value=range>指定出口端口范围</option></select></div><div class="field hidden" id=outBox><label>出口端口</label><input id=out placeholder="2000 或 2000-2100"></div></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveRule(this)">保存</button></div>`);drawTags()}
-async function saveRule(btn){await runAction(btn,async()=>{let portInput=document.querySelector('.modal .tag-input');if(!addTag(portInput))return;let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim();let body={ip:document.getElementById('ip').value,ports:state.ports,mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value};if(!body.ports.length)throw new Error('请至少输入一个入口端口');if(mode==='start')body.outStart=out;if(mode==='range')body.outPorts=out?[out]:[];if(state.edit){body.oldLport=state.edit.lport;body.ports=[String(state.edit.lport)];if(mode==='same')body.ports=state.ports;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body)})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body)});document.querySelector('.modal').remove();await load()})}
+function parsePorts(value){let ports=value.trim().split(/[ ,]+/).filter(Boolean);if(!ports.length)throw new Error('请至少输入一个入口端口');let seen=new Set;for(let port of ports){if(!/^[0-9]+$/.test(port)||Number(port)<1||Number(port)>65535)throw new Error(`端口无效: ${port}；仅支持单个端口，请用空格或英文逗号分隔`);if(seen.has(port))throw new Error(`端口重复: ${port}`);seen.add(port)}return ports}
+function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join('');modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveRule(this)">保存</button></div>`)}
+async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});document.querySelector('.modal').remove();await load()})}
 async function delRules(lports){if(confirm('确认删除转发？')){try{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports})});await load()}catch(e){toast(msg(e))}}}
 function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP</label><input id=tip value="${t?.ip||''}"></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
 async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});document.querySelector('.modal').remove();await load()})}
