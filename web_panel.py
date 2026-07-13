@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -24,6 +25,7 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
+WEB_PANEL_VERSION = "2.9"
 
 
 def resolve_nft_bin():
@@ -321,16 +323,16 @@ def migrate_legacy_data():
         write_targets(targets)
 
     if not os.path.exists(CONF_FILE) or not rules:
-        return
+        return True
 
     try:
         text = open(CONF_FILE, encoding="utf-8", errors="ignore").read()
     except OSError:
-        return
+        return False
 
     needs_migration = "WEB_META|2" not in text or "META_COUNTER_UPLOAD" not in text
     if not needs_migration:
-        return
+        return True
 
     original_text = text
     temp_file = f"{CONF_FILE}.migrate.{secrets.token_hex(8)}"
@@ -339,9 +341,10 @@ def migrate_legacy_data():
         check = run_nft(["-c", "-f", temp_file], timeout=15)
         if check.returncode != 0:
             print(f"nft-manager: 旧规则迁移校验失败，已保留原配置：{check.stderr.strip()}")
-            return
+            return False
         os.replace(temp_file, CONF_FILE)
         reload_rules()
+        return True
     except Exception as e:
         restore_file = f"{CONF_FILE}.restore.{secrets.token_hex(8)}"
         try:
@@ -355,6 +358,7 @@ def migrate_legacy_data():
             if os.path.exists(restore_file):
                 os.unlink(restore_file)
         print(f"nft-manager: 旧规则迁移失败，已尝试恢复原配置：{e}")
+        return False
     finally:
         if os.path.exists(temp_file):
             os.unlink(temp_file)
@@ -569,7 +573,7 @@ function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(eve
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err))}finally{btn.disabled=false;btn.textContent=old}}
 async function load(){try{state.data=await api('/api/state');render()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){state.view=v;render()}
-function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v2.8</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
+function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v2.9</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function hourText(stamp){return String(new Date(stamp*1000).getHours()).padStart(2,'0')+':00'}
 function trafficChart(){let h=state.data.history||[],w=960,ht=250,p=34,max=Math.max(1,...h.map(x=>x.bytes)),pts=h.map((x,i)=>`${p+i*(w-p*2)/23},${ht-p-(x.bytes/max)*(ht-p*2)}`),area=`${p},${ht-p} ${pts.join(' ')} ${w-p},${ht-p}`,grid=[0,1,2,3,4].map(i=>{let y=p+i*(ht-p*2)/4;return `<line class=chart-grid x1=${p} y1=${y} x2=${w-p} y2=${y}/><text class=chart-label x=2 y=${y+4}>${fmt(max*(4-i)/4)}</text>`}).join(''),hours=h.map((x,i)=>i%3===0?`<text class=chart-label x=${p+i*(w-p*2)/23-10} y=${ht-6}>${hourText(x.hour)}</text>`:'').join('');return `<svg class=chart-svg viewBox="0 0 ${w} ${ht}" role="img"><g>${grid}</g><polygon class=chart-fill points="${area}"/><polyline class=chart-line points="${pts.join(' ')}"/>${hours}</svg>`}
 function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
@@ -712,6 +716,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ensure_auth()
-    migrate_legacy_data()
+    migration_ok = migrate_legacy_data()
+    if "--migrate-only" in sys.argv:
+        raise SystemExit(0 if migration_ok else 1)
     print(f"nft-manager web listening on {HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
