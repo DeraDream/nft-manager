@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v2.7
+# nftables 端口转发管理工具 v2.8
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="2.7"
+SCRIPT_VERSION="2.8"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -1020,7 +1020,6 @@ do_update() {
 exec "${SCRIPT_INSTALL_FILE}" "\$@"
 EOF
         chmod +x "${GLOBAL_CMD}" 2>/dev/null || true
-        install_keepalive_service
         if ! install_web_service force; then
             if [[ "$services_stopped" == "true" ]]; then
                 systemctl restart "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -1030,6 +1029,7 @@ EOF
             return
         fi
         install_nexttrace || warn "NextTrace 未能完成安装，路由追踪功能暂不可用。"
+        install_keepalive_service
     fi
 
     info "更新完成: v${SCRIPT_VERSION} → v${remote_version}"
@@ -1236,9 +1236,9 @@ install_nexttrace() {
 install_manager_runtime() {
     install_manager_files || return 1
     persist_update_url
-    install_keepalive_service
     install_web_service || return 1
     install_nexttrace || true
+    install_keepalive_service
 }
 
 bootstrap_legacy_web_panel() {
@@ -1336,6 +1336,8 @@ do_keepalive() {
     init_conf || exit 1
     enable_ip_forward
     reload_rules || exit 1
+    # 旧版菜单更新会重启本服务；在旧规则已成功恢复后补装 Web，避免并发重载规则。
+    bootstrap_legacy_web_panel
     log_action "保活服务已确认规则加载"
 }
 
