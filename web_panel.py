@@ -155,11 +155,9 @@ def parse_rules():
     if not os.path.exists(CONF_FILE):
         return rules
     text = open(CONF_FILE, encoding="utf-8", errors="ignore").read().splitlines()
-    has_meta = any("META_RULE|" in line for line in text)
-    if has_meta:
-        for line in text:
-            if "META_RULE|" not in line:
-                continue
+    seen_lports = set()
+    for line in text:
+        if "META_RULE|" in line:
             meta = line.split("META_RULE|", 1)[1]
             parts = (meta.split("|") + ["", "", ""])[:6]
             try:
@@ -174,11 +172,16 @@ def parse_rules():
                     "alias": clean_label(parts[3]),
                     "desc": clean_label(parts[5] if len(parts) > 5 else ""),
                 })
-        return rules
+                seen_lports.add(lport)
     for line in text:
         m = re.search(r"tcp dport (\d+).*dnat to ([0-9.]+):(\d+)", line)
-        if m:
-            rules.append({"lport": int(m.group(1)), "ip": m.group(2), "dport": int(m.group(3)), "alias": "", "desc": ""})
+        if not m:
+            continue
+        lport = int(m.group(1))
+        if lport in seen_lports:
+            continue
+        rules.append({"lport": lport, "ip": m.group(2), "dport": int(m.group(3)), "alias": "", "desc": ""})
+        seen_lports.add(lport)
     return rules
 
 
@@ -187,6 +190,7 @@ def write_rules(rules):
     lip = local_ip()
     with open(CONF_FILE, "w", encoding="utf-8") as f:
         f.write("#!/usr/sbin/nft -f\n\n")
+        f.write("# WEB_META|1\n\n")
         f.write(f"define LOCAL_IP = {lip}\n\n")
         f.write(f"table ip {TABLE_NAME} {{\n")
         f.write("    chain prerouting {\n        type nat hook prerouting priority -100; policy accept;\n")
@@ -210,6 +214,41 @@ def reload_rules():
     res = run(["nft", "-f", CONF_FILE])
     if res.returncode != 0:
         raise RuntimeError(res.stderr.strip() or "nft 规则加载失败")
+
+
+def migrate_legacy_data():
+    ensure_dirs()
+    rules = parse_rules()
+    targets = read_targets()
+
+    target_ips = {t["ip"] for t in targets}
+    changed_targets = False
+    for r in rules:
+        if r["ip"] not in target_ips:
+            targets.append({"alias": f"目标-{r['ip'].replace('.', '-')}", "ip": r["ip"]})
+            target_ips.add(r["ip"])
+            changed_targets = True
+    if changed_targets:
+        write_targets(targets)
+
+    if not os.path.exists(CONF_FILE) or not rules:
+        return
+
+    try:
+        text = open(CONF_FILE, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return
+
+    needs_migration = "WEB_META|1" not in text or "counter dnat to" not in text
+    if not needs_migration:
+        return
+
+    write_rules(rules)
+    try:
+        reload_rules()
+    except Exception:
+        # Keep the migrated file for future operations; the dashboard can still read it.
+        pass
 
 
 def nft_counters():
@@ -335,6 +374,7 @@ def delete_rules(payload):
 
 
 def dashboard():
+    migrate_legacy_data()
     targets = read_targets()
     rules = parse_rules()
     counters = nft_counters()
@@ -494,5 +534,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ensure_auth()
+    migrate_legacy_data()
     print(f"nft-manager web listening on {HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

@@ -606,6 +606,8 @@ write_conf_file() {
     cat > "${tmp_file}" <<EOF
 #!/usr/sbin/nft -f
 
+# WEB_META|1
+
 # --- 本机 IP（自动获取，用于 SNAT 回源）
 define LOCAL_IP = ${local_ip}
 
