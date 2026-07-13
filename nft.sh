@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.0
+# nftables 端口转发管理工具 v3.1
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.0"
-WEB_PANEL_VERSION="3.0"
+SCRIPT_VERSION="3.1"
+WEB_PANEL_VERSION="3.1"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -613,7 +613,7 @@ write_conf_file() {
     cat > "${tmp_file}" <<EOF
 #!/usr/sbin/nft -f
 
-# WEB_META|1
+# WEB_META|3
 
 # --- 本机 IP（自动获取，用于 SNAT 回源）
 define LOCAL_IP = ${local_ip}
@@ -630,7 +630,7 @@ EOF
         alias=$(clean_label "$alias")
         cat >> "${tmp_file}" <<EOF
 
-        # META_RULE|${lport}|${dip}|${dport}|${alias}
+        # META_RULE|${lport}|${dip}|${dport}|${alias}|||total|1
         # 转发: 本机:${lport} -> ${dip}:${dport}${alias:+ (${alias})}
         tcp dport ${lport} counter dnat to ${dip}:${dport}
         udp dport ${lport} counter dnat to ${dip}:${dport}
@@ -652,6 +652,25 @@ EOF
         # 回源: 发往 ${dip}:${dport} 的已 DNAT 流量, SNAT 为本机 IP
         ip daddr ${dip} tcp dport ${dport} ct status dnat snat to \$LOCAL_IP
         ip daddr ${dip} udp dport ${dport} ct status dnat snat to \$LOCAL_IP
+EOF
+    done
+
+    cat >> "${tmp_file}" <<EOF
+    }
+
+    # --- FORWARD (Web 流量统计) ---
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+EOF
+
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport dip dport alias <<< "$rule"
+        cat >> "${tmp_file}" <<EOF
+
+        ip daddr ${dip} tcp dport ${dport} ct status dnat counter comment "META_COUNTER_UPLOAD|${lport}|${dip}|${dport}"
+        ip daddr ${dip} udp dport ${dport} ct status dnat counter comment "META_COUNTER_UPLOAD|${lport}|${dip}|${dport}"
+        ip saddr ${dip} tcp sport ${dport} ct status dnat counter comment "META_COUNTER_DOWNLOAD|${lport}|${dip}|${dport}"
+        ip saddr ${dip} udp sport ${dport} ct status dnat counter comment "META_COUNTER_DOWNLOAD|${lport}|${dip}|${dport}"
 EOF
     done
 

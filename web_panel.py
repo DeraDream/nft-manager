@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import http.cookies
@@ -8,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -25,7 +27,7 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.0"
+WEB_PANEL_VERSION = "3.1"
 
 
 def resolve_nft_bin():
@@ -95,6 +97,66 @@ def nexttrace_route(ip):
         if output:
             output += "\n\n"
         return output + "[NextTrace 执行超时：已停止，最长等待 120 秒]"
+
+
+def ping_target(ip):
+    if not valid_ip(ip):
+        return {"reachable": False, "latency": None}
+    try:
+        result = run(["ping", "-n", "-c", "1", "-W", "2", ip], timeout=4)
+    except Exception:
+        return {"reachable": False, "latency": None}
+    if result.returncode != 0:
+        return {"reachable": False, "latency": None}
+    match = re.search(r"time[=<]\s*([0-9.]+)\s*ms", result.stdout)
+    return {"reachable": True, "latency": float(match.group(1)) if match else 0.0}
+
+
+def tcp_connect_target(ip, port):
+    if not valid_ip(ip) or not valid_port(port):
+        return {"reachable": False, "latency": None}
+    started = time.perf_counter()
+    try:
+        with socket.create_connection((ip, port), timeout=3):
+            latency = round((time.perf_counter() - started) * 1000, 1)
+            return {"reachable": True, "latency": latency}
+    except OSError:
+        return {"reachable": False, "latency": None}
+
+
+def parallel_probes(items, probe):
+    if not items:
+        return {}
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(items))) as pool:
+        future_map = {pool.submit(probe, value): key for key, value in items.items()}
+        for future in concurrent.futures.as_completed(future_map):
+            key = future_map[future]
+            try:
+                results[key] = future.result()
+            except Exception:
+                results[key] = {"reachable": False, "latency": None}
+    return results
+
+
+def target_latency_checks():
+    return parallel_probes({target["ip"]: target["ip"] for target in read_targets()}, ping_target)
+
+
+def rule_connectivity_checks():
+    checks = {}
+    for rule in parse_rules():
+        if rule.get("enabled", True):
+            checks[str(rule["lport"])] = (rule["ip"], rule["dport"])
+        else:
+            checks[str(rule["lport"])] = None
+
+    def probe(value):
+        if value is None:
+            return {"reachable": False, "latency": None, "skipped": True}
+        return tcp_connect_target(*value)
+
+    return parallel_probes(checks, probe)
 
 
 def local_ip():
@@ -253,7 +315,7 @@ def write_rules_file(path, rules):
     lip = local_ip()
     with open(path, "w", encoding="utf-8") as f:
         f.write("#!/usr/sbin/nft -f\n\n")
-        f.write("# WEB_META|2\n\n")
+        f.write("# WEB_META|3\n\n")
         f.write(f"define LOCAL_IP = {lip}\n\n")
         f.write(f"table ip {TABLE_NAME} {{\n")
         f.write("    chain prerouting {\n        type nat hook prerouting priority -100; policy accept;\n")
@@ -279,12 +341,12 @@ def write_rules_file(path, rules):
         for r in rules:
             if not r.get("enabled", True):
                 continue
-            f.write(f"\n        # META_COUNTER_UPLOAD|{r['lport']}|{r['ip']}|{r['dport']}\n")
-            f.write(f"        ip daddr {r['ip']} tcp dport {r['dport']} ct status dnat counter\n")
-            f.write(f"        ip daddr {r['ip']} udp dport {r['dport']} ct status dnat counter\n")
-            f.write(f"\n        # META_COUNTER_DOWNLOAD|{r['lport']}|{r['ip']}|{r['dport']}\n")
-            f.write(f"        ip saddr {r['ip']} tcp sport {r['dport']} ct status dnat counter\n")
-            f.write(f"        ip saddr {r['ip']} udp sport {r['dport']} ct status dnat counter\n")
+            upload_marker = f"META_COUNTER_UPLOAD|{r['lport']}|{r['ip']}|{r['dport']}"
+            download_marker = f"META_COUNTER_DOWNLOAD|{r['lport']}|{r['ip']}|{r['dport']}"
+            f.write(f"        ip daddr {r['ip']} tcp dport {r['dport']} ct status dnat counter comment \"{upload_marker}\"\n")
+            f.write(f"        ip daddr {r['ip']} udp dport {r['dport']} ct status dnat counter comment \"{upload_marker}\"\n")
+            f.write(f"        ip saddr {r['ip']} tcp sport {r['dport']} ct status dnat counter comment \"{download_marker}\"\n")
+            f.write(f"        ip saddr {r['ip']} udp sport {r['dport']} ct status dnat counter comment \"{download_marker}\"\n")
         f.write("    }\n}\n")
 
 
@@ -330,7 +392,7 @@ def migrate_legacy_data():
     except OSError:
         return False
 
-    needs_migration = "WEB_META|2" not in text or "META_COUNTER_UPLOAD" not in text
+    needs_migration = "WEB_META|3" not in text or 'comment "META_COUNTER_UPLOAD|' not in text
     if not needs_migration:
         return True
 
@@ -386,13 +448,10 @@ def nft_counters():
     current = None
     direction = None
     for line in out.splitlines():
-        if "META_COUNTER_UPLOAD|" in line or "META_COUNTER_DOWNLOAD|" in line:
-            marker = "META_COUNTER_UPLOAD|" if "META_COUNTER_UPLOAD|" in line else "META_COUNTER_DOWNLOAD|"
-            parts = line.split(marker, 1)[1].split("|")
-            if len(parts) >= 3:
-                current = f"{parts[0]}|{parts[1]}|{parts[2]}"
-                direction = "upload" if marker == "META_COUNTER_UPLOAD|" else "download"
-            continue
+        marker = re.search(r"META_COUNTER_(UPLOAD|DOWNLOAD)\|(\d+)\|([0-9.]+)\|(\d+)", line)
+        if marker:
+            current = f"{marker.group(2)}|{marker.group(3)}|{marker.group(4)}"
+            direction = "upload" if marker.group(1) == "UPLOAD" else "download"
         if current and direction and "counter packets" in line:
             m = re.search(r"counter packets (\d+) bytes (\d+)", line)
             if m:
@@ -553,13 +612,13 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-
 .app{display:flex;min-height:100vh}.side{width:238px;background:#020303;border-right:1px solid #2a2d35;padding:28px 16px;position:fixed;inset:0 auto 0 0}.brand{font-weight:800;font-size:18px;margin-bottom:2px}.ver{font-size:12px;color:var(--muted);margin-bottom:34px}.nav button{width:100%;text-align:left;margin:5px 0;background:transparent;color:#d9dde7}.nav button.active{background:#112846;color:#0b84ff}.foot{position:absolute;bottom:18px;color:#737b89;font-size:12px;left:70px}
 .main{margin-left:238px;flex:1}.top{height:54px;border-bottom:1px solid #2a2d35;display:flex;align-items:center;justify-content:flex-end;padding:0 26px}.user{font-weight:700}
 .content{padding:18px 24px 40px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.rules-toolbar{justify-content:flex-end}.rule-table-wrap{border:1px solid var(--line);border-radius:8px;overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.table tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.pill{display:inline-flex;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.metric.upload{color:#46a6ff}.metric.download{color:#20d98a}.metric.total{color:#b779ff}.actions{display:flex;align-items:center;gap:8px}.actions .switch{margin-right:12px}.actions button{padding:6px 10px;margin:0}.hidden{display:none!important}.view-switch{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}.view-switch button{border-radius:0;background:#17181c;padding:7px 11px}.view-switch button.active{background:#1d4d8a}.switch{position:relative;display:inline-flex;width:38px;height:22px;vertical-align:middle;flex:none}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#4a252a;border-radius:22px}.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}.switch input:checked+.slider{background:#16855b}.switch input:checked+.slider:before{transform:translateX(16px)}.rule-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.rule-card{border:1px solid var(--line);background:#111318;padding:14px;border-radius:8px}.rule-card.disabled{opacity:.6}.rule-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.rule-card h3{font-size:15px;margin:0 0 8px}.rule-card .route{color:#cdd4e0;margin:7px 0}.rule-card .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid #2a2d35;padding-top:10px;margin-top:10px}.rule-card .metrics span{font-size:12px}.rule-card .actions{margin-top:14px}.chart-svg{display:block;width:100%;height:280px}.chart-grid{stroke:#3c414d;stroke-dasharray:3 4}.chart-line{fill:none;stroke:#8e4cff;stroke-width:3}.chart-fill{fill:rgba(142,76,255,.14)}.chart-label{fill:#89919f;font-size:11px}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}.probe-pill{display:inline-flex;align-items:center;gap:6px;min-width:96px;padding:4px 9px;border-radius:999px;background:rgba(142,150,163,.14);color:#aeb5c0;white-space:nowrap}.probe-pill i{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:probe-pulse 1.8s infinite}.probe-pill b{font-variant-numeric:tabular-nums}.probe-pill.good{background:rgba(29,219,120,.14);color:#58e69d}.probe-pill.warn{background:rgba(255,205,65,.15);color:#ffd262}.probe-pill.slow{background:rgba(255,159,26,.16);color:#ffae43}.probe-pill.bad{background:rgba(255,90,102,.16);color:#ff8791}.probe-pill.off{background:rgba(142,150,163,.12);color:#9aa2ae}.probe-pill.pending i{animation:none}@keyframes probe-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 0 4px transparent}}
 @media(max-width:900px){.side{position:static;width:100%}.app{display:block}.main{margin:0}.cards{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
 </style></head><body><div id="root"></div><script>
 const appRoot=document.getElementById('root');
 const authToken=()=>localStorage.getItem('nft_manager_token')||'';
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
-let state={view:'dash',data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat'};
+let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','settings'].includes(savedView))savedView='dash';let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',targetLatency:{},ruleConnectivity:{}};
 const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
@@ -572,21 +631,24 @@ function loading(){appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2
 function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>nft-manager</h2><p class=muted>默认账号 admin / admin</p><input name=u value=admin placeholder=账号><input name=p type=password value=admin placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err))}finally{btn.disabled=false;btn.textContent=old}}
 async function load(){try{state.data=await api('/api/state');render()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
-function nav(v){state.view=v;render()}
-function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v3.0</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
+function nav(v){state.view=v;localStorage.setItem('nft_manager_view',v);render()}
+function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v3.1</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function hourText(stamp){return String(new Date(stamp*1000).getHours()).padStart(2,'0')+':00'}
 function trafficChart(){let h=state.data.history||[],w=960,ht=250,p=34,max=Math.max(1,...h.map(x=>x.bytes)),pts=h.map((x,i)=>`${p+i*(w-p*2)/23},${ht-p-(x.bytes/max)*(ht-p*2)}`),area=`${p},${ht-p} ${pts.join(' ')} ${w-p},${ht-p}`,grid=[0,1,2,3,4].map(i=>{let y=p+i*(ht-p*2)/4;return `<line class=chart-grid x1=${p} y1=${y} x2=${w-p} y2=${y}/><text class=chart-label x=2 y=${y+4}>${fmt(max*(4-i)/4)}</text>`}).join(''),hours=h.map((x,i)=>i%3===0?`<text class=chart-label x=${p+i*(w-p*2)/23-10} y=${ht-6}>${hourText(x.hour)}</text>`:'').join('');return `<svg class=chart-svg viewBox="0 0 ${w} ${ht}" role="img"><g>${grid}</g><polygon class=chart-fill points="${area}"/><polyline class=chart-line points="${pts.join(' ')}"/>${hours}</svg>`}
 function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
- if(state.view==='rules')return shell(`<div class="toolbar rules-toolbar"><div class=view-switch><button class="${state.ruleView==='flat'?'active':''}" onclick="setRuleView('flat')">平铺</button><button class="${state.ruleView==='grid'?'active':''}" onclick="setRuleView('grid')">方块</button></div><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}`);
- if(state.view==='targets')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">主机管理</h2><button class=primary onclick="openTarget()">新增主机</button></div>${targetsTable()}</div>`);
+ if(state.view==='rules')return shell(`<div class="toolbar rules-toolbar"><div class=view-switch><button class="${state.ruleView==='flat'?'active':''}" onclick="setRuleView('flat')">平铺</button><button class="${state.ruleView==='grid'?'active':''}" onclick="setRuleView('grid')">方块</button></div><button onclick="checkRuleConnectivity(this)">连通性检查</button><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}`);
+ if(state.view==='targets')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">主机管理</h2><button onclick="checkTargetLatency(this)">延迟检测</button><button class=primary onclick="openTarget()">新增主机</button></div>${targetsTable()}</div>`);
  return shell(`<div class=panel><h2>系统设置</h2><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
 function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
 function ruleName(r){return r.alias||`${r.targetAlias||r.ip}:${r.lport}`}
 function ruleSwitch(r){return `<label class=switch title="${r.enabled?'关闭转发':'开启转发'}"><input type=checkbox ${r.enabled?'checked':''} onchange="toggleRule(${r.lport},this.checked)"><span class=slider></span></label>`}
 function ruleActions(r){return `<button onclick='openRule(${JSON.stringify(r)})'>编辑</button><button class=danger onclick="delRules([${r.lport}])">删除</button>`}
-function rulesTable(limit){let rules=state.data.rules.slice(0,limit?8:9999);if(!limit&&state.ruleView==='grid'){let cards=rules.map(r=>`<article class="rule-card ${r.enabled?'':'disabled'}"><div class=rule-card-top><h3>${ruleName(r)}</h3>${ruleSwitch(r)}</div><div class=muted>${r.targetAlias||'-'} / ${r.ip}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div><p class="status ${r.active?'on':''}">状态：${r.enabled?(r.active?'活跃':'空闲'):'已关闭'}</p><div class=actions>${ruleActions(r)}</div></article>`).join('');return `<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}let rows=rules.map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${ruleName(r)}</td><td>${r.lport}</td><td>${r.dport}</td><td class="metric upload">${fmt(r.uploadBytes)}</td><td class="metric download">${fmt(r.downloadBytes)}</td><td class="metric total">${fmt(r.totalBytes)}</td><td>${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</td><td class="status ${r.active?'on':''}">${r.enabled?(r.active?'活跃':'空闲'):'关闭'}</td><td class=actions>${ruleSwitch(r)}${ruleActions(r)}</td></tr>`).join('');return `<div class=rule-table-wrap><table class=table><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>统计口径</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=10 class=muted>暂无转发</td></tr>'}</table></div>`}
+function probePill(result,label){if(!result)return `<span class="probe-pill pending"><i></i>${label}<b>未检测</b></span>`;if(result.skipped)return `<span class="probe-pill off"><i></i>${label}<b>已关闭</b></span>`;if(!result.reachable)return `<span class="probe-pill bad"><i></i>${label}<b>不可达</b></span>`;let ms=Number(result.latency||0),level=ms<100?'good':ms<1000?'warn':'slow';return `<span class="probe-pill ${level}"><i></i>${label}<b>${ms.toFixed(ms<10?1:0)} ms</b></span>`}
+function rulesTable(limit){let rules=state.data.rules.slice(0,limit?8:9999);if(!limit&&state.ruleView==='grid'){let cards=rules.map(r=>`<article class="rule-card ${r.enabled?'':'disabled'}"><div class=rule-card-top><h3>${ruleName(r)}</h3>${ruleSwitch(r)}</div><div class=muted>${r.targetAlias||'-'} / ${r.ip}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div><p class="status ${r.active?'on':''}">状态：${r.enabled?(r.active?'活跃':'空闲'):'已关闭'}</p>${probePill(state.ruleConnectivity[r.lport],'连通性')}<div class=actions>${ruleActions(r)}</div></article>`).join('');return `<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}let rows=rules.map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${ruleName(r)}</td><td>${r.lport}</td><td>${r.dport}</td><td class="metric upload">${fmt(r.uploadBytes)}</td><td class="metric download">${fmt(r.downloadBytes)}</td><td class="metric total">${fmt(r.totalBytes)}</td><td>${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</td><td>${probePill(state.ruleConnectivity[r.lport],'连通性')}</td><td class="status ${r.active?'on':''}">${r.enabled?(r.active?'活跃':'空闲'):'关闭'}</td><td class=actions>${ruleSwitch(r)}${ruleActions(r)}</td></tr>`).join('');return `<div class=rule-table-wrap><table class=table><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>统计口径</th><th>连通性</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=11 class=muted>暂无转发</td></tr>'}</table></div>`}
 async function toggleRule(lport,enabled){try{await api('/api/rules/toggle',{method:'POST',body:JSON.stringify({lport,enabled}),timeout:30000});await load()}catch(e){toast(msg(e));await load()}}
-function targetsTable(){let counts={};state.data.rules.forEach(r=>counts[r.ip]=(counts[r.ip]||0)+1);let rows=state.data.targets.map(t=>`<tr><td>${t.alias}</td><td>${t.ip}</td><td>${counts[t.ip]||0}</td><td class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`).join('');return `<table class=table><tr><th>别名</th><th>IP</th><th>规则数</th><th>操作</th></tr>${rows||'<tr><td colspan=4 class=muted>暂无主机</td></tr>'}</table>`}
+function targetsTable(){let counts={};state.data.rules.forEach(r=>counts[r.ip]=(counts[r.ip]||0)+1);let rows=state.data.targets.map(t=>`<tr><td>${t.alias}</td><td>${t.ip}</td><td>${probePill(state.targetLatency[t.ip],'延迟')}</td><td>${counts[t.ip]||0}</td><td class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`).join('');return `<table class=table><tr><th>别名</th><th>IP</th><th>延迟</th><th>规则数</th><th>操作</th></tr>${rows||'<tr><td colspan=5 class=muted>暂无主机</td></tr>'}</table>`}
+async function checkTargetLatency(btn){await runAction(btn,async()=>{let result=await api('/api/targets/latency',{method:'POST',body:'{}',timeout:60000});state.targetLatency=result.results||{};render();toast('延迟检测完成')})}
+async function checkRuleConnectivity(btn){await runAction(btn,async()=>{let result=await api('/api/rules/connectivity',{method:'POST',body:'{}',timeout:60000});state.ruleConnectivity=result.results||{};render();toast('连通性检查完成')})}
 function ansiToHtml(text){let colors={30:'#111827',31:'#ff7b86',32:'#8bd49c',33:'#e6c27a',34:'#82b1ff',35:'#f38ac2',36:'#70d6e5',37:'#f1eadb',90:'#8a9499',91:'#ff8f9a',92:'#a4e5ae',93:'#f4d68f',94:'#9bc1ff',95:'#f5a5cf',96:'#91e2ed',97:'#ffffff'},fg='',bold=false,out='',last=0,re=/\x1b\[([0-9;]*)m/g,esc=s=>s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),safe=s=>{let p=0,result='',urls=/https?:\/\/[^\s<>"']+/g,m;while((m=urls.exec(s))){result+=esc(s.slice(p,m.index));let url=esc(m[0]);result+=`<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;p=urls.lastIndex}return result+esc(s.slice(p))},paint=s=>{if(!s)return;let style=[fg&&`color:${fg}`,bold&&'font-weight:700'].filter(Boolean).join(';'),content=safe(s);out+=style?`<span style="${style}">${content}</span>`:content},match;while((match=re.exec(text))){paint(text.slice(last,match.index));let codes=(match[1]||'0').split(';').map(Number);for(let i=0;i<codes.length;i++){let c=codes[i];if(c===0){fg='';bold=false}else if(c===1)bold=true;else if(c===22)bold=false;else if(c===39)fg='';else if(colors[c])fg=colors[c];else if(c===38&&codes[i+1]===2&&codes.length>=i+4){fg=`rgb(${codes[i+2]},${codes[i+3]},${codes[i+4]})`;i+=4}else if(c===38&&codes[i+1]===5&&codes.length>=i+2){let n=codes[i+2],v=n<16?(colors[[30,31,32,33,34,35,36,37,90,91,92,93,94,95,96,97][n]]||'#f1eadb'):n>=232?`rgb(${8+(n-232)*10},${8+(n-232)*10},${8+(n-232)*10})`:`rgb(${Math.floor((n-16)/36)*51},${Math.floor((n-16)%36/6)*51},${(n-16)%6*51})`;fg=v;i+=2}}last=re.lastIndex}paint(text.slice(last));return out}
 function traceTarget(t){let layer=modal(`<h2>NextTrace 路由</h2><p class=dialog-copy data-trace-target></p><pre class=trace-output><code>正在从本机执行 nexttrace，请稍候...</code></pre><div class=dialog-actions><button class=primary data-close>关闭</button></div>`),code=layer.querySelector('code');layer.querySelector('.dialog').classList.add('trace-dialog');layer.querySelector('[data-trace-target]').textContent=`目标主机：${t.alias} (${t.ip})`;layer.querySelector('[data-close]').addEventListener('click',()=>layer.remove());api('/api/targets/trace',{method:'POST',body:JSON.stringify({ip:t.ip}),timeout:125000}).then(r=>{code.innerHTML=ansiToHtml((r.output||'NextTrace 未返回输出。').replace(/\r\n?/g,'\n'))}).catch(e=>{if(e.status===401){layer.remove();expireSession();return}code.textContent=`路由执行失败：${msg(e)}`})}
 function modal(html){document.body.insertAdjacentHTML('beforeend',`<div class=modal><div class=dialog><div class=error-box></div>${html}</div></div>`);let layer=document.body.lastElementChild;layer.addEventListener('click',e=>{if(e.target===layer)layer.remove()});return layer}
@@ -693,6 +755,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/targets/trace":
                 self.send_json({"output": nexttrace_route(data.get("ip", ""))})
                 return
+            elif path == "/api/targets/latency":
+                self.send_json({"results": target_latency_checks()})
+                return
             elif path == "/api/targets/delete":
                 ip = data.get("ip")
                 if any(r["ip"] == ip for r in parse_rules()):
@@ -706,6 +771,9 @@ class Handler(BaseHTTPRequestHandler):
                 delete_rules(data)
             elif path == "/api/rules/toggle":
                 toggle_rule(data)
+            elif path == "/api/rules/connectivity":
+                self.send_json({"results": rule_connectivity_checks()})
+                return
             else:
                 self.send_json({"error": "not found"}, 404)
                 return
