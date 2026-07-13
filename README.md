@@ -46,7 +46,7 @@ sudo ./nft.sh
 ```bash
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.1
+# nftables 端口转发管理工具 v3.2
 ```
 
 如果看到 `<!DOCTYPE html>`、`Cloudflare`、`403`、`404` 等内容，说明下载到的是网页错误页，不要执行。
