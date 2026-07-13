@@ -929,11 +929,14 @@ exec "${SCRIPT_INSTALL_FILE}" "\$@"
 EOF
         chmod +x "${GLOBAL_CMD}" 2>/dev/null || true
         install_keepalive_service
-        install_web_service
+        install_web_service force
     fi
 
     info "更新完成: v${SCRIPT_VERSION} → v${remote_version}"
     persist_update_url
+    if [[ "$install_target" == "$SCRIPT_INSTALL_FILE" ]]; then
+        info "已同步更新 Web 面板并重启相关服务。"
+    fi
     warn "请重新执行 nft 进入新版菜单。"
     log_action "更新脚本: ${SCRIPT_VERSION} -> ${remote_version}"
     exit 0
@@ -997,11 +1000,11 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload >/dev/null 2>&1 || true
-    if systemctl enable --now "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1; then
+    if systemctl enable "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 && systemctl restart "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1; then
         info "已安装并启用 systemd 保活服务: ${KEEPALIVE_SERVICE_NAME}"
         log_action "安装并启用保活服务 ${KEEPALIVE_SERVICE_NAME}"
     else
-        warn "保活服务启用失败，请手动执行: systemctl enable --now ${KEEPALIVE_SERVICE_NAME}"
+        warn "保活服务启用失败，请手动执行: systemctl enable ${KEEPALIVE_SERVICE_NAME} && systemctl restart ${KEEPALIVE_SERVICE_NAME}"
     fi
 }
 
@@ -1087,14 +1090,14 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload >/dev/null 2>&1 || true
-    if systemctl enable --now "${WEB_SERVICE_NAME}" >/dev/null 2>&1; then
+    if systemctl enable "${WEB_SERVICE_NAME}" >/dev/null 2>&1 && systemctl restart "${WEB_SERVICE_NAME}" >/dev/null 2>&1; then
         web_firewall_open
         info "已安装并启用 Web 面板服务: ${WEB_SERVICE_NAME}"
         info "Web 面板地址: http://$(get_local_ip):${WEB_PORT}"
         info "默认账号/密码: admin / admin"
         log_action "安装并启用 Web 面板服务 ${WEB_SERVICE_NAME}"
     else
-        warn "Web 面板服务启用失败，请手动执行: systemctl enable --now ${WEB_SERVICE_NAME}"
+        warn "Web 面板服务启用失败，请手动执行: systemctl enable ${WEB_SERVICE_NAME} && systemctl restart ${WEB_SERVICE_NAME}"
     fi
 }
 
@@ -1102,7 +1105,7 @@ install_manager_runtime() {
     install_manager_files || return 1
     persist_update_url
     install_keepalive_service
-        install_web_service force
+    install_web_service
 }
 
 do_uninstall_manager() {
