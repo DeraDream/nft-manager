@@ -32,7 +32,7 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.5"
+WEB_PANEL_VERSION = "3.6"
 FIREWALL_LOCK = threading.Lock()
 
 
@@ -1133,6 +1133,13 @@ if __name__ == "__main__":
         protocol = sys.argv[index + 2] if len(sys.argv) > index + 2 else "tcp+udp"
         label = sys.argv[index + 3] if len(sys.argv) > index + 3 else "手动开放"
         add_firewall_port(port, protocol, label)
+        raise SystemExit(0)
+    if "--firewall-add-forward" in sys.argv:
+        index = sys.argv.index("--firewall-add-forward")
+        ports = sys.argv[index + 1:]
+        if not ports:
+            raise ValueError("缺少转发端口")
+        add_forward_firewall_ports(ports)
         raise SystemExit(0)
     if "--firewall-delete" in sys.argv:
         index = sys.argv.index("--firewall-delete")

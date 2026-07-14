@@ -49,7 +49,7 @@ sudo ./nft.sh
 ```bash
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.5
+# nftables 端口转发管理工具 v3.6
 ```
 
 如果看到 `<!DOCTYPE html>`、`Cloudflare`、`403`、`404` 等内容，说明下载到的是网页错误页，不要执行。
@@ -149,7 +149,7 @@ admin / admin
 
 ## 防火墙端口管理
 
-安装或更新到 `v3.5` 后，项目会创建独立的 nftables 入站防火墙配置：
+安装或更新到 `v3.6` 后，项目会创建独立的 nftables 入站防火墙配置：
 
 - 默认拒绝未列出的入站连接。
 - 无论何时都会保留 `22/tcp`（SSH）和 `5555/tcp`（Web 面板）两个保底端口。
