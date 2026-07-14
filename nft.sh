@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.3
+# nftables 端口转发管理工具 v3.4
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.3"
-WEB_PANEL_VERSION="3.3"
+SCRIPT_VERSION="3.4"
+WEB_PANEL_VERSION="3.4"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -35,8 +35,6 @@ DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/DeraDream/nft-manager/main
 FALLBACK_UPDATE_URL="https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/nft.sh"
 UPDATE_URL="${NFT_FORWARD_UPDATE_URL:-$DEFAULT_UPDATE_URL}"
 UPDATE_DOWNLOADED_URL=""
-LATEST_UPSTREAM_SHA=""
-RESOLVED_UPDATE_URL=""
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
 UPDATE_CHECKED=false
 UPDATE_AVAILABLE=false
@@ -908,33 +906,36 @@ version_gt() {
 }
 
 download_update_script() {
-    local dest="$1" source_url requested_url fallback_url
+    local dest="$1" requested_url source_url
     requested_url=$(load_update_url)
     if [[ -z "$requested_url" ]]; then
         return 2
     fi
 
-    resolve_official_update_url "$requested_url"
-    source_url="$RESOLVED_UPDATE_URL"
-
-    if download_remote_file "$source_url" "$dest" 20; then
-        UPDATE_URL="$source_url"
-        UPDATE_DOWNLOADED_URL="$source_url"
-        return 0
-    fi
-
-    # 默认 GitHub raw 在部分网络环境不可用时，自动尝试官方 jsDelivr 镜像。
-    fallback_url="$FALLBACK_UPDATE_URL"
-    if [[ -n "$LATEST_UPSTREAM_SHA" ]]; then
-        fallback_url="https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@${LATEST_UPSTREAM_SHA}/nft.sh"
-    fi
-    if [[ "$requested_url" == "$DEFAULT_UPDATE_URL" ]] && download_remote_file "$fallback_url" "$dest" 20; then
-        UPDATE_URL="$fallback_url"
-        UPDATE_DOWNLOADED_URL="$fallback_url"
-        return 0
-    fi
-
+    # 按当前配置源、GitHub Raw、jsDelivr 顺序尝试。每个源都要通过脚本校验，
+    # 防止代理返回 HTML 错误页后被误判为下载成功。
+    local -a candidates=("$requested_url" "$DEFAULT_UPDATE_URL" "$FALLBACK_UPDATE_URL")
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        [[ -n "$candidate" ]] || continue
+        [[ "$candidate" == "$source_url" ]] && continue
+        source_url="$candidate"
+        if download_remote_file "$source_url" "$dest" 8 && is_valid_update_script "$dest"; then
+            UPDATE_URL="$source_url"
+            UPDATE_DOWNLOADED_URL="$source_url"
+            return 0
+        fi
+        rm -f "$dest" 2>/dev/null || true
+    done
     return 1
+}
+
+is_valid_update_script() {
+    local file="$1"
+    [[ -s "$file" ]] || return 1
+    [[ "$(head -1 "$file" 2>/dev/null)" == "#!/usr/bin/env bash" ]] || return 1
+    [[ -n "$(extract_script_version "$file")" ]] || return 1
+    bash -n "$file" >/dev/null 2>&1
 }
 
 cache_busted_url() {
@@ -947,34 +948,13 @@ cache_busted_url() {
     printf '%s%snft_manager_cache=%s%s' "$url" "$sep" "$(date +%s)" "$RANDOM"
 }
 
-resolve_official_update_url() {
-    local source_url="$1" api_url sha
-    RESOLVED_UPDATE_URL="$source_url"
-    case "$source_url" in
-        "$DEFAULT_UPDATE_URL"|"$FALLBACK_UPDATE_URL") ;;
-        *) return ;;
-    esac
-
-    api_url=$(cache_busted_url "https://api.github.com/repos/DeraDream/nft-manager/commits/main")
-    if command -v curl &>/dev/null; then
-        sha=$(curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 "$api_url" 2>/dev/null | sed -nE 's/^[[:space:]]*"sha": "([0-9a-f]{40})",/\1/p' | head -1)
-    elif command -v wget &>/dev/null; then
-        sha=$(wget -q --tries=3 --timeout=20 -O - "$api_url" 2>/dev/null | sed -nE 's/^[[:space:]]*"sha": "([0-9a-f]{40})",/\1/p' | head -1)
-    fi
-
-    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-        LATEST_UPSTREAM_SHA="$sha"
-        RESOLVED_UPDATE_URL="https://raw.githubusercontent.com/DeraDream/nft-manager/${sha}/nft.sh"
-    fi
-}
-
 download_remote_file() {
     local source_url="$1" dest="$2" timeout="${3:-30}" request_url
     request_url=$(cache_busted_url "$source_url")
     if command -v curl &>/dev/null; then
-        curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time "$timeout" "$request_url" -o "$dest"
+        curl -fsSL --retry 0 --connect-timeout 3 --max-time "$timeout" "$request_url" -o "$dest"
     elif command -v wget &>/dev/null; then
-        wget -q --tries=3 --timeout="$timeout" -O "$dest" "$request_url"
+        wget -q --tries=1 --timeout="$timeout" -O "$dest" "$request_url"
     else
         return 3
     fi

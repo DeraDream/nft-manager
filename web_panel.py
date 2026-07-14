@@ -31,7 +31,7 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.3"
+WEB_PANEL_VERSION = "3.4"
 FIREWALL_LOCK = threading.Lock()
 
 
