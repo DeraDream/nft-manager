@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -22,12 +23,16 @@ TARGETS_FILE = os.path.join(CONF_DIR, "targets.conf")
 AUTH_FILE = os.path.join(CONF_DIR, "web-auth.conf")
 STATS_FILE = os.path.join(CONF_DIR, "web-stats.json")
 HISTORY_FILE = os.path.join(CONF_DIR, "web-history.json")
+FIREWALL_CONF = os.path.join(CONF_DIR, "firewall.conf")
+FIREWALL_PORTS_FILE = os.path.join(CONF_DIR, "firewall-ports.db")
 TABLE_NAME = "port_forward"
+FIREWALL_TABLE = "nft_manager_firewall"
 HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.2"
+WEB_PANEL_VERSION = "3.3"
+FIREWALL_LOCK = threading.Lock()
 
 
 def resolve_nft_bin():
@@ -165,6 +170,210 @@ def local_ip():
         return out
     out = run(["bash", "-lc", "hostname -I 2>/dev/null | awk '{print $1}'"], timeout=2).stdout.strip()
     return out or "127.0.0.1"
+
+
+def normalize_firewall_protocol(protocol):
+    protocol = str(protocol or "tcp+udp").lower()
+    if protocol not in ("tcp", "udp", "tcp+udp"):
+        raise ValueError("协议仅支持 tcp、udp 或 tcp+udp")
+    return protocol
+
+
+def firewall_baseline_ports():
+    return [
+        {"port": 22, "protocol": "tcp", "label": "SSH 保底"},
+        {"port": PORT, "protocol": "tcp", "label": "Web 面板保底"},
+    ]
+
+
+def read_firewall_ports():
+    ports = []
+    if not os.path.exists(FIREWALL_PORTS_FILE):
+        return ports
+    for line in open(FIREWALL_PORTS_FILE, encoding="utf-8", errors="ignore"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|", 2)
+        if len(parts) < 2:
+            continue
+        try:
+            port = int(parts[0])
+            protocol = normalize_firewall_protocol(parts[1])
+        except (TypeError, ValueError):
+            continue
+        if valid_port(port):
+            ports.append({"port": port, "protocol": protocol, "label": clean_label(parts[2] if len(parts) > 2 else "")})
+    return ports
+
+
+def normalize_firewall_ports(ports):
+    normalized = {}
+    for item in [*firewall_baseline_ports(), *ports]:
+        port = int(item.get("port", 0))
+        protocol = normalize_firewall_protocol(item.get("protocol"))
+        if not valid_port(port):
+            raise ValueError(f"端口无效: {port}")
+        key = (port, protocol)
+        label = clean_label(item.get("label", ""))
+        if key not in normalized or label.startswith("SSH 保底") or label.startswith("Web 面板保底"):
+            normalized[key] = {"port": port, "protocol": protocol, "label": label}
+    return sorted(normalized.values(), key=lambda item: (item["port"], item["protocol"]))
+
+
+def firewall_config_text(ports):
+    tcp_ports = sorted({item["port"] for item in ports if item["protocol"] in ("tcp", "tcp+udp")})
+    udp_ports = sorted({item["port"] for item in ports if item["protocol"] in ("udp", "tcp+udp")})
+    lines = [
+        "#!/usr/sbin/nft -f",
+        "",
+        "# NFT_MANAGER_FIREWALL|1",
+        "",
+        f"table inet {FIREWALL_TABLE} {{",
+        "    chain input {",
+        "        type filter hook input priority filter; policy drop;",
+        "        ct state established,related accept",
+        "        iifname \"lo\" accept",
+    ]
+    if tcp_ports:
+        lines.append("        tcp dport { " + ", ".join(map(str, tcp_ports)) + " } accept")
+    if udp_ports:
+        lines.append("        udp dport { " + ", ".join(map(str, udp_ports)) + " } accept")
+    lines.extend([
+        "    }",
+        "",
+        "    chain forward {",
+        "        type filter hook forward priority filter; policy drop;",
+        "        ct state established,related accept",
+    ])
+    if tcp_ports:
+        lines.append("        ct original protocol tcp ct original proto-dst { " + ", ".join(map(str, tcp_ports)) + " } ct status dnat accept")
+    if udp_ports:
+        lines.append("        ct original protocol udp ct original proto-dst { " + ", ".join(map(str, udp_ports)) + " } ct status dnat accept")
+    lines.extend(["    }", "}", ""])
+    return "\n".join(lines)
+
+
+def atomic_write(path, content):
+    ensure_dirs()
+    temp = f"{path}.tmp.{secrets.token_hex(8)}"
+    try:
+        with open(temp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def firewall_ports_text(ports):
+    lines = ["# port|protocol|label"]
+    lines.extend(f"{item['port']}|{item['protocol']}|{clean_label(item['label'])}" for item in ports)
+    return "\n".join(lines) + "\n"
+
+
+def reload_firewall():
+    run_nft(["flush", "table", "inet", FIREWALL_TABLE])
+    run_nft(["delete", "table", "inet", FIREWALL_TABLE])
+    result = run_nft(["-f", FIREWALL_CONF], timeout=15)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "防火墙规则加载失败")
+
+
+def apply_firewall_ports(ports):
+    ports = normalize_firewall_ports(ports)
+    config = firewall_config_text(ports)
+    temp = f"{FIREWALL_CONF}.check.{secrets.token_hex(8)}"
+    old_conf = open(FIREWALL_CONF, encoding="utf-8").read() if os.path.exists(FIREWALL_CONF) else None
+    old_ports = open(FIREWALL_PORTS_FILE, encoding="utf-8").read() if os.path.exists(FIREWALL_PORTS_FILE) else None
+    try:
+        with open(temp, "w", encoding="utf-8") as f:
+            f.write(config)
+        check = run_nft(["-c", "-f", temp], timeout=15)
+        if check.returncode != 0:
+            raise RuntimeError(check.stderr.strip() or "防火墙配置校验失败")
+        atomic_write(FIREWALL_CONF, config)
+        atomic_write(FIREWALL_PORTS_FILE, firewall_ports_text(ports))
+        reload_firewall()
+        return ports
+    except Exception:
+        if old_conf is not None:
+            atomic_write(FIREWALL_CONF, old_conf)
+            try:
+                reload_firewall()
+            except Exception:
+                pass
+        elif os.path.exists(FIREWALL_CONF):
+            os.unlink(FIREWALL_CONF)
+        if old_ports is not None:
+            atomic_write(FIREWALL_PORTS_FILE, old_ports)
+        elif os.path.exists(FIREWALL_PORTS_FILE):
+            os.unlink(FIREWALL_PORTS_FILE)
+        raise
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def ensure_firewall_configuration(sync_existing=False):
+    with FIREWALL_LOCK:
+        current = read_firewall_ports()
+        first_setup = not os.path.exists(FIREWALL_PORTS_FILE)
+        if first_setup or sync_existing:
+            known = {(item["port"], item["protocol"]) for item in current}
+            for rule in parse_rules():
+                if not rule.get("enabled", True):
+                    continue
+                key = (rule["lport"], "tcp+udp")
+                if key not in known:
+                    current.append({"port": rule["lport"], "protocol": "tcp+udp", "label": "转发端口"})
+                    known.add(key)
+        return apply_firewall_ports(current)
+
+
+def add_firewall_port(port, protocol="tcp+udp", label="手动开放"):
+    port = int(port)
+    if not valid_port(port):
+        raise ValueError("端口无效")
+    with FIREWALL_LOCK:
+        current = read_firewall_ports()
+        current.append({"port": port, "protocol": normalize_firewall_protocol(protocol), "label": label})
+        return apply_firewall_ports(current)
+
+
+def add_forward_firewall_ports(ports):
+    with FIREWALL_LOCK:
+        current = read_firewall_ports()
+        existing = {(item["port"], item["protocol"]) for item in current}
+        for port in ports:
+            port = int(port)
+            if not valid_port(port):
+                raise ValueError("端口无效")
+            if (port, "tcp+udp") not in existing:
+                current.append({"port": port, "protocol": "tcp+udp", "label": "转发端口"})
+                existing.add((port, "tcp+udp"))
+        return apply_firewall_ports(current)
+
+
+def remove_firewall_port(port, protocol=None):
+    port = int(port)
+    if port in (22, PORT):
+        raise ValueError(f"保底端口 {port} 不允许关闭")
+    with FIREWALL_LOCK:
+        current = read_firewall_ports()
+        if protocol:
+            protocol = normalize_firewall_protocol(protocol)
+            current = [item for item in current if not (item["port"] == port and item["protocol"] == protocol)]
+        else:
+            current = [item for item in current if item["port"] != port]
+        return apply_firewall_ports(current)
+
+
+def remove_forward_firewall_ports(ports):
+    with FIREWALL_LOCK:
+        wanted = {int(port) for port in ports if int(port) not in (22, PORT)}
+        current = [item for item in read_firewall_ports() if not (item["port"] in wanted and item["label"] == "转发端口")]
+        return apply_firewall_ports(current)
 
 
 def valid_ip(ip):
@@ -541,8 +750,21 @@ def add_rules(payload):
     conflict = [r["lport"] for r in new_rules if r["lport"] in used]
     if conflict:
         raise ValueError("入口端口已存在: " + ", ".join(map(str, conflict[:20])))
-    write_rules(existing + new_rules)
-    reload_rules()
+    open_firewall = payload.get("openFirewall", True)
+    if isinstance(open_firewall, str):
+        open_firewall = open_firewall.lower() not in ("0", "false", "no")
+    try:
+        write_rules(existing + new_rules)
+        reload_rules()
+        if open_firewall:
+            add_forward_firewall_ports([rule["lport"] for rule in new_rules])
+    except Exception:
+        write_rules(existing)
+        try:
+            reload_rules()
+        except Exception:
+            pass
+        raise
     return len(new_rules)
 
 
@@ -558,14 +780,40 @@ def update_rule(payload):
         raise ValueError("入口端口已存在")
     if old_rule:
         new_rules[0]["enabled"] = old_rule.get("enabled", True)
-    write_rules(rest + new_rules)
-    reload_rules()
+    try:
+        write_rules(rest + new_rules)
+        reload_rules()
+        if old_rule and old_rule["lport"] != new_rules[0]["lport"]:
+            add_forward_firewall_ports([new_rules[0]["lport"]])
+            if old_rule["lport"] not in (22, PORT):
+                remove_forward_firewall_ports([old_rule["lport"]])
+    except Exception:
+        write_rules(rules)
+        try:
+            reload_rules()
+        except Exception:
+            pass
+        raise
 
 
 def delete_rules(payload):
     ports = {int(p) for p in payload.get("lports", [])}
-    write_rules([r for r in parse_rules() if r["lport"] not in ports])
-    reload_rules()
+    existing = parse_rules()
+    close_firewall = payload.get("closeFirewall", True)
+    if isinstance(close_firewall, str):
+        close_firewall = close_firewall.lower() not in ("0", "false", "no")
+    try:
+        write_rules([r for r in existing if r["lport"] not in ports])
+        reload_rules()
+        if close_firewall:
+            remove_forward_firewall_ports(ports)
+    except Exception:
+        write_rules(existing)
+        try:
+            reload_rules()
+        except Exception:
+            pass
+        raise
 
 
 def toggle_rule(payload):
@@ -599,7 +847,7 @@ def dashboard():
         total_bytes += both_bytes
         active += 1 if c.get("active") else 0
         enriched.append({**r, "targetAlias": aliases.get(r["ip"], ""), "uploadBytes": upload_bytes, "downloadBytes": download_bytes, "totalBytes": both_bytes, "bytes": selected_bytes, "active": c["active"]})
-    return {"targets": targets, "rules": enriched, "history": history, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
+    return {"targets": targets, "rules": enriched, "history": history, "firewall": {"ports": read_firewall_ports(), "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
 
 
 HTML = r"""<!doctype html>
@@ -612,13 +860,13 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-
 .app{display:flex;min-height:100vh}.side{width:238px;background:#020303;border-right:1px solid #2a2d35;padding:28px 16px;position:fixed;inset:0 auto 0 0}.brand{font-weight:800;font-size:18px;margin-bottom:2px}.ver{font-size:12px;color:var(--muted);margin-bottom:34px}.nav button{width:100%;text-align:left;margin:5px 0;background:transparent;color:#d9dde7}.nav button.active{background:#112846;color:#0b84ff}.foot{position:absolute;bottom:18px;color:#737b89;font-size:12px;left:70px}
 .main{margin-left:238px;flex:1}.top{height:54px;border-bottom:1px solid #2a2d35;display:flex;align-items:center;justify-content:flex-end;padding:0 26px}.user{font-weight:700}
 .content{padding:18px 24px 40px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.rules-toolbar{justify-content:flex-end}.rule-table-wrap{border:1px solid var(--line);border-radius:8px;overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.table tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.pill{display:inline-flex;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.metric.upload{color:#46a6ff}.metric.download{color:#20d98a}.metric.total{color:#b779ff}.actions{display:flex;align-items:center;gap:8px}.actions .switch{margin-right:12px}.actions button{padding:6px 10px;margin:0}.hidden{display:none!important}.view-switch{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}.view-switch button{border-radius:0;background:#17181c;padding:7px 11px}.view-switch button.active{background:#1d4d8a}.switch{position:relative;display:inline-flex;width:38px;height:22px;vertical-align:middle;flex:none}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#4a252a;border-radius:22px}.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}.switch input:checked+.slider{background:#16855b}.switch input:checked+.slider:before{transform:translateX(16px)}.rule-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.rule-card{border:1px solid var(--line);background:#111318;padding:14px;border-radius:8px}.rule-card.disabled{opacity:.6}.rule-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.rule-card h3{font-size:15px;margin:0 0 8px}.rule-card .route{color:#cdd4e0;margin:7px 0}.rule-card .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid #2a2d35;padding-top:10px;margin-top:10px}.rule-card .metrics span{font-size:12px}.rule-card .actions{margin-top:14px}.chart-svg{display:block;width:100%;height:280px}.chart-grid{stroke:#3c414d;stroke-dasharray:3 4}.chart-line{fill:none;stroke:#8e4cff;stroke-width:3}.chart-fill{fill:rgba(142,76,255,.14)}.chart-label{fill:#89919f;font-size:11px}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}.probe-pill{display:inline-flex;align-items:center;gap:6px;min-width:96px;padding:4px 9px;border-radius:999px;background:rgba(142,150,163,.14);color:#aeb5c0;white-space:nowrap}.probe-pill i{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:probe-pulse 1.8s infinite}.probe-pill b{font-variant-numeric:tabular-nums}.probe-pill.good{background:rgba(29,219,120,.14);color:#58e69d}.probe-pill.warn{background:rgba(255,205,65,.15);color:#ffd262}.probe-pill.slow{background:rgba(255,159,26,.16);color:#ffae43}.probe-pill.bad{background:rgba(255,90,102,.16);color:#ff8791}.probe-pill.off{background:rgba(142,150,163,.12);color:#9aa2ae}.probe-pill.pending i{animation:none}@keyframes probe-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 0 4px transparent}}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.firewall-check{display:flex!important;align-items:center;gap:9px;padding:11px 12px;border:1px solid #356aa0;border-radius:6px;background:rgba(8,119,255,.1);color:#dbeafe!important;cursor:pointer}.firewall-check input{width:16px!important;height:16px;margin:0;accent-color:var(--blue)}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}.probe-pill{display:inline-flex;align-items:center;gap:6px;min-width:96px;padding:4px 9px;border-radius:999px;background:rgba(142,150,163,.14);color:#aeb5c0;white-space:nowrap}.probe-pill i{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:probe-pulse 1.8s infinite}.probe-pill b{font-variant-numeric:tabular-nums}.probe-pill.good{background:rgba(29,219,120,.14);color:#58e69d}.probe-pill.warn{background:rgba(255,205,65,.15);color:#ffd262}.probe-pill.slow{background:rgba(255,159,26,.16);color:#ffae43}.probe-pill.bad{background:rgba(255,90,102,.16);color:#ff8791}.probe-pill.off{background:rgba(142,150,163,.12);color:#9aa2ae}.probe-pill.pending i{animation:none}@keyframes probe-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 0 4px transparent}}
 @media(max-width:900px){.side{position:static;width:100%}.app{display:block}.main{margin:0}.cards{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
 </style></head><body><div id="root"></div><script>
 const appRoot=document.getElementById('root');
 const authToken=()=>localStorage.getItem('nft_manager_token')||'';
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
-let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','settings'].includes(savedView))savedView='dash';let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',targetLatency:{},ruleConnectivity:{},autoProbeView:''};
+let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',targetLatency:{},ruleConnectivity:{},autoProbeView:''};
 const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
@@ -632,12 +880,13 @@ function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(eve
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err))}finally{btn.disabled=false;btn.textContent=old}}
 async function load(){try{state.data=await api('/api/state');render();autoProbeCurrentView()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){if(state.view!==v)state.autoProbeView='';state.view=v;localStorage.setItem('nft_manager_view',v);render();autoProbeCurrentView()}
-function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v3.2</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
+function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['firewall','防火墙管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v4.0</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function hourText(stamp){return String(new Date(stamp*1000).getHours()).padStart(2,'0')+':00'}
 function trafficChart(){let h=state.data.history||[],w=960,ht=250,p=34,max=Math.max(1,...h.map(x=>x.bytes)),pts=h.map((x,i)=>`${p+i*(w-p*2)/23},${ht-p-(x.bytes/max)*(ht-p*2)}`),area=`${p},${ht-p} ${pts.join(' ')} ${w-p},${ht-p}`,grid=[0,1,2,3,4].map(i=>{let y=p+i*(ht-p*2)/4;return `<line class=chart-grid x1=${p} y1=${y} x2=${w-p} y2=${y}/><text class=chart-label x=2 y=${y+4}>${fmt(max*(4-i)/4)}</text>`}).join(''),hours=h.map((x,i)=>i%3===0?`<text class=chart-label x=${p+i*(w-p*2)/23-10} y=${ht-6}>${hourText(x.hour)}</text>`:'').join('');return `<svg class=chart-svg viewBox="0 0 ${w} ${ht}" role="img"><g>${grid}</g><polygon class=chart-fill points="${area}"/><polyline class=chart-line points="${pts.join(' ')}"/>${hours}</svg>`}
 function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
  if(state.view==='rules')return shell(`<div class="toolbar rules-toolbar"><div class=view-switch><button class="${state.ruleView==='flat'?'active':''}" onclick="setRuleView('flat')">平铺</button><button class="${state.ruleView==='grid'?'active':''}" onclick="setRuleView('grid')">方块</button></div><button onclick="checkRuleConnectivity(this)">连通性检查</button><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}`);
  if(state.view==='targets')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">主机管理</h2><button onclick="checkTargetLatency(this)">延迟检测</button><button class=primary onclick="openTarget()">新增主机</button></div>${targetsTable()}</div>`);
+ if(state.view==='firewall')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">防火墙管理</h2><button onclick="syncFirewall(this)">同步转发端口</button><button class=primary onclick="openFirewall()">开放端口</button></div><p class=muted>默认拒绝入站连接，始终保留 SSH 22/tcp 与 Web 面板 5555/tcp。</p>${firewallTable()}</div>`);
  return shell(`<div class=panel><h2>系统设置</h2><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
 function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
 function ruleName(r){return r.alias||`${r.targetAlias||r.ip}:${r.lport}`}
@@ -647,6 +896,11 @@ function probePill(result,label){if(!result)return `<span class="probe-pill pend
 function rulesTable(limit){let rules=state.data.rules.slice(0,limit?8:9999);if(!limit&&state.ruleView==='grid'){let cards=rules.map(r=>`<article class="rule-card ${r.enabled?'':'disabled'}"><div class=rule-card-top><h3>${ruleName(r)}</h3>${ruleSwitch(r)}</div><div class=muted>${r.targetAlias||'-'} / ${r.ip}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div><p class="status ${r.active?'on':''}">状态：${r.enabled?(r.active?'活跃':'空闲'):'已关闭'}</p>${probePill(state.ruleConnectivity[r.lport],'连通性')}<div class=actions>${ruleActions(r)}</div></article>`).join('');return `<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}let rows=rules.map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${ruleName(r)}</td><td>${r.lport}</td><td>${r.dport}</td><td class="metric upload">${fmt(r.uploadBytes)}</td><td class="metric download">${fmt(r.downloadBytes)}</td><td class="metric total">${fmt(r.totalBytes)}</td><td>${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</td><td>${probePill(state.ruleConnectivity[r.lport],'连通性')}</td><td class="status ${r.active?'on':''}">${r.enabled?(r.active?'活跃':'空闲'):'关闭'}</td><td class=actions>${ruleSwitch(r)}${ruleActions(r)}</td></tr>`).join('');return `<div class=rule-table-wrap><table class=table><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>统计口径</th><th>连通性</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=11 class=muted>暂无转发</td></tr>'}</table></div>`}
 async function toggleRule(lport,enabled){try{await api('/api/rules/toggle',{method:'POST',body:JSON.stringify({lport,enabled}),timeout:30000});await load()}catch(e){toast(msg(e));await load()}}
 function targetsTable(){let counts={};state.data.rules.forEach(r=>counts[r.ip]=(counts[r.ip]||0)+1);let rows=state.data.targets.map(t=>`<tr><td>${t.alias}</td><td>${t.ip}</td><td>${probePill(state.targetLatency[t.ip],'延迟')}</td><td>${counts[t.ip]||0}</td><td class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`).join('');return `<table class=table><tr><th>别名</th><th>IP</th><th>延迟</th><th>规则数</th><th>操作</th></tr>${rows||'<tr><td colspan=5 class=muted>暂无主机</td></tr>'}</table>`}
+function firewallTable(){let ports=state.data.firewall?.ports||[],webPort=state.data.stats?.port||5555,rows=ports.map(p=>{let locked=p.port===22||p.port===webPort;return `<tr><td>${p.port}</td><td>${p.protocol}</td><td>${p.label||'-'}</td><td>${locked?'<span class=muted>保底端口</span>':`<button class=danger onclick="delFirewall(${p.port},'${p.protocol}')">关闭</button>`}</td></tr>`}).join('');return `<div class=rule-table-wrap><table class=table><tr><th>端口</th><th>协议</th><th>来源/说明</th><th>操作</th></tr>${rows||'<tr><td colspan=4 class=muted>防火墙尚未初始化</td></tr>'}</table></div>`}
+function openFirewall(){modal(`<h2>开放端口</h2><div class=grid><div class=field><label>端口</label><input id=fwPort placeholder="例如：8080"></div><div class=field><label>协议</label><select id=fwProtocol><option value=tcp+udp>TCP + UDP</option><option value=tcp>TCP</option><option value=udp>UDP</option></select></div></div><div class=field><label>说明</label><input id=fwLabel value="手动开放"></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveFirewall(this)">开放</button></div>`)}
+async function saveFirewall(btn){await runAction(btn,async()=>{await api('/api/firewall/add',{method:'POST',body:JSON.stringify({port:document.getElementById('fwPort').value,protocol:document.getElementById('fwProtocol').value,label:document.getElementById('fwLabel').value}),timeout:30000});document.querySelector('.modal').remove();await load()})}
+function delFirewall(port,protocol){confirmDialog('关闭端口',`确认关闭 ${port}/${protocol}？`,async()=>{await api('/api/firewall/delete',{method:'POST',body:JSON.stringify({port,protocol}),timeout:30000});await load()})}
+async function syncFirewall(btn){await runAction(btn,async()=>{await api('/api/firewall/sync',{method:'POST',body:'{}',timeout:30000});await load();toast('已同步现有转发端口')})}
 async function checkTargetLatency(btn){await runAction(btn,async()=>{let result=await api('/api/targets/latency',{method:'POST',body:'{}',timeout:60000});state.targetLatency=result.results||{};render();toast('延迟检测完成')})}
 async function checkRuleConnectivity(btn){await runAction(btn,async()=>{let result=await api('/api/rules/connectivity',{method:'POST',body:'{}',timeout:60000});state.ruleConnectivity=result.results||{};render();toast('连通性检查完成')})}
 function autoProbeCurrentView(){if(!state.data||state.autoProbeView===state.view)return;if(state.view==='targets'){state.autoProbeView='targets';checkTargetLatency()}else if(state.view==='rules'){state.autoProbeView='rules';checkRuleConnectivity()}}
@@ -657,9 +911,9 @@ function showInfo(title,text){let layer=modal(`<h2>${title}</h2><p class=dialog-
 function confirmDialog(title,text,action){let layer=modal(`<h2>${title}</h2><p class=dialog-copy>${text}</p><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>确定</button></div>`),cancel=layer.querySelector('[data-cancel]'),confirmBtn=layer.querySelector('[data-confirm]');cancel.addEventListener('click',()=>layer.remove());confirmBtn.addEventListener('click',async()=>{let old=confirmBtn.textContent;confirmBtn.disabled=true;confirmBtn.textContent='处理中...';try{await action();layer.remove()}catch(e){if(e.status===401){layer.remove();expireSession()}else toast(msg(e))}finally{confirmBtn.disabled=false;confirmBtn.textContent=old}})}
 document.addEventListener('keydown',e=>{let layers=document.querySelectorAll('.modal'),layer=layers[layers.length-1];if(!layer)return;if(e.key==='Escape'){e.preventDefault();layer.remove();return}if(e.key==='Enter'&&!e.shiftKey&&e.target.tagName!=='TEXTAREA'){let button=layer.querySelector('[data-confirm],button.primary');if(button&&!button.disabled){e.preventDefault();button.click()}}})
 function parsePorts(value){let ports=value.trim().split(/[ ,]+/).filter(Boolean);if(!ports.length)throw new Error('请至少输入一个入口端口');let seen=new Set;for(let port of ports){if(!/^[0-9]+$/.test(port)||Number(port)<1||Number(port)>65535)throw new Error(`端口无效: ${port}；仅支持单个端口，请用空格或英文逗号分隔`);if(seen.has(port))throw new Error(`端口重复: ${port}`);seen.add(port)}return ports}
-function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,stats=r?.statsMode||'total',opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join('');modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>统计口径</label><select id=statsMode><option value=upload ${stats==='upload'?'selected':''}>上传流量</option><option value=download ${stats==='download'?'selected':''}>下载流量</option><option value=total ${stats==='total'?'selected':''}>上传 + 下载总计</option></select></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveRule(this)">保存</button></div>`)}
-async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});document.querySelector('.modal').remove();await load()})}
-function delRules(lports){confirmDialog('删除转发','确认删除该端口转发？',async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports}),timeout:30000});await load()})}
+function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,stats=r?.statsMode||'total',opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join(''),firewallOption=r?'':`<div class=field><label class=firewall-check><input id=openFirewall type=checkbox checked>同时开放此端口</label></div>`;modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>统计口径</label><select id=statsMode><option value=upload ${stats==='upload'?'selected':''}>上传流量</option><option value=download ${stats==='download'?'selected':''}>下载流量</option><option value=total ${stats==='total'?'selected':''}>上传 + 下载总计</option></select></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div>${firewallOption}<div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveRule(this)">保存</button></div>`)}
+async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),open=document.getElementById('openFirewall'),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value,openFirewall:open?open.checked:true};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});document.querySelector('.modal').remove();await load()})}
+function delRules(lports){let layer=modal(`<h2>删除转发</h2><p class=dialog-copy>确认删除该端口转发？</p><label class=firewall-check><input id=closeFirewall type=checkbox checked>删除后同时关闭此端口</label><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>删除</button></div>`);layer.querySelector('[data-cancel]').onclick=()=>layer.remove();layer.querySelector('[data-confirm]').onclick=async e=>{await runAction(e.currentTarget,async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports,closeFirewall:layer.querySelector('#closeFirewall').checked}),timeout:30000});layer.remove();await load()})}}
 function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP</label><input id=tip value="${t?.ip||''}"></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
 async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});document.querySelector('.modal').remove();await load()})}
 function delTarget(t){confirmDialog('删除主机','确认删除该主机？存在转发规则时将阻止删除。',async()=>{await api('/api/targets/delete',{method:'POST',body:JSON.stringify({ip:t.ip}),timeout:30000});await load()})}
@@ -775,6 +1029,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/rules/connectivity":
                 self.send_json({"results": rule_connectivity_checks()})
                 return
+            elif path == "/api/firewall/add":
+                add_firewall_port(data.get("port", 0), data.get("protocol", "tcp+udp"), data.get("label", "手动开放"))
+            elif path == "/api/firewall/delete":
+                remove_firewall_port(data.get("port", 0), data.get("protocol"))
+            elif path == "/api/firewall/sync":
+                ensure_firewall_configuration(sync_existing=True)
             else:
                 self.send_json({"error": "not found"}, 404)
                 return
@@ -786,7 +1046,43 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     ensure_auth()
     migration_ok = migrate_legacy_data()
+    if "--firewall-list" in sys.argv:
+        print(json.dumps({"ports": read_firewall_ports(), "enabled": os.path.exists(FIREWALL_CONF)}, ensure_ascii=False))
+        raise SystemExit(0)
+    if "--firewall-add" in sys.argv:
+        index = sys.argv.index("--firewall-add")
+        port = sys.argv[index + 1] if len(sys.argv) > index + 1 else ""
+        protocol = sys.argv[index + 2] if len(sys.argv) > index + 2 else "tcp+udp"
+        label = sys.argv[index + 3] if len(sys.argv) > index + 3 else "手动开放"
+        add_firewall_port(port, protocol, label)
+        raise SystemExit(0)
+    if "--firewall-delete" in sys.argv:
+        index = sys.argv.index("--firewall-delete")
+        port = sys.argv[index + 1] if len(sys.argv) > index + 1 else ""
+        protocol = sys.argv[index + 2] if len(sys.argv) > index + 2 else None
+        remove_firewall_port(port, protocol)
+        raise SystemExit(0)
+    if "--firewall-remove" in sys.argv:
+        index = sys.argv.index("--firewall-remove")
+        port = sys.argv[index + 1] if len(sys.argv) > index + 1 else ""
+        remove_forward_firewall_ports([port])
+        raise SystemExit(0)
+    if "--firewall-sync" in sys.argv:
+        ensure_firewall_configuration(sync_existing=True)
+        raise SystemExit(0)
+    if "--firewall-ensure" in sys.argv:
+        ensure_firewall_configuration()
+        raise SystemExit(0)
     if "--migrate-only" in sys.argv:
+        try:
+            ensure_firewall_configuration()
+        except Exception as e:
+            print(f"nft-manager: 防火墙初始化失败：{e}")
+            raise SystemExit(1)
         raise SystemExit(0 if migration_ok else 1)
+    try:
+        ensure_firewall_configuration()
+    except Exception as e:
+        print(f"nft-manager: 防火墙初始化失败，Web 面板继续启动：{e}")
     print(f"nft-manager web listening on {HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

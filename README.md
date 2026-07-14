@@ -16,6 +16,8 @@
 - 安装后提供全局命令 `nft` 唤起菜单
 - 安装后自动创建 systemd 保活服务
 - 安装后自动创建 Web 面板，默认端口 `5555`
+- 提供独立的 nftables 入站防火墙模块，默认只保底开放 `22/tcp` 和 `5555/tcp`
+- 新增转发默认同步放行入口端口，删除转发默认同步关闭入口端口，SSH 和 Web 均可取消该操作
 - Web 面板支持一次添加多个单端口
 - Web 面板支持上传、下载、总计流量统计、24 小时趋势和规则开关
 - 主机管理支持批量延迟检测，转发管理支持批量连通性检查
@@ -46,7 +48,7 @@ sudo ./nft.sh
 ```bash
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.2
+# nftables 端口转发管理工具 v3.3
 ```
 
 如果看到 `<!DOCTYPE html>`、`Cloudflare`、`403`、`404` 等内容，说明下载到的是网页错误页，不要执行。
@@ -98,6 +100,7 @@ admin / admin
 6) 目标主机管理
 7) 一键清空所有转发
 8) 诊断/自检
+9) 防火墙端口管理
 0) 退出
 ```
 
@@ -114,6 +117,7 @@ Web 面板包含：
 - 仪表板
 - 转发管理
 - 主机管理
+- 防火墙管理
 - 系统设置
 
 首次安装或通过 SSH 菜单更新时，脚本会检测并自动安装 NextTrace。主机管理中可点击“NextTrace 路由”，在弹窗内查看本机到该主机的完整路由输出。
@@ -141,6 +145,18 @@ admin / admin
 ```
 
 请在公网使用前修改默认密码，并确认服务器安全组/防火墙只向可信来源开放 `5555` 端口。
+
+## 防火墙端口管理
+
+安装或更新到 `v3.3` 后，项目会创建独立的 nftables 入站防火墙配置：
+
+- 默认拒绝未列出的入站连接。
+- 无论何时都会保留 `22/tcp`（SSH）和 `5555/tcp`（Web 面板）两个保底端口。
+- 新增端口转发时，SSH 菜单和 Web 面板都会默认同时开放入口端口；可在确认项中取消勾选。
+- 删除端口转发时，默认同时关闭由该转发创建的入口端口；手动开放的端口不会被自动删除。
+- Web 面板左侧的“防火墙管理”和 SSH 菜单 `9)` 可单独查看、开放或关闭端口。
+
+该模块同时限制主机入站流量与 DNAT 转发流量。云厂商安全组仍在系统外层生效，安全组未放行时，本机规则无法绕过它。
 
 ## 配置更新源
 
@@ -183,6 +199,8 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 /etc/nftables.conf
 /etc/nftables.d/port-forward.conf
 /etc/nftables.d/targets.conf
+/etc/nftables.d/firewall.conf
+/etc/nftables.d/firewall-ports.db
 /etc/nftables.d/update-url
 /etc/nftables.d/web-auth.conf
 /etc/nftables.d/web-stats.json
@@ -210,6 +228,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 - 更新源配置
 - Web 面板账号文件
 - Web 面板流量采样文件
+- 独立防火墙配置和端口清单
 - 脚本日志
 - 脚本写入的 sysctl 配置
 - 脚本写入的 logrotate 配置

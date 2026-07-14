@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.2
+# nftables 端口转发管理工具 v3.3
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.2"
-WEB_PANEL_VERSION="3.2"
+SCRIPT_VERSION="3.3"
+WEB_PANEL_VERSION="3.3"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
+FIREWALL_CONF="${CONF_DIR}/firewall.conf"
+FIREWALL_PORTS_FILE="${CONF_DIR}/firewall-ports.db"
+FIREWALL_TABLE="nft_manager_firewall"
 UPDATE_URL_FILE="${CONF_DIR}/update-url"
 MAIN_CONF="/etc/nftables.conf"
 SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
@@ -315,6 +318,90 @@ web_firewall_close() {
         iptables -D INPUT -p tcp --dport "${WEB_PORT}" -j ACCEPT 2>/dev/null || true
         try_persist_iptables || true
     fi
+}
+
+# ============== nft-manager 独立入站防火墙 ==============
+# 防火墙逻辑由 Web 后端统一生成，避免 SSH 与 Web 写出不同格式的 nft 规则。
+manager_firewall_call() {
+    # 防火墙模块通过 Web 后端的 CLI 入口运行，但不依赖 Web 服务本身。
+    # 这样即使面板暂时停止，SSH 菜单仍可管理入站端口。
+    if ! command -v python3 &>/dev/null || [[ ! -f "${WEB_PANEL_FILE}" ]]; then
+        err "防火墙模块不可用，模块文件缺失。请先执行菜单【更新脚本】。"
+        return 1
+    fi
+    NFT_MANAGER_CONF_DIR="${CONF_DIR}" python3 "${WEB_PANEL_FILE}" "$@"
+}
+
+manager_firewall_ensure() {
+    manager_firewall_call --firewall-ensure
+}
+
+manager_firewall_sync() {
+    manager_firewall_call --firewall-sync
+}
+
+manager_firewall_add_forward() {
+    manager_firewall_call --firewall-add "$1" "tcp+udp" "转发端口"
+}
+
+manager_firewall_remove_forward() {
+    manager_firewall_call --firewall-remove "$1"
+}
+
+do_firewall_menu() {
+    while true; do
+        echo ""
+        echo "========================================"
+        echo "            防火墙端口管理"
+        echo "   保底开放: 22/tcp, ${WEB_PORT}/tcp"
+        echo "========================================"
+        echo "  1) 查看已开放端口"
+        echo "  2) 手动开放端口"
+        echo "  3) 关闭手动开放端口"
+        echo "  4) 同步当前转发端口"
+        echo "  0) 返回上一层"
+        echo "========================================"
+        local choice port protocol
+        read -rp "请选择操作 [0-4]: " choice
+        case "$choice" in
+            0) return ;;
+            1) manager_firewall_call --firewall-list ;;
+            2)
+                read -rp "请输入要开放的端口 (1-65535): " port
+                if ! validate_port "$port"; then
+                    err "端口无效。"
+                    continue
+                fi
+                read -rp "协议 [tcp+udp/tcp/udp，默认 tcp+udp]: " protocol
+                protocol="${protocol:-tcp+udp}"
+                if manager_firewall_call --firewall-add "$port" "$protocol" "手动开放"; then
+                    info "已开放端口 ${port}/${protocol}。"
+                fi
+                ;;
+            3)
+                read -rp "请输入要关闭的端口 (1-65535): " port
+                if ! validate_port "$port"; then
+                    err "端口无效。"
+                    continue
+                fi
+                if [[ "$port" == "22" || "$port" == "${WEB_PORT}" ]]; then
+                    warn "${port} 是保底端口，不允许关闭。"
+                    continue
+                fi
+                read -rp "确认关闭端口 ${port}？[y/N]: " protocol
+                [[ "$protocol" =~ ^[Yy]$ ]] || continue
+                if manager_firewall_call --firewall-delete "$port"; then
+                    info "已关闭端口 ${port}。"
+                fi
+                ;;
+            4)
+                if manager_firewall_sync; then
+                    info "已将当前转发端口同步到防火墙。"
+                fi
+                ;;
+            *) err "无效选择，请输入 0-4。" ;;
+        esac
+    done
 }
 
 # ============== 端口占用检测（TCP + UDP） ==============
@@ -1389,6 +1476,8 @@ do_uninstall_manager() {
     if nft_available; then
         "$NFT_BIN" flush table ip "${TABLE_NAME}" 2>/dev/null || true
         "$NFT_BIN" delete table ip "${TABLE_NAME}" 2>/dev/null || true
+        "$NFT_BIN" flush table inet "${FIREWALL_TABLE}" 2>/dev/null || true
+        "$NFT_BIN" delete table inet "${FIREWALL_TABLE}" 2>/dev/null || true
         read -rp "是否清空当前全部 nftables 运行规则？[y/N]: " clear_ruleset
         if [[ "$clear_ruleset" =~ ^[Yy]$ ]]; then
             "$NFT_BIN" flush ruleset 2>/dev/null || true
@@ -1398,6 +1487,7 @@ do_uninstall_manager() {
 
     rm -f "${CONF_FILE}" 2>/dev/null || true
     rm -f "${TARGETS_FILE}" 2>/dev/null || true
+    rm -f "${FIREWALL_CONF}" "${FIREWALL_PORTS_FILE}" 2>/dev/null || true
     rm -f "${UPDATE_URL_FILE}" 2>/dev/null || true
     rm -f "${WEB_AUTH_FILE}" 2>/dev/null || true
     rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" 2>/dev/null || true
@@ -1430,6 +1520,7 @@ do_keepalive() {
     reload_rules || exit 1
     # 旧版菜单更新会重启本服务；在旧规则已成功恢复后补装 Web，避免并发重载规则。
     bootstrap_legacy_web_panel
+    manager_firewall_ensure || warn "独立防火墙初始化失败，请检查 nftables 状态。"
     log_action "保活服务已确认规则加载"
 }
 
@@ -1980,6 +2071,13 @@ do_add() {
     if [[ -n "$rule_alias" ]]; then
         echo "  转发别名: ${rule_alias}"
     fi
+    local open_firewall
+    read -rp "同时开放本机入口端口 ${lport}？[Y/n]: " open_firewall
+    if [[ "$open_firewall" =~ ^[Nn]$ ]]; then
+        open_firewall=false
+    else
+        open_firewall=true
+    fi
     read -rp "确认添加？[Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         info "已取消。"
@@ -1996,7 +2094,13 @@ do_add() {
     fi
 
     if reload_rules; then
-        firewall_open_port "$lport" "$dip" "$dport"
+        if [[ "$open_firewall" == "true" ]] && ! manager_firewall_add_forward "$lport"; then
+            err "防火墙端口开放失败，已回滚本次新增。"
+            RULES=("${old_rules[@]}")
+            write_conf_file >/dev/null 2>&1 || true
+            reload_rules >/dev/null 2>&1 || true
+            return
+        fi
         info "转发规则添加成功: ${lport} → ${dip}:${dport}"
         log_action "新增转发: ${lport} -> ${dip}:${dport}${rule_alias:+ (${rule_alias})}"
         info "若转发不通，请使用菜单中的【诊断/自检】排查。"
@@ -2106,6 +2210,13 @@ do_delete() {
     if [[ -n "$alias" ]]; then
         echo "  转发别名: ${alias}"
     fi
+    local close_firewall
+    read -rp "删除后同时关闭本机入口端口 ${lport}？[Y/n]: " close_firewall
+    if [[ "$close_firewall" =~ ^[Nn]$ ]]; then
+        close_firewall=false
+    else
+        close_firewall=true
+    fi
     read -rp "确认删除？[Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         info "已取消。"
@@ -2113,6 +2224,7 @@ do_delete() {
     fi
 
     # 移除
+    local -a old_rules=("${RULES[@]}")
     unset "RULES[$rule_index]"
     RULES=("${RULES[@]}")
 
@@ -2121,8 +2233,13 @@ do_delete() {
     fi
 
     if reload_rules; then
-        # nft 规则已成功更新后，再清理防火墙放行（RULES 已移除该条，dest_still_used 能正确判断）
-        firewall_close_port "$lport" "$dip" "$dport"
+        if [[ "$close_firewall" == "true" ]] && ! manager_firewall_remove_forward "$lport"; then
+            err "防火墙端口关闭失败，已回滚本次删除。"
+            RULES=("${old_rules[@]}")
+            write_conf_file >/dev/null 2>&1 || true
+            reload_rules >/dev/null 2>&1 || true
+            return
+        fi
         info "转发规则已删除: ${lport} → ${dip}:${dport}"
         log_action "删除转发: ${lport} -> ${dip}:${dport}"
     else
@@ -2154,19 +2271,20 @@ do_clear_all() {
         return
     fi
 
-    # 先清理所有防火墙规则（清空场景用 force，无需检查共享）
-    local rule lport dip dport alias
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport alias <<< "$rule"
-        firewall_close_port "$lport" "$dip" "$dport" "force"
-    done
-
+    local -a old_rules=("${RULES[@]}")
     RULES=()
     if ! write_conf_file; then
         return
     fi
 
     if reload_rules; then
+        local rule lport dip dport alias
+        for rule in "${old_rules[@]}"; do
+            IFS='|' read -r lport dip dport alias <<< "$rule"
+            if ! manager_firewall_remove_forward "$lport"; then
+                warn "端口 ${lport} 的防火墙放行未能自动关闭，请到【防火墙端口管理】处理。"
+            fi
+        done
         info "所有转发规则已清空。"
         log_action "清空所有转发规则"
     else
@@ -2203,9 +2321,10 @@ main_menu() {
         echo "  6) 目标主机管理"
         echo "  7) 一键清空所有转发"
         echo "  8) 诊断/自检"
+        echo "  9) 防火墙端口管理"
         echo "  0) 退出"
         echo "========================================"
-        read -rp "请选择操作 [0-8]: " choice
+        read -rp "请选择操作 [0-9]: " choice
 
         case "$choice" in
             0)
@@ -2229,8 +2348,9 @@ main_menu() {
             6) do_targets_menu ;;
             7) do_clear_all ;;
             8) do_diagnose ;;
+            9) do_firewall_menu ;;
             *)
-                err "无效选择，请输入 0-8。"
+                err "无效选择，请输入 0-9。"
                 ;;
         esac
     done
