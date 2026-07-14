@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.4
+# nftables 端口转发管理工具 v3.5
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.4"
-WEB_PANEL_VERSION="3.4"
+SCRIPT_VERSION="3.5"
+WEB_PANEL_VERSION="3.5"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
 FIREWALL_CONF="${CONF_DIR}/firewall.conf"
 FIREWALL_PORTS_FILE="${CONF_DIR}/firewall-ports.db"
+FIREWALL_SSH_PORT_FILE="${CONF_DIR}/firewall-ssh-port"
 FIREWALL_TABLE="nft_manager_firewall"
 UPDATE_URL_FILE="${CONF_DIR}/update-url"
 MAIN_CONF="/etc/nftables.conf"
@@ -351,16 +352,19 @@ do_firewall_menu() {
         echo ""
         echo "========================================"
         echo "            防火墙端口管理"
-        echo "   保底开放: 22/tcp, ${WEB_PORT}/tcp"
+        echo "   当前 SSH 保底端口: $(manager_firewall_call --firewall-ssh-status 2>/dev/null || echo '检测失败')/tcp"
+        echo "   Web 面板保底端口: ${WEB_PORT}/tcp"
         echo "========================================"
         echo "  1) 查看已开放端口"
         echo "  2) 手动开放端口"
         echo "  3) 关闭手动开放端口"
         echo "  4) 同步当前转发端口"
+        echo "  5) 修改 SSH 防火墙保底端口"
+        echo "  6) 恢复 SSH 端口自动检测"
         echo "  0) 返回上一层"
         echo "========================================"
-        local choice port protocol
-        read -rp "请选择操作 [0-4]: " choice
+        local choice port protocol detected
+        read -rp "请选择操作 [0-6]: " choice
         case "$choice" in
             0) return ;;
             1) manager_firewall_call --firewall-list ;;
@@ -382,8 +386,13 @@ do_firewall_menu() {
                     err "端口无效。"
                     continue
                 fi
-                if [[ "$port" == "22" || "$port" == "${WEB_PORT}" ]]; then
-                    warn "${port} 是保底端口，不允许关闭。"
+                if [[ "$port" == "${WEB_PORT}" ]]; then
+                    warn "${port} 是 Web 面板保底端口，不允许关闭。"
+                    continue
+                fi
+                detected=$(manager_firewall_call --firewall-ssh-status 2>/dev/null || true)
+                if [[ ",${detected}," == *",${port},"* ]]; then
+                    warn "${port} 是当前 SSH 端口，不允许关闭。"
                     continue
                 fi
                 read -rp "确认关闭端口 ${port}？[y/N]: " protocol
@@ -397,7 +406,29 @@ do_firewall_menu() {
                     info "已将当前转发端口同步到防火墙。"
                 fi
                 ;;
-            *) err "无效选择，请输入 0-4。" ;;
+            5)
+                detected=$(manager_firewall_call --firewall-ssh-status 2>/dev/null || echo "未知")
+                echo "当前系统检测到的 SSH 端口: ${detected}"
+                read -rp "请输入要保留的 SSH 防火墙端口 (1-65535): " port
+                if ! validate_port "$port"; then
+                    err "端口无效。"
+                    continue
+                fi
+                if [[ ",${detected}," != *",${port},"* ]]; then
+                    warn "警告：输入端口 ${port} 与当前检测到的 SSH 端口 (${detected}) 不一致。"
+                    read -rp "仍要将 ${port} 设置为 SSH 防火墙保底端口？[y/N]: " protocol
+                    [[ "$protocol" =~ ^[Yy]$ ]] || { info "已取消。"; continue; }
+                fi
+                if manager_firewall_call --firewall-ssh-port "$port"; then
+                    info "已设置 SSH 防火墙保底端口: ${port}/tcp"
+                fi
+                ;;
+            6)
+                if manager_firewall_call --firewall-ssh-auto; then
+                    info "已恢复 SSH 端口自动检测。"
+                fi
+                ;;
+            *) err "无效选择，请输入 0-6。" ;;
         esac
     done
 }
@@ -1467,7 +1498,7 @@ do_uninstall_manager() {
 
     rm -f "${CONF_FILE}" 2>/dev/null || true
     rm -f "${TARGETS_FILE}" 2>/dev/null || true
-    rm -f "${FIREWALL_CONF}" "${FIREWALL_PORTS_FILE}" 2>/dev/null || true
+    rm -f "${FIREWALL_CONF}" "${FIREWALL_PORTS_FILE}" "${FIREWALL_SSH_PORT_FILE}" 2>/dev/null || true
     rm -f "${UPDATE_URL_FILE}" 2>/dev/null || true
     rm -f "${WEB_AUTH_FILE}" 2>/dev/null || true
     rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" 2>/dev/null || true

@@ -25,13 +25,14 @@ STATS_FILE = os.path.join(CONF_DIR, "web-stats.json")
 HISTORY_FILE = os.path.join(CONF_DIR, "web-history.json")
 FIREWALL_CONF = os.path.join(CONF_DIR, "firewall.conf")
 FIREWALL_PORTS_FILE = os.path.join(CONF_DIR, "firewall-ports.db")
+FIREWALL_SSH_PORT_FILE = os.path.join(CONF_DIR, "firewall-ssh-port")
 TABLE_NAME = "port_forward"
 FIREWALL_TABLE = "nft_manager_firewall"
 HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.4"
+WEB_PANEL_VERSION = "3.5"
 FIREWALL_LOCK = threading.Lock()
 
 
@@ -179,9 +180,50 @@ def normalize_firewall_protocol(protocol):
     return protocol
 
 
+def detected_ssh_ports():
+    ports = []
+    for command in (("sshd", "-T"), ("/usr/sbin/sshd", "-T"), ("/usr/local/sbin/sshd", "-T")):
+        if command[0] != "sshd" and not os.path.isfile(command[0]):
+            continue
+        result = run(list(command), timeout=3)
+        if result.returncode == 0:
+            ports = [int(m.group(1)) for m in re.finditer(r"(?m)^port\s+(\d+)\s*$", result.stdout)]
+            if ports:
+                break
+    if not ports:
+        for path in ("/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d"):
+            if os.path.isfile(path):
+                paths = [path]
+            elif os.path.isdir(path):
+                paths = [os.path.join(path, name) for name in os.listdir(path) if name.endswith(".conf")]
+            else:
+                paths = []
+            for config in paths:
+                try:
+                    for line in open(config, encoding="utf-8", errors="ignore"):
+                        match = re.match(r"^\s*Port\s+(\d+)\s*$", line, re.I)
+                        if match:
+                            ports.append(int(match.group(1)))
+                except OSError:
+                    pass
+    ports = sorted({port for port in ports if valid_port(port)})
+    return ports or [22]
+
+
+def configured_ssh_ports():
+    if os.path.exists(FIREWALL_SSH_PORT_FILE):
+        try:
+            port = int(open(FIREWALL_SSH_PORT_FILE, encoding="utf-8").read().strip())
+            if valid_port(port):
+                return [port]
+        except (OSError, TypeError, ValueError):
+            pass
+    return detected_ssh_ports()
+
+
 def firewall_baseline_ports():
     return [
-        {"port": 22, "protocol": "tcp", "label": "SSH 保底"},
+        *[{"port": port, "protocol": "tcp", "label": "SSH 保底"} for port in configured_ssh_ports()],
         {"port": PORT, "protocol": "tcp", "label": "Web 面板保底"},
     ]
 
@@ -216,8 +258,14 @@ def normalize_firewall_ports(ports):
             raise ValueError(f"端口无效: {port}")
         key = (port, protocol)
         label = clean_label(item.get("label", ""))
+        if label.startswith("SSH 保底") or label.startswith("Web 面板保底"):
+            # 旧版保底端口不应在自动切换 SSH 端口后继续残留开放。
+            continue
         if key not in normalized or label.startswith("SSH 保底") or label.startswith("Web 面板保底"):
             normalized[key] = {"port": port, "protocol": protocol, "label": label}
+    for item in firewall_baseline_ports():
+        key = (item["port"], item["protocol"])
+        normalized[key] = item
     return sorted(normalized.values(), key=lambda item: (item["port"], item["protocol"]))
 
 
@@ -357,7 +405,8 @@ def add_forward_firewall_ports(ports):
 
 def remove_firewall_port(port, protocol=None):
     port = int(port)
-    if port in (22, PORT):
+    baseline_ports = {item["port"] for item in firewall_baseline_ports()}
+    if port in baseline_ports:
         raise ValueError(f"保底端口 {port} 不允许关闭")
     with FIREWALL_LOCK:
         current = read_firewall_ports()
@@ -374,6 +423,35 @@ def remove_forward_firewall_ports(ports):
         wanted = {int(port) for port in ports if int(port) not in (22, PORT)}
         current = [item for item in read_firewall_ports() if not (item["port"] in wanted and item["label"] == "转发端口")]
         return apply_firewall_ports(current)
+
+
+def set_firewall_ssh_port(port):
+    port = int(port)
+    if not valid_port(port):
+        raise ValueError("SSH 保底端口无效")
+    old_override = open(FIREWALL_SSH_PORT_FILE, encoding="utf-8").read() if os.path.exists(FIREWALL_SSH_PORT_FILE) else None
+    atomic_write(FIREWALL_SSH_PORT_FILE, f"{port}\n")
+    try:
+        return apply_firewall_ports(read_firewall_ports())
+    except Exception:
+        if old_override is None:
+            if os.path.exists(FIREWALL_SSH_PORT_FILE):
+                os.unlink(FIREWALL_SSH_PORT_FILE)
+        else:
+            atomic_write(FIREWALL_SSH_PORT_FILE, old_override)
+        raise
+
+
+def restore_automatic_ssh_port():
+    old_override = open(FIREWALL_SSH_PORT_FILE, encoding="utf-8").read() if os.path.exists(FIREWALL_SSH_PORT_FILE) else None
+    if os.path.exists(FIREWALL_SSH_PORT_FILE):
+        os.unlink(FIREWALL_SSH_PORT_FILE)
+    try:
+        return apply_firewall_ports(read_firewall_ports())
+    except Exception:
+        if old_override is not None:
+            atomic_write(FIREWALL_SSH_PORT_FILE, old_override)
+        raise
 
 
 def valid_ip(ip):
@@ -847,7 +925,7 @@ def dashboard():
         total_bytes += both_bytes
         active += 1 if c.get("active") else 0
         enriched.append({**r, "targetAlias": aliases.get(r["ip"], ""), "uploadBytes": upload_bytes, "downloadBytes": download_bytes, "totalBytes": both_bytes, "bytes": selected_bytes, "active": c["active"]})
-    return {"targets": targets, "rules": enriched, "history": history, "firewall": {"ports": read_firewall_ports(), "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
+    return {"targets": targets, "rules": enriched, "history": history, "firewall": {"ports": read_firewall_ports(), "baselinePorts": [item["port"] for item in firewall_baseline_ports()], "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
 
 
 HTML = r"""<!doctype html>
@@ -896,7 +974,7 @@ function probePill(result,label){if(!result)return `<span class="probe-pill pend
 function rulesTable(limit){let rules=state.data.rules.slice(0,limit?8:9999);if(!limit&&state.ruleView==='grid'){let cards=rules.map(r=>`<article class="rule-card ${r.enabled?'':'disabled'}"><div class=rule-card-top><h3>${ruleName(r)}</h3>${ruleSwitch(r)}</div><div class=muted>${r.targetAlias||'-'} / ${r.ip}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div><p class="status ${r.active?'on':''}">状态：${r.enabled?(r.active?'活跃':'空闲'):'已关闭'}</p>${probePill(state.ruleConnectivity[r.lport],'连通性')}<div class=actions>${ruleActions(r)}</div></article>`).join('');return `<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}let rows=rules.map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${ruleName(r)}</td><td>${r.lport}</td><td>${r.dport}</td><td class="metric upload">${fmt(r.uploadBytes)}</td><td class="metric download">${fmt(r.downloadBytes)}</td><td class="metric total">${fmt(r.totalBytes)}</td><td>${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</td><td>${probePill(state.ruleConnectivity[r.lport],'连通性')}</td><td class="status ${r.active?'on':''}">${r.enabled?(r.active?'活跃':'空闲'):'关闭'}</td><td class=actions>${ruleSwitch(r)}${ruleActions(r)}</td></tr>`).join('');return `<div class=rule-table-wrap><table class=table><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>统计口径</th><th>连通性</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=11 class=muted>暂无转发</td></tr>'}</table></div>`}
 async function toggleRule(lport,enabled){try{await api('/api/rules/toggle',{method:'POST',body:JSON.stringify({lport,enabled}),timeout:30000});await load()}catch(e){toast(msg(e));await load()}}
 function targetsTable(){let counts={};state.data.rules.forEach(r=>counts[r.ip]=(counts[r.ip]||0)+1);let rows=state.data.targets.map(t=>`<tr><td>${t.alias}</td><td>${t.ip}</td><td>${probePill(state.targetLatency[t.ip],'延迟')}</td><td>${counts[t.ip]||0}</td><td class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`).join('');return `<table class=table><tr><th>别名</th><th>IP</th><th>延迟</th><th>规则数</th><th>操作</th></tr>${rows||'<tr><td colspan=5 class=muted>暂无主机</td></tr>'}</table>`}
-function firewallTable(){let ports=state.data.firewall?.ports||[],webPort=state.data.stats?.port||5555,rows=ports.map(p=>{let locked=p.port===22||p.port===webPort;return `<tr><td>${p.port}</td><td>${p.protocol}</td><td>${p.label||'-'}</td><td>${locked?'<span class=muted>保底端口</span>':`<button class=danger onclick="delFirewall(${p.port},'${p.protocol}')">关闭</button>`}</td></tr>`}).join('');return `<div class=rule-table-wrap><table class=table><tr><th>端口</th><th>协议</th><th>来源/说明</th><th>操作</th></tr>${rows||'<tr><td colspan=4 class=muted>防火墙尚未初始化</td></tr>'}</table></div>`}
+function firewallTable(){let ports=state.data.firewall?.ports||[],baseline=state.data.firewall?.baselinePorts||[],rows=ports.map(p=>{let locked=baseline.includes(p.port);return `<tr><td>${p.port}</td><td>${p.protocol}</td><td>${p.label||'-'}</td><td>${locked?'<span class=muted>保底端口</span>':`<button class=danger onclick="delFirewall(${p.port},'${p.protocol}')">关闭</button>`}</td></tr>`}).join('');return `<div class=rule-table-wrap><table class=table><tr><th>端口</th><th>协议</th><th>来源/说明</th><th>操作</th></tr>${rows||'<tr><td colspan=4 class=muted>防火墙尚未初始化</td></tr>'}</table></div>`}
 function openFirewall(){modal(`<h2>开放端口</h2><div class=grid><div class=field><label>端口</label><input id=fwPort placeholder="例如：8080"></div><div class=field><label>协议</label><select id=fwProtocol><option value=tcp+udp>TCP + UDP</option><option value=tcp>TCP</option><option value=udp>UDP</option></select></div></div><div class=field><label>说明</label><input id=fwLabel value="手动开放"></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveFirewall(this)">开放</button></div>`)}
 async function saveFirewall(btn){await runAction(btn,async()=>{await api('/api/firewall/add',{method:'POST',body:JSON.stringify({port:document.getElementById('fwPort').value,protocol:document.getElementById('fwProtocol').value,label:document.getElementById('fwLabel').value}),timeout:30000});document.querySelector('.modal').remove();await load()})}
 function delFirewall(port,protocol){confirmDialog('关闭端口',`确认关闭 ${port}/${protocol}？`,async()=>{await api('/api/firewall/delete',{method:'POST',body:JSON.stringify({port,protocol}),timeout:30000});await load()})}
@@ -1066,6 +1144,17 @@ if __name__ == "__main__":
         index = sys.argv.index("--firewall-remove")
         port = sys.argv[index + 1] if len(sys.argv) > index + 1 else ""
         remove_forward_firewall_ports([port])
+        raise SystemExit(0)
+    if "--firewall-ssh-status" in sys.argv:
+        print(",".join(map(str, detected_ssh_ports())))
+        raise SystemExit(0)
+    if "--firewall-ssh-port" in sys.argv:
+        index = sys.argv.index("--firewall-ssh-port")
+        port = sys.argv[index + 1] if len(sys.argv) > index + 1 else ""
+        set_firewall_ssh_port(port)
+        raise SystemExit(0)
+    if "--firewall-ssh-auto" in sys.argv:
+        restore_automatic_ssh_port()
         raise SystemExit(0)
     if "--firewall-sync" in sys.argv:
         ensure_firewall_configuration(sync_existing=True)
