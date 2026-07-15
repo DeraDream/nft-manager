@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.14
+# nftables 端口转发管理工具 v3.15
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.14"
-WEB_PANEL_VERSION="3.14"
+SCRIPT_VERSION="3.15"
+WEB_PANEL_VERSION="3.15"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -1254,6 +1254,20 @@ cleanup_legacy_runtime() {
     fi
 }
 
+cleanup_offline_staging_contents() {
+    local source_dir source_real staging_real
+    source_dir="$(dirname "${SCRIPT_PATH}")"
+    source_real="$(readlink -f "$source_dir" 2>/dev/null || realpath "$source_dir" 2>/dev/null || printf '%s' "$source_dir")"
+    staging_real="$(readlink -f "${OFFLINE_STAGING_DIR}" 2>/dev/null || realpath "${OFFLINE_STAGING_DIR}" 2>/dev/null || printf '%s' "${OFFLINE_STAGING_DIR}")"
+
+    [[ "$source_real" == "${OFFLINE_STAGING_DIR}" && "$staging_real" == "${OFFLINE_STAGING_DIR}" && -d "${OFFLINE_STAGING_DIR}" ]] || return 0
+    find "${OFFLINE_STAGING_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || {
+        warn "离线更新目录内容清理失败: ${OFFLINE_STAGING_DIR}"
+        return 1
+    }
+    info "已清空离线更新目录，目录已保留: ${OFFLINE_STAGING_DIR}"
+}
+
 install_keepalive_service() {
     local start_mode="${1:-start}"
     if ! command -v systemctl &>/dev/null; then
@@ -1660,11 +1674,9 @@ do_local_redeploy() {
     if [[ "$sync_ok" == "true" ]]; then
         cleanup_legacy_runtime || warn "新版服务已运行，但旧运行文件未能全部清理。"
         info "离线重部署完成，配置与流量统计数据均已保留。"
-        if [[ "$(dirname "${SCRIPT_PATH}")" == "${OFFLINE_STAGING_DIR}" ]]; then
-            info "离线更新目录已保留: ${OFFLINE_STAGING_DIR}"
-        fi
         info "Web 面板地址: http://$(get_local_ip):${WEB_PORT}"
         log_action "使用本机文件离线重部署 v${SCRIPT_VERSION}"
+        cleanup_offline_staging_contents || true
     else
         err "离线重部署未完整完成，已尝试恢复并重启现有服务，请执行诊断/自检。"
     fi

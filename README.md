@@ -201,7 +201,7 @@ chmod +x /root/nft-manager-update/nft.sh
 sudo /root/nft-manager-update/nft.sh --offline-redeploy
 ```
 
-该入口不会访问网络，会依次校验本地文件、保存当前流量快照、停止管理服务、部署到 `/opt/nft-manager`、更新配置结构与 systemd 服务，最后重启保活和 Web 服务。全部成功后，会保留 `/root/nft-manager-update` 作为固定离线更新目录，并清理旧版 `/usr/local/lib/nft-forward` 和可识别的 `/root/nft.sh`。以后只需将新版文件拖入该目录覆盖，再执行同一条命令。
+该入口不会访问网络，会依次校验本地文件、保存当前流量快照、停止管理服务、部署到 `/opt/nft-manager`、更新配置结构与 systemd 服务，最后重启保活和 Web 服务。全部成功后，会清空 `/root/nft-manager-update` 内的内容但保留该目录，并清理旧版 `/usr/local/lib/nft-forward` 和可识别的 `/root/nft.sh`。以后只需将新版文件拖入该目录，再执行同一条命令；如果校验或更新失败，上传内容会保留以便重试。
 
 也可以直接覆盖 `/opt/nft-manager` 中的同名文件，再执行 `nft` 并选择 `10) 离线更新 / 重部署服务`；使用暂存目录更便于在校验失败时保留当前运行文件。
 
