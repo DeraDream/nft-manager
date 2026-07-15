@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="3.11"
+INSTALLER_VERSION="3.12"
 RAW_BASE="https://raw.githubusercontent.com/DeraDream/nft-manager/main"
 CDN_BASE="https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main"
 
