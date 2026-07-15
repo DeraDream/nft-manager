@@ -33,29 +33,16 @@
 海外服务器或可直接访问 GitHub 的机器：
 
 ```bash
-curl -L https://raw.githubusercontent.com/DeraDream/nft-manager/main/nft.sh -o nft.sh
-chmod +x nft.sh
-sudo ./nft.sh
+curl -fsSL https://raw.githubusercontent.com/DeraDream/nft-manager/main/install.sh | sudo bash
 ```
 
 国内服务器可使用 jsDelivr CDN：
 
 ```bash
-curl -L https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/nft.sh -o nft.sh
-head -3 nft.sh
-chmod +x nft.sh
-sudo ./nft.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/install.sh | sudo bash
 ```
 
-正常情况下，`head -3 nft.sh` 应显示：
-
-```bash
-#!/usr/bin/env bash
-#
-# nftables 端口转发管理工具 v3.7
-```
-
-如果看到 `<!DOCTYPE html>`、`Cloudflare`、`403`、`404` 等内容，说明下载到的是网页错误页，不要执行。
+引导安装器会在 `/tmp/nft-manager-install.*` 创建临时目录，下载并校验同版本的脚本、Web 面板和当前架构的 NextTrace，然后进入安装菜单。退出菜单后临时目录会自动删除；正式运行文件统一安装到 `/opt/nft-manager`，不会在 `/root` 留下 `nft.sh`。
 
 进入菜单后选择：
 
@@ -85,11 +72,11 @@ admin / admin
 
 ## 从旧 SSH 版升级
 
-纯 SSH 菜单版本升级到 Web 版本时，只需在旧菜单中选择 `2) 更新脚本`。旧版更新流程会重启 systemd 保活服务；新版在保活服务确认旧规则已成功加载后，自动识别未部署的 Web 面板并补装 Web 服务和 NextTrace，不会执行菜单 `1)` 的清空安装流程。Web 服务启动时会先校验旧转发配置，校验通过后才迁移为支持流量统计的格式；若校验或加载失败，会保留并恢复旧配置。
+纯 SSH 菜单版本升级到 Web 版本时，只需在旧菜单中选择 `2) 更新脚本`。新版会先把运行文件迁移到 `/opt/nft-manager`，再停止管理服务、补装缺失的 Web 面板与 NextTrace、更新 systemd 路径并迁移配置，最后重启服务。服务和路径同步成功后，才会清理旧目录 `/usr/local/lib/nft-forward` 以及可识别的 `/root/nft.sh`；不会执行菜单 `1)` 的清空安装流程，也不会删除 `/etc/nftables.d` 中的规则、主机和流量统计数据。
 
 如果服务器没有 systemd 或保活服务启动失败，再手动执行一次 `sudo nft` 即可触发相同的补装检测。
 
-对于已部署 Web 的版本更新，脚本会比较已安装的 Web 文件版本；版本一致时不下载或覆盖 Web 文件。更新会停止管理服务，校验配置结构是否需要迁移，最后统一重启保活和 Web 服务。
+对于已部署 Web 的版本更新，脚本会比较已安装的 Web 文件版本；版本一致时不下载或覆盖 Web 文件。更新会短暂停止 Web 和保活服务，校验配置结构是否需要迁移，最后统一重启。nftables 规则与配置不会被清空。
 
 升级过程中不要选择 `1) 安装/卸载 nftables 管理器`，该选项用于全新安装或完整卸载，不适合保留旧转发的升级场景。
 
@@ -154,7 +141,7 @@ admin / admin
 
 ## 防火墙端口管理
 
-安装或更新到 `v3.7` 后，项目会创建独立的 nftables 入站防火墙配置：
+安装或更新到 `v3.8` 后，项目会创建独立的 nftables 入站防火墙配置：
 
 - 默认拒绝未列出的入站连接。
 - 无论何时都会保留当前检测到的 SSH 端口和 `5555/tcp`（Web 面板）两个保底端口。
@@ -198,9 +185,9 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 服务器无法访问 HTTP/HTTPS 时，可在其他机器下载完整项目，将同一版本的 `nft.sh`、`web_panel.py` 和 `vendor/nexttrace` 上传并覆盖：
 
 ```text
-/usr/local/lib/nft-forward/nft.sh
-/usr/local/lib/nft-forward/web_panel.py
-/usr/local/lib/nft-forward/vendor/nexttrace/
+/opt/nft-manager/nft.sh
+/opt/nft-manager/web_panel.py
+/opt/nft-manager/vendor/nexttrace/
 ```
 
 然后执行 `nft`，选择：
@@ -212,13 +199,13 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 该入口不会访问网络，会依次校验本地文件、保存当前流量快照、停止管理服务、更新配置结构与 systemd 服务，最后重启保活和 Web 服务。也可以直接执行：
 
 ```bash
-sudo /usr/local/lib/nft-forward/nft.sh --offline-redeploy
+sudo /opt/nft-manager/nft.sh --offline-redeploy
 ```
 
 完整项目已经包含 Linux `amd64/arm64` 的 NextTrace，无需另外下载。若使用其他架构，也可以自行下载匹配的二进制并命名为 `nexttrace`，上传到以下任一位置：
 
 ```text
-/usr/local/lib/nft-forward/nexttrace
+/opt/nft-manager/nexttrace
 /root/nexttrace
 ```
 
@@ -231,9 +218,9 @@ sudo /usr/local/lib/nft-forward/nft.sh --offline-redeploy
 安装后主要文件：
 
 ```text
-/usr/local/lib/nft-forward/nft.sh
-/usr/local/lib/nft-forward/web_panel.py
-/usr/local/lib/nft-forward/vendor/nexttrace/
+/opt/nft-manager/nft.sh
+/opt/nft-manager/web_panel.py
+/opt/nft-manager/vendor/nexttrace/
 /usr/local/bin/nft
 /usr/local/bin/nexttrace
 /etc/systemd/system/nft-forward-keepalive.service
@@ -263,7 +250,7 @@ sudo /usr/local/lib/nft-forward/nft.sh --offline-redeploy
 卸载为完整卸载，会删除：
 
 - 全局命令 `/usr/local/bin/nft`
-- 安装目录 `/usr/local/lib/nft-forward`
+- 安装目录 `/opt/nft-manager`（同时清理旧版 `/usr/local/lib/nft-forward`）
 - systemd 保活服务
 - Web 面板服务
 - 端口转发配置

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.7
+# nftables 端口转发管理工具 v3.8
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.7"
-WEB_PANEL_VERSION="3.7"
+SCRIPT_VERSION="3.8"
+WEB_PANEL_VERSION="3.8"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -21,9 +21,10 @@ LOG_FILE="/var/log/nft-forward.log"
 LOGROTATE_CONF="/etc/logrotate.d/nft-forward"
 TABLE_NAME="port_forward"
 GLOBAL_CMD="/usr/local/bin/nft"
-SCRIPT_INSTALL_DIR="/usr/local/lib/nft-forward"
+SCRIPT_INSTALL_DIR="/opt/nft-manager"
 SCRIPT_INSTALL_FILE="${SCRIPT_INSTALL_DIR}/nft.sh"
 WEB_PANEL_FILE="${SCRIPT_INSTALL_DIR}/web_panel.py"
+LEGACY_SCRIPT_INSTALL_DIR="/usr/local/lib/nft-forward"
 NEXTTRACE_MARKER="${SCRIPT_INSTALL_DIR}/nexttrace-managed"
 NEXTTRACE_LOCAL_FILE="${SCRIPT_INSTALL_DIR}/nexttrace"
 NEXTTRACE_INSTALL_FILE="/usr/local/bin/nexttrace"
@@ -1218,6 +1219,40 @@ EOF
     info "已安装全局命令: ${GLOBAL_CMD}"
 }
 
+is_nft_manager_script() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    grep -qF 'nftables 端口转发管理工具' "$file" 2>/dev/null &&
+        grep -qE '^[[:space:]]*SCRIPT_VERSION=' "$file" 2>/dev/null
+}
+
+cleanup_legacy_runtime() {
+    local legacy_root_script="/root/nft.sh"
+
+    # 只有全局命令和两个 systemd 服务均已指向新目录，才清理旧运行文件。
+    grep -qF "exec \"${SCRIPT_INSTALL_FILE}\"" "${GLOBAL_CMD}" 2>/dev/null || return 1
+    if command -v systemctl &>/dev/null; then
+        [[ ! -f "${KEEPALIVE_SERVICE_FILE}" ]] || grep -qF "${SCRIPT_INSTALL_FILE} --keepalive" "${KEEPALIVE_SERVICE_FILE}" 2>/dev/null || return 1
+        [[ ! -f "${WEB_SERVICE_FILE}" ]] || grep -qF "${WEB_PANEL_FILE}" "${WEB_SERVICE_FILE}" 2>/dev/null || return 1
+    fi
+
+    if [[ "${LEGACY_SCRIPT_INSTALL_DIR}" != "${SCRIPT_INSTALL_DIR}" && -d "${LEGACY_SCRIPT_INSTALL_DIR}" ]]; then
+        rm -rf "${LEGACY_SCRIPT_INSTALL_DIR}" 2>/dev/null || {
+            warn "旧运行目录清理失败: ${LEGACY_SCRIPT_INSTALL_DIR}"
+            return 1
+        }
+        info "已迁移并清理旧运行目录: ${LEGACY_SCRIPT_INSTALL_DIR}"
+    fi
+
+    if [[ "$legacy_root_script" != "${SCRIPT_INSTALL_FILE}" ]] && is_nft_manager_script "$legacy_root_script"; then
+        rm -f "$legacy_root_script" 2>/dev/null || {
+            warn "旧启动脚本清理失败: ${legacy_root_script}"
+            return 1
+        }
+        info "已清理旧启动脚本: ${legacy_root_script}"
+    fi
+}
+
 install_keepalive_service() {
     local start_mode="${1:-start}"
     if ! command -v systemctl &>/dev/null; then
@@ -1632,7 +1667,21 @@ do_local_redeploy() {
 
 do_post_update() {
     check_root
-    sync_updated_runtime
+    local source_web
+    source_web="$(dirname "${SCRIPT_PATH}")/web_panel.py"
+
+    # 从旧运行目录启动升级时，先结算一次流量，再切换服务路径。
+    if [[ -f "$source_web" ]] && grep -q -- '--snapshot-traffic' "$source_web" 2>/dev/null; then
+        python3 "$source_web" --snapshot-traffic >/dev/null 2>&1 || warn "升级前的流量快照未完成，将继续迁移。"
+    fi
+
+    info "正在将运行文件同步到 ${SCRIPT_INSTALL_DIR}..."
+    install_manager_files || return 1
+    if sync_updated_runtime; then
+        cleanup_legacy_runtime || warn "新版服务已运行，但旧启动文件未能全部清理。"
+        return 0
+    fi
+    return 1
 }
 
 bootstrap_legacy_web_panel() {
@@ -1683,6 +1732,10 @@ do_uninstall_manager() {
     rm -f "${GLOBAL_CMD}" 2>/dev/null || true
     rm -f "${GLOBAL_CMD}.bak."* 2>/dev/null || true
     rm -rf "${SCRIPT_INSTALL_DIR}" 2>/dev/null || true
+    rm -rf "${LEGACY_SCRIPT_INSTALL_DIR}" 2>/dev/null || true
+    if is_nft_manager_script /root/nft.sh; then
+        rm -f /root/nft.sh 2>/dev/null || true
+    fi
     if [[ -n "$managed_nexttrace" && -x "$managed_nexttrace" ]]; then
         rm -f "$managed_nexttrace" 2>/dev/null || true
     fi
@@ -1924,6 +1977,7 @@ do_install() {
         fi
 
         install_manager_runtime || return
+        cleanup_legacy_runtime || warn "安装已完成，但旧启动文件未能全部清理。"
         info "初始化完成，所有配置已由本脚本接管。"
         return
     fi
@@ -1974,6 +2028,7 @@ do_install() {
     fi
 
     install_manager_runtime || return
+    cleanup_legacy_runtime || warn "安装已完成，但旧启动文件未能全部清理。"
     info "安装与初始化完成。"
 }
 
