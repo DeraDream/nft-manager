@@ -141,7 +141,7 @@ admin / admin
 
 ## 防火墙端口管理
 
-安装或更新到 `v3.8` 后，项目会创建独立的 nftables 入站防火墙配置：
+安装或更新到 `v3.9` 后，项目会创建独立的 nftables 入站防火墙配置：
 
 - 默认拒绝未列出的入站连接。
 - 无论何时都会保留当前检测到的 SSH 端口和 `5555/tcp`（Web 面板）两个保底端口。
@@ -182,25 +182,24 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 
 ## 完全离线更新
 
-服务器无法访问 HTTP/HTTPS 时，可在其他机器下载完整项目，将同一版本的 `nft.sh`、`web_panel.py` 和 `vendor/nexttrace` 上传并覆盖：
+服务器无法访问 HTTP/HTTPS 时，可在其他机器下载完整项目，然后将以下内容上传到固定暂存目录：
 
 ```text
-/opt/nft-manager/nft.sh
-/opt/nft-manager/web_panel.py
-/opt/nft-manager/vendor/nexttrace/
+/root/nft-manager-update/nft.sh
+/root/nft-manager-update/web_panel.py
+/root/nft-manager-update/vendor/nexttrace/
 ```
 
-然后执行 `nft`，选择：
-
-```text
-10) 离线更新 / 重部署服务
-```
-
-该入口不会访问网络，会依次校验本地文件、保存当前流量快照、停止管理服务、更新配置结构与 systemd 服务，最后重启保活和 Web 服务。也可以直接执行：
+上传完成后执行：
 
 ```bash
-sudo /opt/nft-manager/nft.sh --offline-redeploy
+chmod +x /root/nft-manager-update/nft.sh
+sudo /root/nft-manager-update/nft.sh --offline-redeploy
 ```
+
+该入口不会访问网络，会依次校验本地文件、保存当前流量快照、停止管理服务、部署到 `/opt/nft-manager`、更新配置结构与 systemd 服务，最后重启保活和 Web 服务。全部成功后，会自动删除 `/root/nft-manager-update`、旧版 `/usr/local/lib/nft-forward` 和可识别的 `/root/nft.sh`。
+
+也可以直接覆盖 `/opt/nft-manager` 中的同名文件，再执行 `nft` 并选择 `10) 离线更新 / 重部署服务`；使用暂存目录更便于在校验失败时保留当前运行文件。
 
 完整项目已经包含 Linux `amd64/arm64` 的 NextTrace，无需另外下载。若使用其他架构，也可以自行下载匹配的二进制并命名为 `nexttrace`，上传到以下任一位置：
 

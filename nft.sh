@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.8
+# nftables 端口转发管理工具 v3.9
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.8"
-WEB_PANEL_VERSION="3.8"
+SCRIPT_VERSION="3.9"
+WEB_PANEL_VERSION="3.9"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -25,6 +25,7 @@ SCRIPT_INSTALL_DIR="/opt/nft-manager"
 SCRIPT_INSTALL_FILE="${SCRIPT_INSTALL_DIR}/nft.sh"
 WEB_PANEL_FILE="${SCRIPT_INSTALL_DIR}/web_panel.py"
 LEGACY_SCRIPT_INSTALL_DIR="/usr/local/lib/nft-forward"
+OFFLINE_STAGING_DIR="/root/nft-manager-update"
 NEXTTRACE_MARKER="${SCRIPT_INSTALL_DIR}/nexttrace-managed"
 NEXTTRACE_LOCAL_FILE="${SCRIPT_INSTALL_DIR}/nexttrace"
 NEXTTRACE_INSTALL_FILE="/usr/local/bin/nexttrace"
@@ -1253,6 +1254,20 @@ cleanup_legacy_runtime() {
     fi
 }
 
+cleanup_offline_staging() {
+    local source_dir source_real staging_real
+    source_dir="$(dirname "${SCRIPT_PATH}")"
+    source_real="$(readlink -f "$source_dir" 2>/dev/null || realpath "$source_dir" 2>/dev/null || printf '%s' "$source_dir")"
+    staging_real="$(readlink -f "${OFFLINE_STAGING_DIR}" 2>/dev/null || realpath "${OFFLINE_STAGING_DIR}" 2>/dev/null || printf '%s' "${OFFLINE_STAGING_DIR}")"
+
+    [[ "$source_real" == "$staging_real" && "$source_real" != "${SCRIPT_INSTALL_DIR}" ]] || return 0
+    rm -rf "$source_real" 2>/dev/null || {
+        warn "离线更新暂存目录清理失败: ${source_real}"
+        return 1
+    }
+    info "已清理离线更新暂存目录: ${source_real}"
+}
+
 install_keepalive_service() {
     local start_mode="${1:-start}"
     if ! command -v systemctl &>/dev/null; then
@@ -1657,6 +1672,8 @@ do_local_redeploy() {
     restart_runtime_services || sync_ok=false
 
     if [[ "$sync_ok" == "true" ]]; then
+        cleanup_legacy_runtime || warn "新版服务已运行，但旧运行文件未能全部清理。"
+        cleanup_offline_staging || true
         info "离线重部署完成，配置与流量统计数据均已保留。"
         info "Web 面板地址: http://$(get_local_ip):${WEB_PORT}"
         log_action "使用本机文件离线重部署 v${SCRIPT_VERSION}"
