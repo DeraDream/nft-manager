@@ -13,7 +13,7 @@
 - 支持目标主机库，可为 IP 设置中文别名
 - 支持为每条转发规则设置别名
 - 查看和删除规则时按目标主机分区
-- 安装后提供全局命令 `nft` 唤起菜单
+- 安装后提供全局命令 `nftm` 唤起菜单，不占用系统 nftables 的 `nft` 命令
 - 安装后自动创建 systemd 保活服务
 - 安装后自动创建 Web 面板，默认端口 `5555`
 - Web 面板自适应桌面与手机，手机端使用固定底部 Tab Bar，列表、表单和弹窗均支持触屏布局
@@ -60,7 +60,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/install.sh | s
 安装完成后，可直接使用全局命令打开菜单：
 
 ```bash
-sudo nft
+sudo nftm
 ```
 
 Web 面板默认地址：
@@ -81,7 +81,9 @@ admin / admin
 
 纯 SSH 菜单版本升级到 Web 版本时，只需在旧菜单中选择 `2) 更新脚本`。新版会先把运行文件迁移到 `/opt/nft-manager`，再停止管理服务、补装缺失的 Web 面板与 NextTrace、更新 systemd 路径并迁移配置，最后重启服务。服务和路径同步成功后，才会清理旧目录 `/usr/local/lib/nft-forward` 以及可识别的 `/root/nft.sh`；不会执行菜单 `1)` 的清空安装流程，也不会删除 `/etc/nftables.d` 中的规则、主机和流量统计数据。
 
-如果服务器没有 systemd 或保活服务启动失败，再手动执行一次 `sudo nft` 即可触发相同的补装检测。
+升级到 v3.24 或更高版本时，会先创建新的全局菜单命令 `/usr/local/bin/nftm`，成功后自动删除旧版项目生成的 `/usr/local/bin/nft`，把 `nft` 命令还给系统 nftables。
+
+如果服务器没有 systemd 或保活服务启动失败，再手动执行一次 `sudo nftm` 即可触发相同的补装检测。
 
 对于已部署 Web 的版本更新，脚本会比较已安装的 Web 文件版本；版本一致时不下载或覆盖 Web 文件。更新会短暂停止 Web 和保活服务，校验配置结构是否需要迁移，最后统一重启。nftables 规则与配置不会被清空。
 
@@ -120,7 +122,7 @@ Web 面板包含：
 - 防火墙管理
 - 系统设置
 
-项目内置 NextTrace Tiny `v1.7.1` 的 Linux `amd64` 与 `arm64` 文件。首次安装时会按 VPS 架构自动关联为 `/usr/local/bin/nexttrace`；只有单独下载 `nft.sh` 且本地没有内置文件时，才会尝试从本项目下载对应架构文件。Web 主机管理可点击“NextTrace 路由”，SSH 目标主机管理可选择 `5) NextTrace 路由检测`。主菜单 `11) NextTrace 管理` 支持从项目内置文件安装/修复，以及从 NextTrace 官方 Release 在线升级；也可以直接执行 `sudo nft --nexttrace-update`。
+项目内置 NextTrace Tiny `v1.7.1` 的 Linux `amd64` 与 `arm64` 文件。首次安装时会按 VPS 架构自动关联为 `/usr/local/bin/nexttrace`；只有单独下载 `nft.sh` 且本地没有内置文件时，才会尝试从本项目下载对应架构文件。Web 主机管理可点击“NextTrace 路由”，SSH 目标主机管理可选择 `5) NextTrace 路由检测`。主菜单 `11) NextTrace 管理` 支持从项目内置文件安装/修复，以及从 NextTrace 官方 Release 在线升级；也可以直接执行 `sudo nftm --nexttrace-update`。
 
 新增转发时，入口端口输入框仅支持单个端口；可用空格或英文逗号一次输入多个端口：
 
@@ -195,7 +197,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 /root/nft-manager-main.zip
 ```
 
-执行 `nft`，选择 `10) 从 /root/nft-manager-main.zip 离线更新`。脚本会将 ZIP 解压到 `/tmp` 下的随机临时目录，校验后直接更新 `/opt/nft-manager` 中的服务文件。更新成功后删除临时解压目录和 `/root/nft-manager-main.zip`，并清理旧版本遗留的 `/root/nft-manager-update` 后立即进入新版菜单；更新失败时删除临时目录并保留 ZIP，供排查或重试。该入口不影响 `2) 更新脚本` 的在线更新流程。
+执行 `nftm`，选择 `10) 从 /root/nft-manager-main.zip 离线更新`。脚本会将 ZIP 解压到 `/tmp` 下的随机临时目录，校验后直接更新 `/opt/nft-manager` 中的服务文件。更新成功后删除临时解压目录和 `/root/nft-manager-main.zip`，并清理旧版本遗留的 `/root/nft-manager-update` 后立即进入新版菜单；更新失败时删除临时目录并保留 ZIP，供排查或重试。该入口不影响 `2) 更新脚本` 的在线更新流程。
 
 完整项目已经包含 Linux `amd64/arm64` 的 NextTrace，无需另外下载。若使用其他架构，也可以自行下载匹配的二进制并命名为 `nexttrace`，上传到以下任一位置：
 
@@ -216,7 +218,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 /opt/nft-manager/nft.sh
 /opt/nft-manager/web_panel.py
 /opt/nft-manager/vendor/nexttrace/
-/usr/local/bin/nft
+/usr/local/bin/nftm
 /usr/local/bin/nexttrace
 /etc/systemd/system/nft-forward-keepalive.service
 /etc/systemd/system/nft-manager-web.service
@@ -244,7 +246,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 
 卸载为完整卸载，会删除：
 
-- 全局命令 `/usr/local/bin/nft`
+- 全局命令 `/usr/local/bin/nftm`（升级时自动清理旧版 `/usr/local/bin/nft` 管理入口）
 - 安装目录 `/opt/nft-manager`（同时清理旧版 `/usr/local/lib/nft-forward`）
 - systemd 保活服务
 - Web 面板服务

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.23
+# nftables 端口转发管理工具 v3.24
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.23"
-WEB_PANEL_VERSION="3.23"
+SCRIPT_VERSION="3.24"
+WEB_PANEL_VERSION="3.24"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -20,7 +20,8 @@ SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
 LOG_FILE="/var/log/nft-forward.log"
 LOGROTATE_CONF="/etc/logrotate.d/nft-forward"
 TABLE_NAME="port_forward"
-GLOBAL_CMD="/usr/local/bin/nft"
+GLOBAL_CMD="/usr/local/bin/nftm"
+LEGACY_GLOBAL_CMD="/usr/local/bin/nft"
 SCRIPT_INSTALL_DIR="/opt/nft-manager"
 SCRIPT_INSTALL_FILE="${SCRIPT_INSTALL_DIR}/nft.sh"
 WEB_PANEL_FILE="${SCRIPT_INSTALL_DIR}/web_panel.py"
@@ -54,13 +55,13 @@ UPDATE_STATUS_TEXT="未检查"
 resolve_nft_bin() {
     local bin
     for bin in /usr/sbin/nft /sbin/nft /usr/bin/nft /bin/nft; do
-        if [[ -x "$bin" && "$bin" != "$GLOBAL_CMD" ]]; then
+        if [[ -x "$bin" && "$bin" != "$GLOBAL_CMD" && "$bin" != "$LEGACY_GLOBAL_CMD" ]]; then
             echo "$bin"
             return
         fi
     done
     bin=$(command -v nft 2>/dev/null || true)
-    if [[ -n "$bin" && "$bin" != "$GLOBAL_CMD" ]]; then
+    if [[ -n "$bin" && "$bin" != "$GLOBAL_CMD" && "$bin" != "$LEGACY_GLOBAL_CMD" ]]; then
         echo "$bin"
     fi
 }
@@ -1177,6 +1178,26 @@ web_panel_needs_sync() {
     [[ "$(web_panel_version "${WEB_PANEL_FILE}")" != "${WEB_PANEL_VERSION}" ]]
 }
 
+is_manager_global_command() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    grep -qE 'exec[[:space:]]+"(/opt/nft-manager|/usr/local/lib/nft-forward)/nft\.sh"' "$file" 2>/dev/null ||
+        grep -qF 'nftables 端口转发管理工具' "$file" 2>/dev/null
+}
+
+remove_legacy_global_command() {
+    [[ "${LEGACY_GLOBAL_CMD}" != "${GLOBAL_CMD}" && -e "${LEGACY_GLOBAL_CMD}" ]] || return 0
+    if ! is_manager_global_command "${LEGACY_GLOBAL_CMD}"; then
+        warn "检测到非本项目管理的 ${LEGACY_GLOBAL_CMD}，已保留该文件。"
+        return 0
+    fi
+    rm -f "${LEGACY_GLOBAL_CMD}" 2>/dev/null || {
+        err "无法删除旧版全局命令 ${LEGACY_GLOBAL_CMD}"
+        return 1
+    }
+    info "已删除旧版全局命令: ${LEGACY_GLOBAL_CMD}"
+}
+
 install_manager_files() {
     local source_vendor target_vendor
     mkdir -p "${SCRIPT_INSTALL_DIR}" 2>/dev/null || {
@@ -1216,6 +1237,8 @@ EOF
         err "无法创建全局命令 ${GLOBAL_CMD}"
         return 1
     }
+
+    remove_legacy_global_command || return 1
 
     info "已安装全局命令: ${GLOBAL_CMD}"
 }
@@ -1771,7 +1794,7 @@ bootstrap_legacy_web_panel() {
         install_nexttrace || warn "NextTrace 未能完成安装，路由追踪功能暂不可用。"
         info "Web 面板补装完成。旧规则将在 Web 服务启动时校验并迁移。"
     else
-        warn "Web 面板补装失败；现有 SSH 转发未被改动。请检查网络后重新执行 nft。"
+        warn "Web 面板补装失败；现有 SSH 转发未被改动。请检查网络后重新执行 nftm。"
     fi
 }
 
@@ -1808,6 +1831,9 @@ do_uninstall_manager() {
 
     rm -f "${GLOBAL_CMD}" 2>/dev/null || true
     rm -f "${GLOBAL_CMD}.bak."* 2>/dev/null || true
+    if is_manager_global_command "${LEGACY_GLOBAL_CMD}"; then
+        rm -f "${LEGACY_GLOBAL_CMD}" 2>/dev/null || true
+    fi
     rm -rf "${SCRIPT_INSTALL_DIR}" 2>/dev/null || true
     rm -rf "${LEGACY_SCRIPT_INSTALL_DIR}" 2>/dev/null || true
     if is_nft_manager_script /root/nft.sh; then
