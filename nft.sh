@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.20
+# nftables 端口转发管理工具 v3.21
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.20"
-WEB_PANEL_VERSION="3.20"
+SCRIPT_VERSION="3.21"
+WEB_PANEL_VERSION="3.21"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -1835,7 +1835,7 @@ do_uninstall_manager() {
     rm -f "${FIREWALL_CONF}" "${FIREWALL_PORTS_FILE}" "${FIREWALL_SSH_PORT_FILE}" 2>/dev/null || true
     rm -f "${UPDATE_URL_FILE}" 2>/dev/null || true
     rm -f "${WEB_AUTH_FILE}" 2>/dev/null || true
-    rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" "${CONF_DIR}/web-settings.json" "${CONF_DIR}/.web-stats.lock" 2>/dev/null || true
+    rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" "${CONF_DIR}/web-bandwidth.db" "${CONF_DIR}/web-bandwidth.db-wal" "${CONF_DIR}/web-bandwidth.db-shm" "${CONF_DIR}/web-settings.json" "${CONF_DIR}/.web-stats.lock" 2>/dev/null || true
     rm -f "${CONF_DIR}"/*.conf.bak.* 2>/dev/null || true
     rm -rf "${CONF_DIR}/backups" 2>/dev/null || true
     rmdir "${CONF_DIR}" 2>/dev/null || true

@@ -12,11 +12,12 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -27,6 +28,7 @@ AUTH_FILE = os.path.join(CONF_DIR, "web-auth.conf")
 STATS_FILE = os.path.join(CONF_DIR, "web-stats.json")
 STATS_LOCK_FILE = os.path.join(CONF_DIR, ".web-stats.lock")
 HISTORY_FILE = os.path.join(CONF_DIR, "web-history.json")
+BANDWIDTH_DB = os.path.join(CONF_DIR, "web-bandwidth.db")
 SETTINGS_FILE = os.path.join(CONF_DIR, "web-settings.json")
 FIREWALL_CONF = os.path.join(CONF_DIR, "firewall.conf")
 FIREWALL_PORTS_FILE = os.path.join(CONF_DIR, "firewall-ports.db")
@@ -37,9 +39,13 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.20"
+WEB_PANEL_VERSION = "3.21"
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
+BANDWIDTH_LOCK = threading.Lock()
+BANDWIDTH_STATE = {"interface": "", "timestamp": 0.0, "rx": 0, "tx": 0, "downloadMbps": 0.0, "uploadMbps": 0.0}
+BANDWIDTH_RETENTION = 24 * 60 * 60
+BANDWIDTH_SAMPLE_INTERVAL = 10
 DEFAULT_PANEL_TITLE = "nft-manager"
 
 
@@ -770,6 +776,123 @@ def hourly_history(delta):
     return [{"hour": stamp, "bytes": int(hours.get(str(stamp), 0))} for stamp in range(now_hour - 23 * 3600, now_hour + 1, 3600)]
 
 
+def default_network_interface():
+    result = run(["ip", "-o", "route", "show", "default"], timeout=2)
+    for line in result.stdout.splitlines():
+        match = re.search(r"(?:^|\s)dev\s+(\S+)", line)
+        if match:
+            return match.group(1)
+    try:
+        with open("/proc/net/route", encoding="utf-8") as route_file:
+            for line in route_file.readlines()[1:]:
+                fields = line.split()
+                if len(fields) >= 4 and fields[1] == "00000000" and int(fields[3], 16) & 2:
+                    return fields[0]
+    except (OSError, ValueError):
+        pass
+    try:
+        for interface in sorted(os.listdir("/sys/class/net")):
+            if interface == "lo":
+                continue
+            state_file = f"/sys/class/net/{interface}/operstate"
+            if os.path.isfile(state_file):
+                with open(state_file, encoding="utf-8") as state_handle:
+                    if state_handle.read().strip() == "up":
+                        return interface
+    except OSError:
+        pass
+    return ""
+
+
+def interface_byte_counters(interface):
+    if not re.fullmatch(r"[A-Za-z0-9_.:@-]+", interface or ""):
+        raise ValueError("默认出口网卡名称无效")
+    base = f"/sys/class/net/{interface}/statistics"
+    with open(f"{base}/rx_bytes", encoding="utf-8") as rx_file:
+        rx_bytes = int(rx_file.read().strip())
+    with open(f"{base}/tx_bytes", encoding="utf-8") as tx_file:
+        tx_bytes = int(tx_file.read().strip())
+    return rx_bytes, tx_bytes
+
+
+def bandwidth_connection():
+    os.makedirs(CONF_DIR, exist_ok=True)
+    connection = sqlite3.connect(BANDWIDTH_DB, timeout=5)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS samples ("
+        "timestamp INTEGER PRIMARY KEY, download_mbps REAL NOT NULL, upload_mbps REAL NOT NULL)"
+    )
+    return connection
+
+
+def bandwidth_history(connection, now):
+    cutoff = int(now) - BANDWIDTH_RETENTION
+    connection.execute("DELETE FROM samples WHERE timestamp < ?", (cutoff,))
+    rows = connection.execute(
+        "SELECT (timestamp / 60) * 60 AS minute, "
+        "MAX(download_mbps), MAX(upload_mbps) "
+        "FROM samples WHERE timestamp >= ? GROUP BY minute ORDER BY minute",
+        (cutoff,),
+    ).fetchall()
+    return [
+        {"timestamp": int(stamp), "downloadMbps": round(float(download), 3), "uploadMbps": round(float(upload), 3)}
+        for stamp, download, upload in rows
+    ]
+
+
+def bandwidth_snapshot():
+    now = time.time()
+    interface = default_network_interface()
+    if not interface:
+        return {"available": False, "interface": "", "downloadMbps": 0.0, "uploadMbps": 0.0, "sampledAt": int(now), "history": []}
+    try:
+        rx_bytes, tx_bytes = interface_byte_counters(interface)
+    except (OSError, ValueError):
+        return {"available": False, "interface": interface, "downloadMbps": 0.0, "uploadMbps": 0.0, "sampledAt": int(now), "history": []}
+
+    with BANDWIDTH_LOCK:
+        previous = dict(BANDWIDTH_STATE)
+        elapsed = now - float(previous.get("timestamp", 0) or 0)
+        valid_delta = (
+            previous.get("interface") == interface
+            and 0.5 <= elapsed <= BANDWIDTH_SAMPLE_INTERVAL * 4
+            and rx_bytes >= int(previous.get("rx", 0))
+            and tx_bytes >= int(previous.get("tx", 0))
+        )
+        download_mbps = float(previous.get("downloadMbps", 0.0))
+        upload_mbps = float(previous.get("uploadMbps", 0.0))
+        if valid_delta:
+            download_mbps = (rx_bytes - int(previous["rx"])) * 8 / elapsed / 1_000_000
+            upload_mbps = (tx_bytes - int(previous["tx"])) * 8 / elapsed / 1_000_000
+
+        BANDWIDTH_STATE.update(
+            {"interface": interface, "timestamp": now, "rx": rx_bytes, "tx": tx_bytes, "downloadMbps": download_mbps, "uploadMbps": upload_mbps}
+        )
+        history = []
+        try:
+            with closing(bandwidth_connection()) as connection:
+                with connection:
+                    if valid_delta:
+                        connection.execute(
+                            "INSERT OR REPLACE INTO samples(timestamp, download_mbps, upload_mbps) VALUES(?, ?, ?)",
+                            (int(now), download_mbps, upload_mbps),
+                        )
+                    history = bandwidth_history(connection, now)
+        except sqlite3.Error:
+            history = []
+
+        return {
+            "available": True,
+            "interface": interface,
+            "downloadMbps": round(download_mbps, 3),
+            "uploadMbps": round(upload_mbps, 3),
+            "sampledAt": int(now),
+            "history": history,
+        }
+
+
 def empty_counter():
     return {"upload": {"packets": 0, "bytes": 0}, "download": {"packets": 0, "bytes": 0}}
 
@@ -1046,7 +1169,7 @@ def dashboard():
         total_bytes += both_bytes
         active += 1 if c.get("active") else 0
         enriched.append({**r, "targetAlias": aliases.get(r["ip"], ""), "uploadBytes": upload_bytes, "downloadBytes": download_bytes, "totalBytes": both_bytes, "bytes": selected_bytes, "active": c["active"]})
-    return {"targets": targets, "rules": enriched, "history": history, "settings": read_settings(), "firewall": {"ports": read_firewall_ports(), "baselinePorts": [item["port"] for item in firewall_baseline_ports()], "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
+    return {"targets": targets, "rules": enriched, "history": history, "bandwidth": bandwidth_snapshot(), "settings": read_settings(), "firewall": {"ports": read_firewall_ports(), "baselinePorts": [item["port"] for item in firewall_baseline_ports()], "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
 
 
 HTML = r"""<!doctype html>
@@ -1060,13 +1183,14 @@ HTML = r"""<!doctype html>
 button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-radius:6px;background:#243b63;color:#fff;padding:9px 14px}button:disabled{cursor:not-allowed;opacity:.65}button.primary{background:var(--blue)}button.danger{background:var(--danger)}button.ghost{background:#2b2d35}.login{height:100vh;display:grid;place-items:center}.login form{width:360px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:28px}.login input{width:100%;margin:8px 0 14px;padding:12px;border-radius:6px;border:1px solid var(--line);background:#111318;color:#fff}
 .app{display:flex;min-height:100vh}.side{width:238px;background:#020303;border-right:1px solid #2a2d35;padding:28px 16px;position:fixed;inset:0 auto 0 0}.brand{font-weight:800;font-size:18px;margin-bottom:2px}.ver{font-size:12px;color:var(--muted);margin-bottom:34px}.nav button{width:100%;text-align:left;margin:5px 0;background:transparent;color:#d9dde7}.nav button.active{background:#112846;color:#0b84ff}.foot{position:absolute;bottom:18px;color:#737b89;font-size:12px;left:70px}
 .main{margin-left:238px;flex:1;min-width:0}.top{height:54px;border-bottom:1px solid #2a2d35;display:flex;align-items:center;justify-content:flex-end;padding:0 26px}.user{font-weight:700}.mobile-brand{display:none;font-weight:800;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nav-icon{display:none}
-.content{padding:18px 24px 40px}.page-with-fabs{min-height:calc(100vh - 112px);padding-bottom:190px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.rule-table-wrap{border:1px solid var(--line);border-radius:8px;overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.table tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.pill{display:inline-flex;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.metric.upload{color:#46a6ff}.metric.download{color:#20d98a}.metric.total{color:#b779ff}.actions{display:flex;align-items:center;gap:8px}.actions .switch{margin-right:12px}.actions button{padding:6px 10px;margin:0}.hidden{display:none!important}.view-switch{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}.view-switch button{border-radius:0;background:#17181c;padding:7px 11px}.view-switch button.active{background:#1d4d8a}.switch{position:relative;display:inline-flex;width:38px;height:22px;vertical-align:middle;flex:none}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#4a252a;border-radius:22px}.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}.switch input:checked+.slider{background:#16855b}.switch input:checked+.slider:before{transform:translateX(16px)}.rule-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.rule-card{border:1px solid var(--line);background:#111318;padding:14px;border-radius:8px}.rule-card.disabled{opacity:.6}.rule-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.rule-card h3{font-size:15px;margin:0 0 8px}.rule-card .route{color:#cdd4e0;margin:7px 0}.rule-card .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid #2a2d35;padding-top:10px;margin-top:10px}.rule-card .metrics span{font-size:12px}.rule-card .actions{margin-top:14px}.chart-svg{display:block;width:100%;height:300px}.chart-grid{stroke:var(--line);stroke-dasharray:3 4}.chart-axis{stroke:var(--muted);stroke-width:1.4}.chart-line{fill:none;stroke:var(--purple);stroke-width:3}.chart-fill{fill:rgba(142,76,255,.14)}.chart-label{fill:var(--muted);font-size:11px}.chart-axis-title{fill:var(--text);font-size:12px;font-weight:700}.fab-stack{position:fixed;z-index:7;right:24px;bottom:24px;display:flex;flex-direction:column;align-items:flex-end;gap:10px}.fab{min-width:112px;height:46px;padding:0 15px;border:1px solid rgba(105,173,255,.45);border-radius:23px;background:rgba(17,40,70,.94);color:#eaf3ff;display:flex;align-items:center;justify-content:flex-start;gap:9px;box-shadow:0 10px 28px rgba(0,0,0,.3);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.fab:hover{background:#164b83}.fab.primary{border-color:rgba(8,119,255,.72);background:var(--blue)}.fab-icon{display:grid;place-items:center;width:20px;height:20px;font-size:18px;font-weight:800;line-height:1}.fab-label{font-size:13px;font-weight:700;white-space:nowrap}
+.content{padding:18px 24px 40px}.page-with-fabs{min-height:calc(100vh - 112px);padding-bottom:190px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.chart-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.chart-pair>.panel{min-width:0}.chart-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.bandwidth-live{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px 12px;font-size:12px;font-weight:700}.bandwidth-live .download{color:var(--download)}.bandwidth-live .upload{color:var(--upload)}.bandwidth-interface{width:100%;color:var(--muted);font-weight:500;text-align:right}.chart-legend{display:flex;justify-content:flex-end;gap:14px;margin:-4px 2px 4px;color:var(--muted);font-size:12px}.chart-legend span{display:inline-flex;align-items:center;gap:6px}.chart-legend i{width:16px;height:3px;border-radius:3px}.chart-legend .download i{background:var(--download)}.chart-legend .upload i{background:var(--upload)}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.rule-table-wrap{border:1px solid var(--line);border-radius:8px;overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.table tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.pill{display:inline-flex;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.metric.upload{color:#46a6ff}.metric.download{color:#20d98a}.metric.total{color:#b779ff}.actions{display:flex;align-items:center;gap:8px}.actions .switch{margin-right:12px}.actions button{padding:6px 10px;margin:0}.hidden{display:none!important}.view-switch{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}.view-switch button{border-radius:0;background:#17181c;padding:7px 11px}.view-switch button.active{background:#1d4d8a}.switch{position:relative;display:inline-flex;width:38px;height:22px;vertical-align:middle;flex:none}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#4a252a;border-radius:22px}.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}.switch input:checked+.slider{background:#16855b}.switch input:checked+.slider:before{transform:translateX(16px)}.rule-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.rule-card{border:1px solid var(--line);background:#111318;padding:14px;border-radius:8px}.rule-card.disabled{opacity:.6}.rule-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.rule-card h3{font-size:15px;margin:0 0 8px}.rule-card .route{color:#cdd4e0;margin:7px 0}.rule-card .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid #2a2d35;padding-top:10px;margin-top:10px}.rule-card .metrics span{font-size:12px}.rule-card .actions{margin-top:14px}.chart-svg{display:block;width:100%;height:300px}.chart-grid{stroke:var(--line);stroke-dasharray:3 4}.chart-axis{stroke:var(--muted);stroke-width:1.4}.chart-line{fill:none;stroke:var(--purple);stroke-width:3}.chart-line.bandwidth-download{stroke:var(--download);stroke-width:2.5}.chart-line.bandwidth-upload{stroke:var(--upload);stroke-width:2.5}.chart-fill{fill:rgba(142,76,255,.14)}.chart-label{fill:var(--muted);font-size:11px}.chart-axis-title{fill:var(--text);font-size:12px;font-weight:700}.fab-stack{position:fixed;z-index:7;right:24px;bottom:24px;display:flex;flex-direction:column;align-items:flex-end;gap:10px}.fab{min-width:112px;height:46px;padding:0 15px;border:1px solid rgba(105,173,255,.45);border-radius:23px;background:rgba(17,40,70,.94);color:#eaf3ff;display:flex;align-items:center;justify-content:flex-start;gap:9px;box-shadow:0 10px 28px rgba(0,0,0,.3);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.fab:hover{background:#164b83}.fab.primary{border-color:rgba(8,119,255,.72);background:var(--blue)}.fab-icon{display:grid;place-items:center;width:20px;height:20px;font-size:18px;font-weight:800;line-height:1}.fab-label{font-size:13px;font-weight:700;white-space:nowrap}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:20}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog.rules-dialog{width:min(1240px,96vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.firewall-check{display:flex!important;align-items:center;gap:9px;padding:11px 12px;border:1px solid #356aa0;border-radius:6px;background:rgba(8,119,255,.1);color:#dbeafe!important;cursor:pointer}.firewall-check input{width:16px!important;height:16px;margin:0;accent-color:var(--blue)}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:30;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.count-button{padding:2px 8px;background:rgba(8,119,255,.14);color:#69adff;border:1px solid rgba(8,119,255,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}.probe-pill{display:inline-flex;align-items:center;gap:6px;min-width:96px;padding:4px 9px;border-radius:999px;background:rgba(142,150,163,.14);color:#aeb5c0;white-space:nowrap}.probe-pill i{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:probe-pulse 1.8s infinite}.probe-pill b{font-variant-numeric:tabular-nums}.probe-pill.good{background:rgba(29,219,120,.14);color:#58e69d}.probe-pill.warn{background:rgba(255,205,65,.15);color:#ffd262}.probe-pill.slow{background:rgba(255,159,26,.16);color:#ffae43}.probe-pill.bad{background:rgba(255,90,102,.16);color:#ff8791}.probe-pill.off{background:rgba(142,150,163,.12);color:#9aa2ae}.probe-pill.pending i{animation:none}@keyframes probe-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 0 4px transparent}}
 button,button.ghost{background:var(--button-bg);color:var(--button-text)}button.primary,button.danger{color:#fff}.login input{background:var(--surface);color:var(--text)}.side{background:var(--sidebar);border-color:var(--line-soft)}.nav button{color:var(--nav-text)}.top{border-color:var(--line-soft)}.table th,.table td{border-color:var(--line-soft)}.view-switch button{background:var(--panel)}.rule-card{background:var(--surface)}.rule-card .route{color:var(--text)}.rule-card .metrics{border-color:var(--line-soft)}.pill{background:var(--pill-bg);color:var(--pill-text)}.metric.upload{color:var(--upload)}.metric.download{color:var(--download)}.metric.total{color:var(--total)}.trace-output{background:var(--trace-bg);color:var(--trace-text)}.dialog-copy{color:var(--text)}.field label{color:var(--text)}.field input,.field select,.field textarea{background:var(--surface2);color:var(--text)}.firewall-check{color:var(--text)!important}.tags,.preview{background:var(--surface2);color:var(--text)}.toast{display:flex;align-items:center;gap:10px;border:1px solid var(--line);background:var(--panel2);color:var(--text);box-shadow:0 14px 36px rgba(0,0,0,.22);animation:toast-in .2s ease-out}.toast-icon{display:grid;place-items:center;flex:none;width:24px;height:24px;border-radius:50%;background:rgba(8,119,255,.14);color:#3996ff;font-weight:800}.toast.success .toast-icon{background:rgba(29,219,120,.14);color:var(--green)}.toast.error .toast-icon{background:rgba(255,90,102,.14);color:var(--danger)}.toast.success{border-color:rgba(29,160,98,.42)}.toast.error{border-color:rgba(226,63,77,.48)}@keyframes toast-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}.theme-switch{display:inline-grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}.theme-switch button{min-width:92px;background:transparent;color:var(--muted)}.theme-switch button.active{background:var(--blue);color:#fff}
 .chart-svg{height:auto}
 @media(max-width:1100px) and (min-width:761px){.cards{grid-template-columns:repeat(2,minmax(160px,1fr))}}
 @media(max-width:760px){
 body{font-size:14px;overflow-x:hidden}.app{display:block;min-height:100dvh}.side{position:fixed;z-index:8;inset:auto 0 0 0;width:auto;height:calc(66px + env(safe-area-inset-bottom));padding:0 8px env(safe-area-inset-bottom);border:0;border-top:1px solid var(--line-soft);background:var(--tab-glass);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}.brand,.ver,.foot{display:none}.nav{height:66px;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));align-items:stretch}.nav button{min-width:0;width:auto;height:66px;margin:0;padding:7px 2px 6px;border-radius:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:3px;text-align:center;color:var(--muted);font-size:11px;line-height:1.15;background:transparent}.nav button.active{background:transparent;color:#187ee8}.nav-icon{display:block;font-size:21px;line-height:22px;font-weight:500}.main{margin:0;min-width:0}.top{position:sticky;z-index:4;top:0;height:50px;padding:0 14px;justify-content:space-between;background:var(--glass);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}.mobile-brand{display:block;max-width:70%}.user{font-size:12px;color:var(--muted)}.content{padding:12px 12px calc(84px + env(safe-area-inset-bottom))}.page-with-fabs{min-height:calc(100dvh - 146px);padding-bottom:250px}.page-with-fabs>.panel{margin-top:0;padding:0;border:0;background:transparent}.cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card{min-height:116px;padding:13px}.card h3{margin-bottom:10px;font-size:12px}.big{font-size:19px;overflow-wrap:anywhere}.bar{margin-top:11px}.panel{margin-top:12px;padding:12px;border-radius:8px}.panel h2{font-size:18px;margin-bottom:12px}.toolbar{align-items:stretch;flex-wrap:wrap;gap:8px;margin-bottom:12px}.toolbar h2{width:100%;margin:0!important}.toolbar button{min-height:42px;flex:1;padding:9px 8px}.grid{grid-template-columns:1fr;gap:0}.field>.actions{display:grid;grid-template-columns:1fr auto;align-items:stretch}.field>.actions button{min-height:44px}.rule-grid{grid-template-columns:1fr;gap:12px}.rule-card{padding:15px;border-color:var(--item-border);background:var(--item-bg);box-shadow:0 8px 22px rgba(0,0,0,.2)}.rule-card .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}.rule-card .actions button{min-height:40px}.chart-svg{height:230px}.chart-label{font-size:20px}.chart-axis-title{font-size:21px}.rule-table-wrap{border:0;overflow:visible}.table,.table tbody,.table tr,.table td{display:block;width:100%}.table thead{display:none}.table tbody{display:grid;gap:12px}.table tr{padding:14px;border:1px solid var(--item-border);border-radius:8px;background:var(--item-bg);box-shadow:0 8px 22px rgba(0,0,0,.2)}.table td{min-height:35px;padding:7px 0;border:0;display:grid;grid-template-columns:minmax(88px,36%) minmax(0,1fr);gap:12px;align-items:center;text-align:right;font-weight:600;overflow-wrap:anywhere}.table td:before{content:attr(data-label);color:var(--muted);font-size:12px;font-weight:500;text-align:left}.table td.actions{display:flex;justify-content:flex-end;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--line-soft);margin-top:6px}.table td.actions:before{margin-right:auto}.table td.actions button{min-height:40px}.table td[colspan]{display:block;text-align:center;color:var(--muted)}.table td[colspan]:before{display:none}.probe-pill{margin-left:auto}.fab-stack{right:14px;bottom:calc(80px + env(safe-area-inset-bottom));gap:9px}.fab{min-width:104px;height:44px;border-radius:22px;padding:0 13px}.dialog{width:calc(100vw - 24px);max-width:none;max-height:calc(100dvh - 28px);padding:16px;border-radius:9px;overscroll-behavior:contain}.dialog.trace-dialog,.dialog.rules-dialog{width:calc(100vw - 16px)}.dialog h2{font-size:20px;margin-top:0}.dialog-actions{position:sticky;bottom:-16px;margin:16px -16px -16px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));display:flex;justify-content:flex-end;gap:9px;background:var(--panel2);border-top:1px solid var(--line)}.dialog-actions button{min-width:92px;min-height:42px}.trace-output{max-height:58dvh;padding:10px;font-size:11px}.field input,.field select,.field textarea{font-size:16px;min-height:44px}.field textarea{min-height:88px}.firewall-check{min-height:46px}.toast{left:12px;right:12px;top:auto;bottom:calc(78px + env(safe-area-inset-bottom));max-width:none}.theme-switch{display:grid;width:100%}.theme-switch button{min-width:0}.login{min-height:100dvh;height:auto;padding:18px}.login form{width:100%;max-width:360px;padding:22px}.login input{font-size:16px}.pill{max-width:100%;overflow-wrap:anywhere}.content>.panel:first-child{margin-top:0}
+.chart-pair{grid-template-columns:1fr;gap:0}.chart-panel-head{display:block}.bandwidth-live{justify-content:flex-start;margin:-4px 0 8px}.bandwidth-interface{text-align:left}.chart-legend{justify-content:flex-start}
 .chart-svg{height:auto}.chart-label{font-size:11px}.chart-axis-title{font-size:12px}
 }
 </style></head><body><div id="root"></div><script>
@@ -1074,7 +1198,7 @@ const appRoot=document.getElementById('root');
 const authToken=()=>localStorage.getItem('nft_manager_token')||'';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
-let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let savedTheme=localStorage.getItem('nft_manager_theme')||'system';if(!['light','dark','system'].includes(savedTheme))savedTheme='system';document.documentElement.dataset.theme=savedTheme;let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',theme:savedTheme,targetLatency:{},ruleConnectivity:{},autoProbeView:'',publicTitle:'nft-manager'};
+let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let savedTheme=localStorage.getItem('nft_manager_theme')||'system';if(!['light','dark','system'].includes(savedTheme))savedTheme='system';document.documentElement.dataset.theme=savedTheme;let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',theme:savedTheme,targetLatency:{},ruleConnectivity:{},autoProbeView:'',publicTitle:'nft-manager',dashboardPollBusy:false};
 const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
@@ -1087,13 +1211,17 @@ function loading(){appRoot.innerHTML=`<div class=login><form><h2>${esc(state.pub
 function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>${esc(state.publicTitle)}</h2><p class=muted>默认账号 admin / admin</p><input name=u value=admin placeholder=账号><input name=p type=password value=admin placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err),'error')}finally{btn.disabled=false;btn.textContent=old}}
 async function load(){try{state.data=await api('/api/state');document.title=state.data.settings?.panelTitle||'nft-manager';render();autoProbeCurrentView()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
-function nav(v){if(state.view!==v)state.autoProbeView='';state.view=v;localStorage.setItem('nft_manager_view',v);render();autoProbeCurrentView()}
+function nav(v){if(state.view!==v)state.autoProbeView='';state.view=v;localStorage.setItem('nft_manager_view',v);render();autoProbeCurrentView();if(v==='dash')pollDashboard()}
 function shell(content){let n=[['dash','仪表板','⌂'],['rules','转发管理','⇄'],['targets','主机管理','▣'],['firewall','防火墙','◫'],['settings','设置','⚙']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')"><span class=nav-icon aria-hidden=true>${x[2]}</span><span>${x[1]}</span></button>`).join(''),title=esc(state.data.settings?.panelTitle||'nft-manager');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>${title}</div><div class=ver>v__WEB_PANEL_VERSION__</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=mobile-brand>${title}</span><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function hourText(stamp){return String(new Date(stamp*1000).getHours()).padStart(2,'0')+':00'}
-function trafficChart(){let mobile=window.matchMedia('(max-width:760px)').matches,w=mobile?390:960,ht=mobile?250:320,left=72,right=mobile?10:18,top=24,bottom=mobile?42:44,pw=w-left-right,ph=ht-top-bottom,max=Math.max(1,...(state.data.history||[]).map(x=>x.bytes)),h=state.data.history||[],den=Math.max(1,h.length-1),x=i=>left+i*pw/den,y=b=>top+(1-b/max)*ph,pts=h.map((item,i)=>`${x(i)},${y(item.bytes)}`),area=pts.length?`${left},${top+ph} ${pts.join(' ')} ${x(h.length-1)},${top+ph}`:'',yGrid=[0,1,2,3,4].map(i=>{let yy=top+i*ph/4,value=max*(4-i)/4;return `<line class=chart-grid x1="${left}" y1="${yy}" x2="${w-right}" y2="${yy}"/><text class=chart-label text-anchor=end x="${left-7}" y="${yy+4}">${fmt(value)}</text>`}).join(''),xGrid=h.map((item,i)=>i%3===0?`<line class=chart-grid x1="${x(i)}" y1="${top}" x2="${x(i)}" y2="${top+ph}"/><text class=chart-label text-anchor=middle x="${x(i)}" y="${top+ph+15}">${hourText(item.hour)}</text>`:'').join('');return `<svg class=chart-svg viewBox="0 0 ${w} ${ht}" role="img" aria-label="最近24小时流量折线图"><g>${yGrid}${xGrid}</g><line class=chart-axis x1="${left}" y1="${top}" x2="${left}" y2="${top+ph}"/><line class=chart-axis x1="${left}" y1="${top+ph}" x2="${w-right}" y2="${top+ph}"/>${area?`<polygon class=chart-fill points="${area}"/><polyline class=chart-line points="${pts.join(' ')}"/>`:''}<text class=chart-axis-title x="${left}" y="13">流量</text><text class=chart-axis-title text-anchor=middle x="${left+pw/2}" y="${ht-3}">时间（小时）</text></svg>`}
+function trafficChart(){let mobile=window.matchMedia('(max-width:760px)').matches,w=mobile?390:700,ht=mobile?250:320,left=72,right=mobile?10:18,top=24,bottom=mobile?42:44,pw=w-left-right,ph=ht-top-bottom,max=Math.max(1,...(state.data.history||[]).map(x=>x.bytes)),h=state.data.history||[],den=Math.max(1,h.length-1),x=i=>left+i*pw/den,y=b=>top+(1-b/max)*ph,pts=h.map((item,i)=>`${x(i)},${y(item.bytes)}`),area=pts.length?`${left},${top+ph} ${pts.join(' ')} ${x(h.length-1)},${top+ph}`:'',yGrid=[0,1,2,3,4].map(i=>{let yy=top+i*ph/4,value=max*(4-i)/4;return `<line class=chart-grid x1="${left}" y1="${yy}" x2="${w-right}" y2="${yy}"/><text class=chart-label text-anchor=end x="${left-7}" y="${yy+4}">${fmt(value)}</text>`}).join(''),xGrid=h.map((item,i)=>i%3===0?`<line class=chart-grid x1="${x(i)}" y1="${top}" x2="${x(i)}" y2="${top+ph}"/><text class=chart-label text-anchor=middle x="${x(i)}" y="${top+ph+15}">${hourText(item.hour)}</text>`:'').join('');return `<svg class=chart-svg viewBox="0 0 ${w} ${ht}" role="img" aria-label="最近24小时流量折线图"><g>${yGrid}${xGrid}</g><line class=chart-axis x1="${left}" y1="${top}" x2="${left}" y2="${top+ph}"/><line class=chart-axis x1="${left}" y1="${top+ph}" x2="${w-right}" y2="${top+ph}"/>${area?`<polygon class=chart-fill points="${area}"/><polyline class=chart-line points="${pts.join(' ')}"/>`:''}<text class=chart-axis-title x="${left}" y="13">流量</text><text class=chart-axis-title text-anchor=middle x="${left+pw/2}" y="${ht-3}">时间（小时）</text></svg>`}
+function fmtBandwidth(value){let n=Number(value||0);return n>=1000?(n/1000).toFixed(n>=10000?1:2)+' Gbps':n.toFixed(n>=100?0:n>=10?1:2)+' Mbps'}
+function bandwidthTime(stamp){let d=new Date(stamp*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
+function niceBandwidthMax(value){if(!Number.isFinite(value)||value<=0)return 1;let power=10**Math.floor(Math.log10(value)),scaled=value/power,factor=scaled<=1?1:scaled<=2?2:scaled<=5?5:10;return factor*power}
+function bandwidthChart(){let b=state.data.bandwidth||{},h=b.history||[],mobile=window.matchMedia('(max-width:760px)').matches,w=mobile?390:700,ht=mobile?250:320,left=72,right=mobile?10:18,top=24,bottom=mobile?42:44,pw=w-left-right,ph=ht-top-bottom,max=niceBandwidthMax(Math.max(0,...h.flatMap(x=>[Number(x.downloadMbps||0),Number(x.uploadMbps||0)]))),den=Math.max(1,h.length-1),x=i=>left+i*pw/den,y=value=>top+(1-Number(value||0)/max)*ph,download=h.map((item,i)=>`${x(i)},${y(item.downloadMbps)}`),upload=h.map((item,i)=>`${x(i)},${y(item.uploadMbps)}`),yGrid=[0,1,2,3,4].map(i=>{let yy=top+i*ph/4,value=max*(4-i)/4;return `<line class=chart-grid x1="${left}" y1="${yy}" x2="${w-right}" y2="${yy}"/><text class=chart-label text-anchor=end x="${left-7}" y="${yy+4}">${fmtBandwidth(value)}</text>`}).join(''),step=Math.max(1,Math.ceil(h.length/7)),xGrid=h.map((item,i)=>(i%step===0||i===h.length-1)?`<line class=chart-grid x1="${x(i)}" y1="${top}" x2="${x(i)}" y2="${top+ph}"/><text class=chart-label text-anchor=middle x="${x(i)}" y="${top+ph+15}">${bandwidthTime(item.timestamp)}</text>`:'').join('');return `<svg class=chart-svg viewBox="0 0 ${w} ${ht}" role="img" aria-label="最近24小时上传下载带宽折线图"><g>${yGrid}${xGrid}</g><line class=chart-axis x1="${left}" y1="${top}" x2="${left}" y2="${top+ph}"/><line class=chart-axis x1="${left}" y1="${top+ph}" x2="${w-right}" y2="${top+ph}"/>${download.length?`<polyline class="chart-line bandwidth-download" points="${download.join(' ')}"/><polyline class="chart-line bandwidth-upload" points="${upload.join(' ')}"/>`:''}<text class=chart-axis-title x="${left}" y="13">带宽</text><text class=chart-axis-title text-anchor=middle x="${left+pw/2}" y="${ht-3}">时间（24小时）</text></svg>`}
 function fabStack(buttons){return `<div class=fab-stack aria-label="页面操作">${buttons.join('')}</div>`}
 function fabButton(icon,label,action,primary=false,title=''){return `<button class="fab ${primary?'primary':''}" onclick="${action}" title="${title||label}" aria-label="${title||label}"><span class=fab-icon aria-hidden=true>${icon}</span><span class=fab-label>${label}</span></button>`}
-function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
+function render(){let d=state.data;if(state.view==='dash'){let b=d.bandwidth||{};return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=chart-pair><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><div class=chart-panel-head><h2>24小时带宽统计</h2><div class=bandwidth-live><span class=download>下载 ${fmtBandwidth(b.downloadMbps)}</span><span class=upload>上传 ${fmtBandwidth(b.uploadMbps)}</span><span class=bandwidth-interface>${b.available?esc(b.interface):'未检测到出口网卡'}</span></div></div><div class=chart-legend><span class=download><i></i>下载</span><span class=upload><i></i>上传</span></div>${bandwidthChart()}</div></div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`)}
  if(state.view==='rules'){let next=state.ruleView==='flat'?'grid':'flat',label=state.ruleView==='flat'?'平铺':'方块',icon=state.ruleView==='flat'?'☷':'▦';return shell(`<div class=page-with-fabs>${rulesTable(false)}${fabStack([fabButton(icon,label,`setRuleView('${next}')`,false,`切换为${next==='grid'?'方块':'平铺'}视图`),fabButton('⌁','连通性',`checkRuleConnectivity(this)`,false,'检查全部转发连通性'),fabButton('+','新增转发',`openRule()`,true)])}</div>`)}
  if(state.view==='targets')return shell(`<div class=page-with-fabs><div class=panel><h2>主机管理</h2>${targetsTable()}</div>${fabStack([fabButton('◷','延迟检测',`checkTargetLatency(this)`),fabButton('+','新增主机',`openTarget()`,true)])}</div>`);
  if(state.view==='firewall')return shell(`<div class=page-with-fabs><div class=panel><h2>防火墙管理</h2><p class=muted>默认拒绝未列出的入站连接，始终保留当前 SSH 端口与 Web 面板 5555/tcp。</p>${firewallTable()}</div>${fabStack([fabButton('↻','同步端口',`syncFirewall(this)`),fabButton('+','开放端口',`openFirewall()`,true)])}</div>`);
@@ -1133,8 +1261,10 @@ async function savePanelTitle(btn){await runAction(btn,async()=>{await api('/api
 function openPassword(){modal(`<h2>修改密码</h2><div class=field><label>旧密码</label><input id=oldp type=password></div><div class=field><label>新密码</label><input id=newp type=password></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="chgPwd(this)">保存</button></div>`)}
 async function chgPwd(btn){await runAction(btn,async()=>{await api('/api/password',{method:'POST',body:JSON.stringify({oldPassword:document.getElementById('oldp').value,newPassword:document.getElementById('newp').value})});document.querySelector('.modal').remove();expireSession();toast('密码已修改，请使用新密码重新登录','success')})}
 async function boot(){try{let publicSettings=await api('/api/public-settings');state.publicTitle=publicSettings.panelTitle||'nft-manager';document.title=state.publicTitle}catch(e){}if(authToken()){loading();load()}else login()}
+async function pollDashboard(){if(!state.data||!authToken()||state.view!=='dash'||document.hidden||state.dashboardPollBusy)return;state.dashboardPollBusy=true;try{await load()}finally{state.dashboardPollBusy=false}}
 boot();
-setInterval(()=>{if(state.data&&authToken())load()},10000);
+setInterval(pollDashboard,10000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollDashboard()});
 </script></body></html>"""
 
 
@@ -1263,12 +1393,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def traffic_sampler_loop():
+    ticks = 0
     while True:
-        time.sleep(30)
+        time.sleep(BANDWIDTH_SAMPLE_INTERVAL)
         try:
-            nft_counters()
+            bandwidth_snapshot()
         except Exception:
             pass
+        ticks += 1
+        if ticks % max(1, 30 // BANDWIDTH_SAMPLE_INTERVAL) == 0:
+            try:
+                nft_counters()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
@@ -1337,6 +1474,10 @@ if __name__ == "__main__":
         nft_counters()
     except Exception as e:
         print(f"nft-manager: 流量统计初始化失败，Web 面板继续启动：{e}")
+    try:
+        bandwidth_snapshot()
+    except Exception as e:
+        print(f"nft-manager: 带宽统计初始化失败，Web 面板继续启动：{e}")
     threading.Thread(target=traffic_sampler_loop, daemon=True).start()
     print(f"nft-manager web listening on {HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
