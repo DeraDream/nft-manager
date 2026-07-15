@@ -192,24 +192,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 /root/nft-manager-main.zip
 ```
 
-执行 `nft`，选择 `10) 从 /root/nft-manager-main.zip 离线更新`。脚本只会在 `/tmp` 创建随机临时目录进行解压，不会生成 `/root/nft-manager-main`；校验并部署成功后会删除临时目录和 ZIP，同时保留空的 `/root/nft-manager-update` 目录，并立即切换到新版菜单。校验失败时不会修改现有运行文件；部署失败时会尝试恢复服务并保留 ZIP，供排查或重试。该入口不影响 `2) 更新脚本` 的在线更新流程。
-
-也可以不使用 ZIP，将完整项目中的以下内容上传到固定暂存目录：
-
-```text
-/root/nft-manager-update/nft.sh
-/root/nft-manager-update/web_panel.py
-/root/nft-manager-update/vendor/nexttrace/
-```
-
-上传完成后执行：
-
-```bash
-chmod +x /root/nft-manager-update/nft.sh
-sudo /root/nft-manager-update/nft.sh --offline-redeploy
-```
-
-该入口不会访问网络，会依次校验本地文件、保存当前流量快照、停止管理服务、部署到 `/opt/nft-manager`、更新配置结构与 systemd 服务，最后重启保活和 Web 服务。全部成功后，会清空 `/root/nft-manager-update` 内的内容但保留该目录，并清理旧版 `/usr/local/lib/nft-forward` 和可识别的 `/root/nft.sh`。以后只需将新版文件拖入该目录，再执行同一条命令；如果校验或更新失败，上传内容会保留以便重试。
+执行 `nft`，选择 `10) 从 /root/nft-manager-main.zip 离线更新`。脚本会将 ZIP 解压到 `/tmp` 下的随机临时目录，校验后直接更新 `/opt/nft-manager` 中的服务文件。更新成功后删除临时解压目录和 `/root/nft-manager-main.zip`，并清理旧版本遗留的 `/root/nft-manager-update` 后立即进入新版菜单；更新失败时删除临时目录并保留 ZIP，供排查或重试。该入口不影响 `2) 更新脚本` 的在线更新流程。
 
 完整项目已经包含 Linux `amd64/arm64` 的 NextTrace，无需另外下载。若使用其他架构，也可以自行下载匹配的二进制并命名为 `nexttrace`，上传到以下任一位置：
 

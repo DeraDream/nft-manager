@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.19
+# nftables 端口转发管理工具 v3.20
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.19"
-WEB_PANEL_VERSION="3.19"
+SCRIPT_VERSION="3.20"
+WEB_PANEL_VERSION="3.20"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -25,7 +25,6 @@ SCRIPT_INSTALL_DIR="/opt/nft-manager"
 SCRIPT_INSTALL_FILE="${SCRIPT_INSTALL_DIR}/nft.sh"
 WEB_PANEL_FILE="${SCRIPT_INSTALL_DIR}/web_panel.py"
 LEGACY_SCRIPT_INSTALL_DIR="/usr/local/lib/nft-forward"
-OFFLINE_STAGING_DIR="/root/nft-manager-update"
 OFFLINE_ZIP_FILE="/root/nft-manager-main.zip"
 NEXTTRACE_MARKER="${SCRIPT_INSTALL_DIR}/nexttrace-managed"
 NEXTTRACE_LOCAL_FILE="${SCRIPT_INSTALL_DIR}/nexttrace"
@@ -1230,6 +1229,7 @@ is_nft_manager_script() {
 
 cleanup_legacy_runtime() {
     local legacy_root_script="/root/nft.sh"
+    local legacy_offline_dir="/root/nft-manager-update"
 
     # 只有全局命令和两个 systemd 服务均已指向新目录，才清理旧运行文件。
     grep -qF "exec \"${SCRIPT_INSTALL_FILE}\"" "${GLOBAL_CMD}" 2>/dev/null || return 1
@@ -1253,20 +1253,14 @@ cleanup_legacy_runtime() {
         }
         info "已清理旧启动脚本: ${legacy_root_script}"
     fi
-}
 
-cleanup_offline_staging_contents() {
-    local source_dir source_real staging_real
-    source_dir="$(dirname "${SCRIPT_PATH}")"
-    source_real="$(readlink -f "$source_dir" 2>/dev/null || realpath "$source_dir" 2>/dev/null || printf '%s' "$source_dir")"
-    staging_real="$(readlink -f "${OFFLINE_STAGING_DIR}" 2>/dev/null || realpath "${OFFLINE_STAGING_DIR}" 2>/dev/null || printf '%s' "${OFFLINE_STAGING_DIR}")"
-
-    [[ "$source_real" == "${OFFLINE_STAGING_DIR}" && "$staging_real" == "${OFFLINE_STAGING_DIR}" && -d "${OFFLINE_STAGING_DIR}" ]] || return 0
-    find "${OFFLINE_STAGING_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || {
-        warn "离线更新目录内容清理失败: ${OFFLINE_STAGING_DIR}"
-        return 1
-    }
-    info "已清空离线更新目录，目录已保留: ${OFFLINE_STAGING_DIR}"
+    if [[ -d "$legacy_offline_dir" ]]; then
+        rm -rf "$legacy_offline_dir" 2>/dev/null || {
+            warn "旧离线暂存目录清理失败: ${legacy_offline_dir}"
+            return 1
+        }
+        info "已清理旧离线暂存目录: ${legacy_offline_dir}"
+    fi
 }
 
 install_keepalive_service() {
@@ -1677,7 +1671,6 @@ do_local_redeploy() {
         info "离线重部署完成，配置与流量统计数据均已保留。"
         info "Web 面板地址: http://$(get_local_ip):${WEB_PORT}"
         log_action "使用本机文件离线重部署 v${SCRIPT_VERSION}"
-        cleanup_offline_staging_contents || true
         return 0
     else
         err "离线重部署未完整完成，已尝试恢复并重启现有服务，请执行诊断/自检。"
@@ -1698,7 +1691,7 @@ do_offline_zip_update() {
         return 1
     fi
 
-    local unpack_dir source_script source_dir staged_script candidate
+    local unpack_dir source_script source_dir candidate
     unpack_dir="$(mktemp -d /tmp/nft-manager-offline.XXXXXX 2>/dev/null)" || {
         err "无法创建临时解压目录。"
         return 1
@@ -1730,25 +1723,12 @@ do_offline_zip_update() {
         return 1
     fi
 
-    rm -rf "${OFFLINE_STAGING_DIR}" 2>/dev/null || true
-    mkdir -p "${OFFLINE_STAGING_DIR}" 2>/dev/null || {
-        rm -rf "$unpack_dir" 2>/dev/null || true
-        err "无法创建离线更新目录: ${OFFLINE_STAGING_DIR}"
-        return 1
-    }
-    cp -a "$source_dir"/. "${OFFLINE_STAGING_DIR}"/ 2>/dev/null || {
-        rm -rf "$unpack_dir" 2>/dev/null || true
-        err "无法复制离线更新文件，当前运行文件未修改。"
-        return 1
-    }
-    rm -rf "$unpack_dir" 2>/dev/null || true
-
-    staged_script="${OFFLINE_STAGING_DIR}/nft.sh"
-    chmod +x "$staged_script" 2>/dev/null || true
-    info "已读取离线版本: v$(sed -nE 's/^[[:space:]]*SCRIPT_VERSION="([^"]+)".*/\1/p' "$staged_script" | head -1)"
-    if bash "$staged_script" --offline-redeploy; then
+    chmod +x "$source_script" 2>/dev/null || true
+    info "已读取离线版本: v$(sed -nE 's/^[[:space:]]*SCRIPT_VERSION="([^"]+)".*/\1/p' "$source_script" | head -1)"
+    if bash "$source_script" --offline-redeploy; then
+        rm -rf "$unpack_dir" 2>/dev/null || warn "更新成功，但无法删除临时解压目录: ${unpack_dir}"
         rm -f "${OFFLINE_ZIP_FILE}" 2>/dev/null || warn "更新成功，但无法删除 ${OFFLINE_ZIP_FILE}"
-        info "离线更新包已删除。"
+        info "临时解压目录和离线更新包已删除。"
         if [[ -x "${SCRIPT_INSTALL_FILE}" ]]; then
             info "正在进入新版菜单..."
             exec "${SCRIPT_INSTALL_FILE}"
@@ -1757,6 +1737,7 @@ do_offline_zip_update() {
         return 1
     fi
 
+    rm -rf "$unpack_dir" 2>/dev/null || true
     err "离线更新失败，ZIP 已保留: ${OFFLINE_ZIP_FILE}"
     return 1
 }
