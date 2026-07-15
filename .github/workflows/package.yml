@@ -35,6 +35,21 @@ jobs:
 
           bash -n nft.sh install.sh
           python3 -m py_compile web_panel.py
+          python3 - <<'PY' | node --check -
+          import ast
+          import pathlib
+          import re
+          import sys
+
+          tree = ast.parse(pathlib.Path("web_panel.py").read_text(encoding="utf-8"))
+          html = next(
+              ast.literal_eval(node.value)
+              for node in tree.body
+              if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == "HTML" for target in node.targets)
+          )
+          sys.stdout.write(re.search(r"<script>(.*)</script>", html, re.S).group(1))
+          PY
           python3 - <<'PY'
           import web_panel
 
