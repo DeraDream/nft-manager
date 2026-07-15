@@ -96,7 +96,7 @@ admin / admin
 7) 一键清空所有转发
 8) 诊断/自检
 9) 防火墙端口管理
-10) 离线更新 / 重部署服务
+10) 从 /root/nft-manager-main.zip 离线更新
 11) NextTrace 管理
 0) 退出
 ```
