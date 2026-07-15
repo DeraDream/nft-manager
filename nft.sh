@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.15
+# nftables 端口转发管理工具 v3.16
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.15"
-WEB_PANEL_VERSION="3.15"
+SCRIPT_VERSION="3.16"
+WEB_PANEL_VERSION="3.16"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -26,6 +26,7 @@ SCRIPT_INSTALL_FILE="${SCRIPT_INSTALL_DIR}/nft.sh"
 WEB_PANEL_FILE="${SCRIPT_INSTALL_DIR}/web_panel.py"
 LEGACY_SCRIPT_INSTALL_DIR="/usr/local/lib/nft-forward"
 OFFLINE_STAGING_DIR="/root/nft-manager-update"
+OFFLINE_ZIP_FILE="/root/nft-manager-main.zip"
 NEXTTRACE_MARKER="${SCRIPT_INSTALL_DIR}/nexttrace-managed"
 NEXTTRACE_LOCAL_FILE="${SCRIPT_INSTALL_DIR}/nexttrace"
 NEXTTRACE_INSTALL_FILE="/usr/local/bin/nexttrace"
@@ -1640,15 +1641,15 @@ do_local_redeploy() {
 
     if ! bash -n "${SCRIPT_PATH}" >/dev/null 2>&1; then
         err "当前 nft.sh 语法校验失败，已取消重部署。"
-        return
+        return 1
     fi
     if [[ ! -f "$source_web" ]]; then
         err "缺少 ${source_web}。请将 nft.sh 与 web_panel.py 放在同一目录后重试。"
-        return
+        return 1
     fi
     if ! command -v python3 &>/dev/null || ! python3 -m py_compile "$source_web" >/dev/null 2>&1; then
         err "本地 web_panel.py 校验失败，已取消重部署。"
-        return
+        return 1
     fi
 
     if grep -q -- '--snapshot-traffic' "$source_web" 2>/dev/null; then
@@ -1677,9 +1678,82 @@ do_local_redeploy() {
         info "Web 面板地址: http://$(get_local_ip):${WEB_PORT}"
         log_action "使用本机文件离线重部署 v${SCRIPT_VERSION}"
         cleanup_offline_staging_contents || true
+        return 0
     else
         err "离线重部署未完整完成，已尝试恢复并重启现有服务，请执行诊断/自检。"
+        return 1
     fi
+}
+
+do_offline_zip_update() {
+    echo ""
+    info "离线更新包: ${OFFLINE_ZIP_FILE}"
+
+    if [[ ! -f "${OFFLINE_ZIP_FILE}" ]]; then
+        err "未找到离线更新包，请将 GitHub 下载的 ZIP 上传为 ${OFFLINE_ZIP_FILE}"
+        return 1
+    fi
+    if ! command -v python3 &>/dev/null; then
+        err "未安装 python3，无法解压和校验离线更新包。"
+        return 1
+    fi
+
+    local unpack_dir source_script source_dir staged_script candidate
+    unpack_dir="$(mktemp -d /tmp/nft-manager-offline.XXXXXX 2>/dev/null)" || {
+        err "无法创建临时解压目录。"
+        return 1
+    }
+
+    if ! python3 -m zipfile -e "${OFFLINE_ZIP_FILE}" "$unpack_dir" >/dev/null 2>&1; then
+        rm -rf "$unpack_dir" 2>/dev/null || true
+        err "ZIP 解压失败，请重新下载完整的 GitHub 项目压缩包。"
+        return 1
+    fi
+
+    source_script=""
+    while IFS= read -r candidate; do
+        if [[ -f "$(dirname "$candidate")/web_panel.py" ]]; then
+            source_script="$candidate"
+            break
+        fi
+    done < <(find "$unpack_dir" -type f -name nft.sh -print 2>/dev/null)
+
+    if [[ -z "$source_script" ]]; then
+        rm -rf "$unpack_dir" 2>/dev/null || true
+        err "ZIP 中未找到同目录的 nft.sh 和 web_panel.py。"
+        return 1
+    fi
+    source_dir="$(dirname "$source_script")"
+    if ! bash -n "$source_script" >/dev/null 2>&1 || ! python3 -m py_compile "$source_dir/web_panel.py" >/dev/null 2>&1; then
+        rm -rf "$unpack_dir" 2>/dev/null || true
+        err "ZIP 中的脚本校验失败，未修改当前运行文件。"
+        return 1
+    fi
+
+    rm -rf "${OFFLINE_STAGING_DIR}" 2>/dev/null || true
+    mkdir -p "${OFFLINE_STAGING_DIR}" 2>/dev/null || {
+        rm -rf "$unpack_dir" 2>/dev/null || true
+        err "无法创建离线更新目录: ${OFFLINE_STAGING_DIR}"
+        return 1
+    }
+    cp -a "$source_dir"/. "${OFFLINE_STAGING_DIR}"/ 2>/dev/null || {
+        rm -rf "$unpack_dir" 2>/dev/null || true
+        err "无法复制离线更新文件，当前运行文件未修改。"
+        return 1
+    }
+    rm -rf "$unpack_dir" 2>/dev/null || true
+
+    staged_script="${OFFLINE_STAGING_DIR}/nft.sh"
+    chmod +x "$staged_script" 2>/dev/null || true
+    info "已读取离线版本: v$(sed -nE 's/^[[:space:]]*SCRIPT_VERSION="([^"]+)".*/\1/p' "$staged_script" | head -1)"
+    if bash "$staged_script" --offline-redeploy; then
+        rm -f "${OFFLINE_ZIP_FILE}" 2>/dev/null || warn "更新成功，但无法删除 ${OFFLINE_ZIP_FILE}"
+        info "离线更新包已删除。"
+        return 0
+    fi
+
+    err "离线更新失败，ZIP 已保留: ${OFFLINE_ZIP_FILE}"
+    return 1
 }
 
 do_post_update() {
@@ -2643,7 +2717,7 @@ main_menu() {
         echo "  7) 一键清空所有转发"
         echo "  8) 诊断/自检"
         echo "  9) 防火墙端口管理"
-        echo " 10) 离线更新 / 重部署服务"
+        echo " 10) 从 /root/nft-manager-main.zip 离线更新"
         echo " 11) NextTrace 管理"
         echo "  0) 退出"
         echo "========================================"
@@ -2672,7 +2746,7 @@ main_menu() {
             7) do_clear_all ;;
             8) do_diagnose ;;
             9) do_firewall_menu ;;
-            10) do_local_redeploy ;;
+            10) do_offline_zip_update ;;
             11) do_nexttrace_menu ;;
             *)
                 err "无效选择，请输入 0-11。"
