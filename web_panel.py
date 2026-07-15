@@ -39,7 +39,7 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.26"
+WEB_PANEL_VERSION = "3.27"
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 BANDWIDTH_LOCK = threading.Lock()
@@ -52,10 +52,15 @@ BANDWIDTH_STATE = {
     "forwardCountersAvailable": False,
     "downloadMbps": 0.0,
     "uploadMbps": 0.0,
+    "bucketTimestamp": 0,
+    "bucketDownloadMax": 0.0,
+    "bucketUploadMax": 0.0,
 }
 BANDWIDTH_RETENTION = 24 * 60 * 60
 BANDWIDTH_SAMPLE_INTERVAL = 10
-BANDWIDTH_SCHEMA_VERSION = "2"
+BANDWIDTH_LIVE_MIN_INTERVAL = 0.8
+BANDWIDTH_BUCKET_SECONDS = 60
+BANDWIDTH_SCHEMA_VERSION = "3"
 DEFAULT_PANEL_TITLE = "nft-manager"
 DEFAULT_DASHBOARD_POLL_SECONDS = 10
 
@@ -855,8 +860,8 @@ def bandwidth_connection():
     connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     row = connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
     if not row or row[0] != BANDWIDTH_SCHEMA_VERSION:
-        # v1 used raw interface RX/TX. Forwarded packets cross the same physical
-        # interface twice, so its upload/download history cannot be converted.
+        # Earlier schemas stored raw samples. They cannot be converted safely to
+        # corrected, per-minute peak buckets, so reset only the bandwidth history.
         connection.execute("DELETE FROM samples")
         connection.execute(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -866,16 +871,20 @@ def bandwidth_connection():
 
 
 def bandwidth_history(connection, now):
-    cutoff = int(now) - BANDWIDTH_RETENTION
+    cutoff = ((int(now) - BANDWIDTH_RETENTION) // BANDWIDTH_BUCKET_SECONDS) * BANDWIDTH_BUCKET_SECONDS
     connection.execute("DELETE FROM samples WHERE timestamp < ?", (cutoff,))
     rows = connection.execute(
-        "SELECT (timestamp / 60) * 60 AS minute, "
-        "MAX(download_mbps), MAX(upload_mbps) "
-        "FROM samples WHERE timestamp >= ? GROUP BY minute ORDER BY minute",
+        "SELECT timestamp, download_mbps, upload_mbps "
+        "FROM samples WHERE timestamp >= ? ORDER BY timestamp",
         (cutoff,),
     ).fetchall()
     return [
-        {"timestamp": int(stamp), "downloadMbps": round(float(download), 3), "uploadMbps": round(float(upload), 3)}
+        {
+            "timestamp": int(stamp) + BANDWIDTH_BUCKET_SECONDS,
+            "bucketTimestamp": int(stamp),
+            "downloadMbps": round(float(download), 3),
+            "uploadMbps": round(float(upload), 3),
+        }
         for stamp, download, upload in rows
     ]
 
@@ -914,21 +923,99 @@ def classify_bandwidth_bytes(rx_delta, tx_delta, forward_upload_delta, forward_d
     )
 
 
-def bandwidth_snapshot():
-    interface = default_network_interface()
-    if not interface:
-        now = time.time()
-        return {"available": False, "interface": "", "downloadMbps": 0.0, "uploadMbps": 0.0, "sampledAt": int(now), "history": []}
+def persist_bandwidth_bucket(bucket_timestamp, download_mbps, upload_mbps):
+    if not bucket_timestamp:
+        return
+    try:
+        with closing(bandwidth_connection()) as connection:
+            with connection:
+                connection.execute(
+                    "INSERT INTO samples(timestamp, download_mbps, upload_mbps) VALUES(?, ?, ?) "
+                    "ON CONFLICT(timestamp) DO UPDATE SET "
+                    "download_mbps = MAX(download_mbps, excluded.download_mbps), "
+                    "upload_mbps = MAX(upload_mbps, excluded.upload_mbps)",
+                    (int(bucket_timestamp), float(download_mbps), float(upload_mbps)),
+                )
+    except sqlite3.Error:
+        pass
 
+
+def bandwidth_point_locked(now):
+    bucket_timestamp = int(BANDWIDTH_STATE.get("bucketTimestamp", 0) or 0)
+    if not bucket_timestamp:
+        return None
+    sampled_at = float(BANDWIDTH_STATE.get("timestamp", 0) or now)
+    return {
+        "timestamp": int(sampled_at),
+        "bucketTimestamp": bucket_timestamp,
+        "downloadMbps": round(float(BANDWIDTH_STATE.get("downloadMbps", 0.0)), 3),
+        "uploadMbps": round(float(BANDWIDTH_STATE.get("uploadMbps", 0.0)), 3),
+        "provisional": True,
+    }
+
+
+def bandwidth_response_locked(now, include_history=False):
+    point = bandwidth_point_locked(now)
+    history = []
+    if include_history:
+        try:
+            with closing(bandwidth_connection()) as connection:
+                with connection:
+                    history = bandwidth_history(connection, now)
+        except sqlite3.Error:
+            history = []
+        if point:
+            history = [item for item in history if item.get("bucketTimestamp") != point["bucketTimestamp"]]
+            history.append(point)
+    return {
+        "available": bool(BANDWIDTH_STATE.get("interface")),
+        "interface": str(BANDWIDTH_STATE.get("interface", "")),
+        "downloadMbps": round(float(BANDWIDTH_STATE.get("downloadMbps", 0.0)), 3),
+        "uploadMbps": round(float(BANDWIDTH_STATE.get("uploadMbps", 0.0)), 3),
+        "sampledAt": int(BANDWIDTH_STATE.get("timestamp", 0) or now),
+        "point": point,
+        "history": history,
+    }
+
+
+def bandwidth_status(include_history=True):
+    with BANDWIDTH_LOCK:
+        return bandwidth_response_locked(time.time(), include_history=include_history)
+
+
+def bandwidth_snapshot(persist=False, include_history=False):
     with BANDWIDTH_LOCK:
         now = time.time()
+        previous = dict(BANDWIDTH_STATE)
+        elapsed = now - float(previous.get("timestamp", 0) or 0)
+
+        # Several visible dashboards may poll together. Reuse the latest sample so
+        # they never multiply system counter reads beyond roughly once per second.
+        if previous.get("timestamp") and elapsed < BANDWIDTH_LIVE_MIN_INTERVAL:
+            if persist:
+                persist_bandwidth_bucket(
+                    previous.get("bucketTimestamp", 0),
+                    previous.get("bucketDownloadMax", 0.0),
+                    previous.get("bucketUploadMax", 0.0),
+                )
+            return bandwidth_response_locked(now, include_history=include_history)
+
+        interface = str(previous.get("interface", ""))
+        if not interface:
+            interface = default_network_interface()
+        if not interface:
+            return bandwidth_response_locked(now, include_history=include_history)
         try:
             rx_bytes, tx_bytes = interface_byte_counters(interface)
         except (OSError, ValueError):
-            return {"available": False, "interface": interface, "downloadMbps": 0.0, "uploadMbps": 0.0, "sampledAt": int(now), "history": []}
+            interface = default_network_interface()
+            try:
+                rx_bytes, tx_bytes = interface_byte_counters(interface)
+            except (OSError, ValueError):
+                BANDWIDTH_STATE["interface"] = ""
+                return bandwidth_response_locked(now, include_history=include_history)
+
         forward_available, forward_counters = read_kernel_counters_with_status()
-        previous = dict(BANDWIDTH_STATE)
-        elapsed = now - float(previous.get("timestamp", 0) or 0)
         valid_delta = (
             previous.get("interface") == interface
             and 0.5 <= elapsed <= BANDWIDTH_SAMPLE_INTERVAL * 4
@@ -949,11 +1036,23 @@ def bandwidth_snapshot():
                     forward_deltas["download"],
                 )
             else:
-                # Keep monitoring available when nftables counters cannot be read.
-                # The next successful read establishes a fresh correction baseline.
                 download_delta, upload_delta = rx_delta, tx_delta
             download_mbps = download_delta * 8 / elapsed / 1_000_000
             upload_mbps = upload_delta * 8 / elapsed / 1_000_000
+
+        bucket_timestamp = (int(now) // BANDWIDTH_BUCKET_SECONDS) * BANDWIDTH_BUCKET_SECONDS
+        previous_bucket = int(previous.get("bucketTimestamp", 0) or 0)
+        if previous_bucket != bucket_timestamp:
+            persist_bandwidth_bucket(
+                previous_bucket,
+                previous.get("bucketDownloadMax", 0.0),
+                previous.get("bucketUploadMax", 0.0),
+            )
+            bucket_download_max = download_mbps if valid_delta else 0.0
+            bucket_upload_max = upload_mbps if valid_delta else 0.0
+        else:
+            bucket_download_max = max(float(previous.get("bucketDownloadMax", 0.0)), download_mbps) if valid_delta else float(previous.get("bucketDownloadMax", 0.0))
+            bucket_upload_max = max(float(previous.get("bucketUploadMax", 0.0)), upload_mbps) if valid_delta else float(previous.get("bucketUploadMax", 0.0))
 
         BANDWIDTH_STATE.update(
             {
@@ -965,29 +1064,14 @@ def bandwidth_snapshot():
                 "forwardCountersAvailable": forward_available,
                 "downloadMbps": download_mbps,
                 "uploadMbps": upload_mbps,
+                "bucketTimestamp": bucket_timestamp,
+                "bucketDownloadMax": bucket_download_max,
+                "bucketUploadMax": bucket_upload_max,
             }
         )
-        history = []
-        try:
-            with closing(bandwidth_connection()) as connection:
-                with connection:
-                    if valid_delta:
-                        connection.execute(
-                            "INSERT OR REPLACE INTO samples(timestamp, download_mbps, upload_mbps) VALUES(?, ?, ?)",
-                            (int(now), download_mbps, upload_mbps),
-                        )
-                    history = bandwidth_history(connection, now)
-        except sqlite3.Error:
-            history = []
-
-        return {
-            "available": True,
-            "interface": interface,
-            "downloadMbps": round(download_mbps, 3),
-            "uploadMbps": round(upload_mbps, 3),
-            "sampledAt": int(now),
-            "history": history,
-        }
+        if persist:
+            persist_bandwidth_bucket(bucket_timestamp, bucket_download_max, bucket_upload_max)
+        return bandwidth_response_locked(now, include_history=include_history)
 
 
 def empty_counter():
@@ -1277,7 +1361,7 @@ def dashboard():
         total_bytes += both_bytes
         active += 1 if c.get("active") else 0
         enriched.append({**r, "targetAlias": aliases.get(r["ip"], ""), "uploadBytes": upload_bytes, "downloadBytes": download_bytes, "totalBytes": both_bytes, "bytes": selected_bytes, "active": c["active"]})
-    return {"targets": targets, "rules": enriched, "history": history, "bandwidth": bandwidth_snapshot(), "settings": read_settings(), "firewall": {"ports": read_firewall_ports(), "baselinePorts": [item["port"] for item in firewall_baseline_ports()], "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
+    return {"targets": targets, "rules": enriched, "history": history, "bandwidth": bandwidth_status(include_history=True), "settings": read_settings(), "firewall": {"ports": read_firewall_ports(), "baselinePorts": [item["port"] for item in firewall_baseline_ports()], "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
 
 
 HTML = r"""<!doctype html>
@@ -1309,20 +1393,20 @@ const authToken=()=>localStorage.getItem('nft_manager_token')||'';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
 function savedSort(storageKey,allowed){try{let value=JSON.parse(localStorage.getItem(storageKey)||'{}');if(allowed.includes(value.key)&&['asc','desc'].includes(value.direction))return value}catch(e){}return {key:'',direction:''}}
-let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let savedTheme=localStorage.getItem('nft_manager_theme')||'system';if(!['light','dark','system'].includes(savedTheme))savedTheme='system';let savedRuleSort=savedSort('nft_manager_rule_sort',['upload','download','total','connectivity']),savedTargetSort=savedSort('nft_manager_target_sort',['upload','download','total','latency']);document.documentElement.dataset.theme=savedTheme;let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',theme:savedTheme,targetLatency:{},ruleConnectivity:{},ruleSort:savedRuleSort,targetSort:savedTargetSort,autoProbeView:'',publicTitle:'nft-manager',dashboardPollBusy:false,dashboardPollSeconds:0,dashboardPollTimer:null};
+let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let savedTheme=localStorage.getItem('nft_manager_theme')||'system';if(!['light','dark','system'].includes(savedTheme))savedTheme='system';let savedRuleSort=savedSort('nft_manager_rule_sort',['upload','download','total','connectivity']),savedTargetSort=savedSort('nft_manager_target_sort',['upload','download','total','latency']);document.documentElement.dataset.theme=savedTheme;let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',theme:savedTheme,targetLatency:{},ruleConnectivity:{},ruleSort:savedRuleSort,targetSort:savedTargetSort,autoProbeView:'',publicTitle:'nft-manager',dashboardPollBusy:false,dashboardPollSeconds:0,dashboardPollTimer:null,bandwidthLiveBusy:false,bandwidthLiveTimer:null};
 const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
 function toast(text,type='info'){document.querySelectorAll('.toast').forEach(x=>x.remove());let icon=type==='success'?'✓':type==='error'?'!':'i';document.body.insertAdjacentHTML('beforeend',`<div class="toast ${type}" role=status><span class=toast-icon>${icon}</span><span>${esc(text)}</span></div>`);setTimeout(()=>document.querySelector('.toast')?.remove(),4000)}
 function setModalError(text){let box=document.querySelector('.modal .error-box');if(box){box.textContent=text;box.classList.add('show')}else toast(text,'error')}
 function clearModalError(){let box=document.querySelector('.modal .error-box');if(box){box.textContent='';box.classList.remove('show')}}
-function expireSession(){localStorage.removeItem('nft_manager_token');state.data=null;if(state.dashboardPollTimer)clearInterval(state.dashboardPollTimer);state.dashboardPollTimer=null;login()}
+function expireSession(){localStorage.removeItem('nft_manager_token');state.data=null;if(state.dashboardPollTimer)clearInterval(state.dashboardPollTimer);if(state.bandwidthLiveTimer)clearInterval(state.bandwidthLiveTimer);state.dashboardPollTimer=null;state.bandwidthLiveTimer=null;login()}
 async function runAction(btn,fn){let old=btn?.textContent;if(btn){btn.disabled=true;btn.textContent='处理中...'}try{await fn()}catch(e){if(e.status===401)expireSession();else setModalError(msg(e))}finally{if(btn){btn.disabled=false;btn.textContent=old}}}
 function loading(){appRoot.innerHTML=`<div class=login><form><h2>${esc(state.publicTitle)}</h2><p class=muted>正在加载...</p></form></div>`}
 function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>${esc(state.publicTitle)}</h2><p class=muted>默认账号 admin / admin</p><input name=u value=admin placeholder=账号><input name=p type=password value=admin placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err),'error')}finally{btn.disabled=false;btn.textContent=old}}
-async function load(){try{state.data=await api('/api/state');document.title=state.data.settings?.panelTitle||'nft-manager';syncDashboardPoll();render();autoProbeCurrentView()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
-function nav(v){if(state.view!==v)state.autoProbeView='';state.view=v;localStorage.setItem('nft_manager_view',v);render();autoProbeCurrentView();if(v==='dash')pollDashboard()}
+async function load(){try{state.data=await api('/api/state');document.title=state.data.settings?.panelTitle||'nft-manager';syncDashboardPoll();render();syncBandwidthLive();autoProbeCurrentView()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
+function nav(v){if(state.view!==v)state.autoProbeView='';state.view=v;localStorage.setItem('nft_manager_view',v);render();syncBandwidthLive();autoProbeCurrentView();if(v==='dash')pollDashboard()}
 function shell(content){let n=[['dash','仪表板','⌂'],['rules','转发管理','⇄'],['targets','主机管理','▣'],['firewall','防火墙','◫'],['settings','设置','⚙']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')"><span class=nav-icon aria-hidden=true>${x[2]}</span><span>${x[1]}</span></button>`).join(''),title=esc(state.data.settings?.panelTitle||'nft-manager');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>${title}</div><div class=ver>v__WEB_PANEL_VERSION__</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=mobile-brand>${title}</span><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function hourText(stamp){return String(new Date(stamp*1000).getHours()).padStart(2,'0')+':00'}
 function chartDateTime(stamp,hourOnly=false){let d=new Date(Number(stamp)*1000),pad=n=>String(n).padStart(2,'0');return `${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${hourOnly?'00':pad(d.getMinutes())}${hourOnly?'':':'+pad(d.getSeconds())}`}
@@ -1346,11 +1430,11 @@ function chartHover(event,type){
 }
 function fabStack(buttons){return `<div class=fab-stack aria-label="页面操作">${buttons.join('')}</div>`}
 function fabButton(icon,label,action,primary=false,title=''){return `<button class="fab ${primary?'primary':''}" onclick="${action}" title="${title||label}" aria-label="${title||label}"><span class=fab-icon aria-hidden=true>${icon}</span><span class=fab-label>${label}</span></button>`}
-function render(){let d=state.data;if(state.view==='dash'){let b=d.bandwidth||{};return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=chart-pair><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><div class=chart-panel-head><h2>24小时带宽统计</h2><div class=bandwidth-live><span class=download>下载 ${fmtBandwidth(b.downloadMbps)}</span><span class=upload>上传 ${fmtBandwidth(b.uploadMbps)}</span><span class=bandwidth-interface>${b.available?esc(b.interface):'未检测到出口网卡'}</span></div></div><div class=chart-legend><span class=download><i></i>下载</span><span class=upload><i></i>上传</span></div>${bandwidthChart()}</div></div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`)}
+function render(){let d=state.data;if(state.view==='dash'){let b=d.bandwidth||{};return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=chart-pair><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><div class=chart-panel-head><h2>24小时带宽统计</h2><div class=bandwidth-live><span class=download id=bandwidthLiveDownload>下载 ${fmtBandwidth(b.downloadMbps)}</span><span class=upload id=bandwidthLiveUpload>上传 ${fmtBandwidth(b.uploadMbps)}</span><span class=bandwidth-interface id=bandwidthLiveInterface>${b.available?esc(b.interface):'未检测到出口网卡'}</span></div></div><div class=chart-legend><span class=download><i></i>下载</span><span class=upload><i></i>上传</span></div><div id=bandwidthLiveChart>${bandwidthChart()}</div></div></div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`)}
  if(state.view==='rules'){let next=state.ruleView==='flat'?'grid':'flat',label=state.ruleView==='flat'?'平铺':'方块',icon=state.ruleView==='flat'?'☷':'▦';return shell(`<div class=page-with-fabs>${rulesTable(false)}${fabStack([fabButton(icon,label,`setRuleView('${next}')`,false,`切换为${next==='grid'?'方块':'平铺'}视图`),fabButton('⌁','连通性',`checkRuleConnectivity(this)`,false,'检查全部转发连通性'),fabButton('+','新增转发',`openRule()`,true),fabButton('↺','默认排序',`resetListSort('rule')`,false,'清除转发列表排序')])}</div>`)}
  if(state.view==='targets')return shell(`<div class=page-with-fabs><div class=panel><h2>主机管理</h2>${targetsTable()}</div>${fabStack([fabButton('◷','延迟检测',`checkTargetLatency(this)`),fabButton('+','新增主机',`openTarget()`,true),fabButton('↺','默认排序',`resetListSort('target')`,false,'清除主机列表排序')])}</div>`);
  if(state.view==='firewall')return shell(`<div class=page-with-fabs><div class=panel><h2>防火墙管理</h2><p class=muted>默认拒绝未列出的入站连接，始终保留当前 SSH 端口与 Web 面板 5555/tcp。</p>${firewallTable()}</div>${fabStack([fabButton('↻','同步端口',`syncFirewall(this)`),fabButton('+','开放端口',`openFirewall()`,true)])}</div>`);
- return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><div class=field style="max-width:520px"><label>首页轮询间隔（秒）</label><div class=actions><input id=dashboardPollSeconds type=number min=2 max=300 step=1 value="${Number(d.settings?.dashboardPollSeconds||10)}"><button class=primary onclick="savePollInterval(this)">保存间隔</button></div><p class=muted>仅停留在仪表板且页面可见时轮询，范围 2-300 秒。</p></div><div class=field><label>显示模式</label><div class=theme-switch><button class="${state.theme==='light'?'active':''}" onclick="setTheme('light')">日间</button><button class="${state.theme==='dark'?'active':''}" onclick="setTheme('dark')">夜间</button><button class="${state.theme==='system'?'active':''}" onclick="setTheme('system')">跟随系统</button></div></div><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
+ return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><div class=field style="max-width:520px"><label>首页轮询间隔（秒）</label><div class=actions><input id=dashboardPollSeconds type=number min=2 max=300 step=1 value="${Number(d.settings?.dashboardPollSeconds||10)}"><button class=primary onclick="savePollInterval(this)">保存间隔</button></div><p class=muted>控制流量、规则等完整首页数据刷新，范围 2-300 秒；带宽速率在首页可见时固定每秒刷新。</p></div><div class=field><label>显示模式</label><div class=theme-switch><button class="${state.theme==='light'?'active':''}" onclick="setTheme('light')">日间</button><button class="${state.theme==='dark'?'active':''}" onclick="setTheme('dark')">夜间</button><button class="${state.theme==='system'?'active':''}" onclick="setTheme('system')">跟随系统</button></div></div><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
 function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
 function setTheme(theme){if(!['light','dark','system'].includes(theme))return;state.theme=theme;localStorage.setItem('nft_manager_theme',theme);document.documentElement.dataset.theme=theme;render();toast('显示模式已切换','success')}
 function ruleName(r){return r.alias||`${r.targetAlias||r.ip}:${r.lport}`}
@@ -1396,10 +1480,13 @@ async function savePollInterval(btn){await runAction(btn,async()=>{let value=Num
 function openPassword(){modal(`<h2>修改密码</h2><div class=field><label>旧密码</label><input id=oldp type=password></div><div class=field><label>新密码</label><input id=newp type=password></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="chgPwd(this)">保存</button></div>`)}
 async function chgPwd(btn){await runAction(btn,async()=>{await api('/api/password',{method:'POST',body:JSON.stringify({oldPassword:document.getElementById('oldp').value,newPassword:document.getElementById('newp').value})});document.querySelector('.modal').remove();expireSession();toast('密码已修改，请使用新密码重新登录','success')})}
 async function boot(){try{let publicSettings=await api('/api/public-settings');state.publicTitle=publicSettings.panelTitle||'nft-manager';document.title=state.publicTitle}catch(e){}if(authToken()){loading();load()}else login()}
+function mergeBandwidthLive(live){let previous=state.data?.bandwidth||{},history=[...(previous.history||[])];if(live.point){history=history.filter(item=>Number(item.bucketTimestamp??item.timestamp)!==Number(live.point.bucketTimestamp));history.push(live.point);history.sort((a,b)=>Number(a.timestamp)-Number(b.timestamp))}state.data.bandwidth={...previous,...live,history}}
+async function pollBandwidthLive(){if(!state.data||!authToken()||state.view!=='dash'||document.hidden||state.bandwidthLiveBusy)return;state.bandwidthLiveBusy=true;try{let live=await api('/api/bandwidth/live',{timeout:4000});mergeBandwidthLive(live);let download=document.getElementById('bandwidthLiveDownload'),upload=document.getElementById('bandwidthLiveUpload'),networkInterface=document.getElementById('bandwidthLiveInterface'),chart=document.getElementById('bandwidthLiveChart');if(download)download.textContent=`下载 ${fmtBandwidth(live.downloadMbps)}`;if(upload)upload.textContent=`上传 ${fmtBandwidth(live.uploadMbps)}`;if(networkInterface)networkInterface.textContent=live.available?live.interface:'未检测到出口网卡';if(chart)chart.innerHTML=bandwidthChart()}catch(e){if(e.status===401)expireSession()}finally{state.bandwidthLiveBusy=false}}
+function syncBandwidthLive(){let active=!!(state.data&&authToken()&&state.view==='dash'&&!document.hidden);if(!active){if(state.bandwidthLiveTimer)clearInterval(state.bandwidthLiveTimer);state.bandwidthLiveTimer=null;return}if(state.bandwidthLiveTimer)return;pollBandwidthLive();state.bandwidthLiveTimer=setInterval(pollBandwidthLive,1000)}
 async function pollDashboard(){if(!state.data||!authToken()||state.view!=='dash'||document.hidden||state.dashboardPollBusy)return;state.dashboardPollBusy=true;try{await load()}finally{state.dashboardPollBusy=false}}
 function syncDashboardPoll(){let seconds=Math.min(300,Math.max(2,Number(state.data?.settings?.dashboardPollSeconds||10)));if(state.dashboardPollTimer&&state.dashboardPollSeconds===seconds)return;if(state.dashboardPollTimer)clearInterval(state.dashboardPollTimer);state.dashboardPollSeconds=seconds;state.dashboardPollTimer=setInterval(pollDashboard,seconds*1000)}
 boot();
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollDashboard()});
+document.addEventListener('visibilitychange',()=>{syncBandwidthLive();if(!document.hidden)pollDashboard()});
 </script></body></html>"""
 
 
@@ -1439,6 +1526,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self.require():
                 return
             self.send_json(dashboard())
+            return
+        if path == "/api/bandwidth/live":
+            if not self.require():
+                return
+            self.send_json(bandwidth_snapshot(persist=False, include_history=False))
             return
         raw = HTML.replace("__WEB_PANEL_VERSION__", WEB_PANEL_VERSION).encode()
         self.send_response(200)
@@ -1532,7 +1624,7 @@ def traffic_sampler_loop():
     while True:
         time.sleep(BANDWIDTH_SAMPLE_INTERVAL)
         try:
-            bandwidth_snapshot()
+            bandwidth_snapshot(persist=True, include_history=False)
         except Exception:
             pass
         ticks += 1
@@ -1610,7 +1702,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"nft-manager: 流量统计初始化失败，Web 面板继续启动：{e}")
     try:
-        bandwidth_snapshot()
+        bandwidth_snapshot(persist=True, include_history=False)
     except Exception as e:
         print(f"nft-manager: 带宽统计初始化失败，Web 面板继续启动：{e}")
     threading.Thread(target=traffic_sampler_loop, daemon=True).start()
