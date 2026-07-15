@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.6
+# nftables 端口转发管理工具 v3.7
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.6"
-WEB_PANEL_VERSION="3.6"
+SCRIPT_VERSION="3.7"
+WEB_PANEL_VERSION="3.7"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -25,6 +25,13 @@ SCRIPT_INSTALL_DIR="/usr/local/lib/nft-forward"
 SCRIPT_INSTALL_FILE="${SCRIPT_INSTALL_DIR}/nft.sh"
 WEB_PANEL_FILE="${SCRIPT_INSTALL_DIR}/web_panel.py"
 NEXTTRACE_MARKER="${SCRIPT_INSTALL_DIR}/nexttrace-managed"
+NEXTTRACE_LOCAL_FILE="${SCRIPT_INSTALL_DIR}/nexttrace"
+NEXTTRACE_INSTALL_FILE="/usr/local/bin/nexttrace"
+NEXTTRACE_VENDOR_DIR="${SCRIPT_INSTALL_DIR}/vendor/nexttrace"
+NEXTTRACE_BUNDLED_VERSION="1.7.1"
+NEXTTRACE_PROJECT_RAW="https://raw.githubusercontent.com/DeraDream/nft-manager/main/vendor/nexttrace"
+NEXTTRACE_PROJECT_CDN="https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/vendor/nexttrace"
+NEXTTRACE_RELEASE_BASE="https://github.com/nxtrace/NTrace-core/releases/latest/download"
 WEB_PORT="5555"
 WEB_AUTH_FILE="${CONF_DIR}/web-auth.conf"
 WEB_PANEL_URL="${NFT_MANAGER_WEB_PANEL_URL:-https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/web_panel.py}"
@@ -730,7 +737,7 @@ write_conf_file() {
     cat > "${tmp_file}" <<EOF
 #!/usr/sbin/nft -f
 
-# WEB_META|3
+# WEB_META|4
 
 # --- 本机 IP（自动获取，用于 SNAT 回源）
 define LOCAL_IP = ${local_ip}
@@ -784,10 +791,10 @@ EOF
         IFS='|' read -r lport dip dport alias <<< "$rule"
         cat >> "${tmp_file}" <<EOF
 
-        ip daddr ${dip} tcp dport ${dport} ct status dnat counter comment "META_COUNTER_UPLOAD|${lport}|${dip}|${dport}"
-        ip daddr ${dip} udp dport ${dport} ct status dnat counter comment "META_COUNTER_UPLOAD|${lport}|${dip}|${dport}"
-        ip saddr ${dip} tcp sport ${dport} ct status dnat counter comment "META_COUNTER_DOWNLOAD|${lport}|${dip}|${dport}"
-        ip saddr ${dip} udp sport ${dport} ct status dnat counter comment "META_COUNTER_DOWNLOAD|${lport}|${dip}|${dport}"
+        ct original protocol tcp ct original proto-dst ${lport} ip daddr ${dip} tcp dport ${dport} ct status dnat counter comment "META_COUNTER_UPLOAD|${lport}|${dip}|${dport}"
+        ct original protocol udp ct original proto-dst ${lport} ip daddr ${dip} udp dport ${dport} ct status dnat counter comment "META_COUNTER_UPLOAD|${lport}|${dip}|${dport}"
+        ct original protocol tcp ct original proto-dst ${lport} ip saddr ${dip} tcp sport ${dport} ct status dnat counter comment "META_COUNTER_DOWNLOAD|${lport}|${dip}|${dport}"
+        ct original protocol udp ct original proto-dst ${lport} ip saddr ${dip} udp sport ${dport} ct status dnat counter comment "META_COUNTER_DOWNLOAD|${lport}|${dip}|${dport}"
 EOF
     done
 
@@ -805,7 +812,14 @@ EOF
 }
 
 # ============== 重新加载规则 ==============
+snapshot_traffic() {
+    if command -v python3 &>/dev/null && [[ -f "${WEB_PANEL_FILE}" ]] && grep -q -- '--snapshot-traffic' "${WEB_PANEL_FILE}" 2>/dev/null; then
+        python3 "${WEB_PANEL_FILE}" --snapshot-traffic >/dev/null 2>&1 || true
+    fi
+}
+
 reload_rules() {
+    snapshot_traffic
     "$NFT_BIN" flush table ip "${TABLE_NAME}" 2>/dev/null || true
     "$NFT_BIN" delete table ip "${TABLE_NAME}" 2>/dev/null || true
     if ! "$NFT_BIN" -f "${CONF_FILE}"; then
@@ -1162,6 +1176,7 @@ web_panel_needs_sync() {
 }
 
 install_manager_files() {
+    local source_vendor target_vendor
     mkdir -p "${SCRIPT_INSTALL_DIR}" 2>/dev/null || {
         err "无法创建 ${SCRIPT_INSTALL_DIR}"
         return 1
@@ -1174,6 +1189,17 @@ install_manager_files() {
         }
     else
         chmod +x "${SCRIPT_INSTALL_FILE}" 2>/dev/null || true
+    fi
+
+    source_vendor="$(dirname "${SCRIPT_PATH}")/vendor/nexttrace"
+    target_vendor="${NEXTTRACE_VENDOR_DIR}"
+    if [[ -d "$source_vendor" && "$(readlink -f "$source_vendor" 2>/dev/null || realpath "$source_vendor" 2>/dev/null)" != "$(readlink -f "$target_vendor" 2>/dev/null || realpath "$target_vendor" 2>/dev/null)" ]]; then
+        rm -rf "$target_vendor" 2>/dev/null || true
+        mkdir -p "$(dirname "$target_vendor")" 2>/dev/null || return 1
+        cp -a "$source_vendor" "$target_vendor" 2>/dev/null || {
+            err "无法安装项目内置 NextTrace 文件。"
+            return 1
+        }
     fi
 
     if [[ -e "${GLOBAL_CMD}" ]] && ! grep -qF "exec \"${SCRIPT_INSTALL_FILE}\"" "${GLOBAL_CMD}" 2>/dev/null; then
@@ -1234,6 +1260,14 @@ install_web_panel_file() {
     local source_dir tmp_file web_panel_url
     source_dir="$(dirname "${SCRIPT_PATH}")"
     if [[ "$force_download" != "force" && -f "${source_dir}/web_panel.py" ]]; then
+        if ! python3 -m py_compile "${source_dir}/web_panel.py" >/dev/null 2>&1; then
+            err "本地 Web 面板文件校验失败: ${source_dir}/web_panel.py"
+            return 1
+        fi
+        if [[ "$(readlink -f "${source_dir}/web_panel.py" 2>/dev/null || realpath "${source_dir}/web_panel.py" 2>/dev/null)" == "$(readlink -f "${WEB_PANEL_FILE}" 2>/dev/null || realpath "${WEB_PANEL_FILE}" 2>/dev/null)" ]]; then
+            chmod 755 "${WEB_PANEL_FILE}" 2>/dev/null || return 1
+            return 0
+        fi
         cp -f "${source_dir}/web_panel.py" "${WEB_PANEL_FILE}" 2>/dev/null && chmod 755 "${WEB_PANEL_FILE}" 2>/dev/null || {
             err "无法安装 Web 面板文件到 ${WEB_PANEL_FILE}"
             return 1
@@ -1290,6 +1324,7 @@ ExecStart=/usr/bin/env python3 ${WEB_PANEL_FILE}
 Restart=always
 RestartSec=3
 Environment=NFT_MANAGER_WEB_PORT=${WEB_PORT}
+ExecStop=/usr/bin/env python3 ${WEB_PANEL_FILE} --snapshot-traffic
 
 [Install]
 WantedBy=multi-user.target
@@ -1308,43 +1343,162 @@ EOF
     fi
 }
 
+nexttrace_arch() {
+    case "$(uname -m 2>/dev/null)" in
+        x86_64|amd64) printf 'amd64' ;;
+        aarch64|arm64) printf 'arm64' ;;
+        *) return 1 ;;
+    esac
+}
+
+nexttrace_version_text() {
+    local bin="${1:-$(command -v nexttrace 2>/dev/null || true)}" output=""
+    [[ -n "$bin" && -x "$bin" ]] || return 1
+    if command -v timeout &>/dev/null; then
+        output=$(NO_COLOR=1 timeout 5 "$bin" --version 2>&1 | head -1) || true
+    else
+        output=$(NO_COLOR=1 "$bin" --version 2>&1 | head -1) || true
+    fi
+    [[ -n "$output" ]] && printf '%s' "$output" || printf '%s' "$bin"
+}
+
+validate_nexttrace_binary() {
+    local file="$1"
+    [[ -s "$file" ]] || return 1
+    chmod 755 "$file" 2>/dev/null || return 1
+    if command -v timeout &>/dev/null; then
+        timeout 8 "$file" --version >/dev/null 2>&1 || timeout 8 "$file" -h >/dev/null 2>&1
+    else
+        "$file" --version >/dev/null 2>&1 || "$file" -h >/dev/null 2>&1
+    fi
+}
+
+activate_nexttrace_binary() {
+    local source="$1" temp_target="${NEXTTRACE_INSTALL_FILE}.new.$$"
+    validate_nexttrace_binary "$source" || {
+        err "NextTrace 文件无效或与当前 VPS 架构不匹配: ${source}"
+        return 1
+    }
+    install -m 755 "$source" "$temp_target" 2>/dev/null && mv -f "$temp_target" "${NEXTTRACE_INSTALL_FILE}" 2>/dev/null || {
+        rm -f "$temp_target" 2>/dev/null || true
+        err "无法写入 ${NEXTTRACE_INSTALL_FILE}"
+        return 1
+    }
+    printf '%s\n' "${NEXTTRACE_INSTALL_FILE}" > "$NEXTTRACE_MARKER" 2>/dev/null || true
+}
+
+download_project_nexttrace() {
+    local arch="$1" dest="$2" name="nexttrace_linux_${arch}" url
+    for url in "${NEXTTRACE_PROJECT_RAW}/${name}" "${NEXTTRACE_PROJECT_CDN}/${name}"; do
+        if download_remote_file "$url" "$dest" 120 && validate_nexttrace_binary "$dest"; then
+            return 0
+        fi
+        rm -f "$dest" 2>/dev/null || true
+    done
+    return 1
+}
+
 install_nexttrace() {
-    local installer nexttrace_bin
+    local mode="${1:-online}" force="${2:-}" nexttrace_bin candidate arch name temp_file
     nexttrace_bin=$(command -v nexttrace 2>/dev/null || true)
-    if [[ -n "$nexttrace_bin" ]]; then
-        info "NextTrace 已就绪: ${nexttrace_bin}"
+    if [[ -n "$nexttrace_bin" && "$force" != "force" ]]; then
+        info "NextTrace 已就绪: $(nexttrace_version_text "$nexttrace_bin")"
         return 0
     fi
+    arch=$(nexttrace_arch 2>/dev/null || true)
+    if [[ -n "$arch" ]]; then
+        name="nexttrace_linux_${arch}"
+        for candidate in "$(dirname "${SCRIPT_PATH}")/vendor/nexttrace/${name}" "${NEXTTRACE_VENDOR_DIR}/${name}"; do
+            [[ -f "$candidate" ]] || continue
+            if activate_nexttrace_binary "$candidate"; then
+                info "已接入项目内置 NextTrace v${NEXTTRACE_BUNDLED_VERSION}: ${candidate}"
+                log_action "安装项目内置 NextTrace: ${candidate}"
+                return 0
+            fi
+        done
+    fi
+    for candidate in "$(dirname "${SCRIPT_PATH}")/nexttrace" "${NEXTTRACE_LOCAL_FILE}" "/root/nexttrace"; do
+        [[ -f "$candidate" ]] || continue
+        if activate_nexttrace_binary "$candidate"; then
+            info "已接入本地 NextTrace: ${candidate}"
+            log_action "安装本地 NextTrace: ${candidate}"
+            return 0
+        fi
+    done
 
-    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
-        warn "未检测到 curl 或 wget，无法自动安装 NextTrace。"
+    if [[ -z "$arch" ]]; then
+        warn "当前架构没有项目内置 NextTrace，请将官方二进制上传为 ${NEXTTRACE_LOCAL_FILE}。"
         return 1
     fi
 
-    info "未检测到 NextTrace，正在安装路由追踪组件..."
-    installer=$(mktemp 2>/dev/null || echo "/tmp/nexttrace-install.$$") || true
-    if ! download_remote_file "https://nxtrace.org/nt" "$installer" 90; then
-        rm -f "$installer" 2>/dev/null || true
-        warn "NextTrace 安装包下载失败，Web 面板的路由追踪暂不可用。"
+    if [[ "$mode" == "offline" ]]; then
+        warn "未找到适用于 ${arch} 的项目内置 NextTrace；请一并上传 vendor/nexttrace 目录。"
         return 1
     fi
-
-    if ! bash "$installer"; then
-        rm -f "$installer" 2>/dev/null || true
-        warn "NextTrace 安装失败，Web 面板的路由追踪暂不可用。"
+    temp_file=$(mktemp 2>/dev/null || echo "/tmp/nexttrace-project.$$") || true
+    info "正在下载项目内置 NextTrace v${NEXTTRACE_BUNDLED_VERSION} (${arch})..."
+    if ! download_project_nexttrace "$arch" "$temp_file" || ! activate_nexttrace_binary "$temp_file"; then
+        rm -f "$temp_file" 2>/dev/null || true
+        warn "项目内置 NextTrace 下载失败，路由追踪暂不可用。"
         return 1
     fi
-    rm -f "$installer" 2>/dev/null || true
+    mkdir -p "${NEXTTRACE_VENDOR_DIR}" 2>/dev/null || true
+    install -m 755 "$temp_file" "${NEXTTRACE_VENDOR_DIR}/${name}" 2>/dev/null || true
+    rm -f "$temp_file" 2>/dev/null || true
+    info "NextTrace 已安装: $(nexttrace_version_text "${NEXTTRACE_INSTALL_FILE}")"
+    log_action "下载并安装项目内置 NextTrace v${NEXTTRACE_BUNDLED_VERSION}"
+}
 
-    nexttrace_bin=$(command -v nexttrace 2>/dev/null || true)
-    if [[ -z "$nexttrace_bin" ]]; then
-        warn "NextTrace 安装后未找到 nexttrace 命令。"
+update_nexttrace_online() {
+    local arch name temp_file vendor_target
+    arch=$(nexttrace_arch) || {
+        err "当前架构暂不支持菜单在线升级，请使用 NextTrace 官方安装方式。"
+        return 1
+    }
+    name="nexttrace-tiny_linux_${arch}"
+    temp_file=$(mktemp 2>/dev/null || echo "/tmp/nexttrace-update.$$") || true
+    info "正在从 NextTrace 官方 Release 检查并下载最新 ${arch} 版本..."
+    if ! download_remote_file "${NEXTTRACE_RELEASE_BASE}/${name}" "$temp_file" 180; then
+        rm -f "$temp_file" 2>/dev/null || true
+        err "NextTrace 下载失败，请检查 GitHub 连接。"
         return 1
     fi
+    if ! activate_nexttrace_binary "$temp_file"; then
+        rm -f "$temp_file" 2>/dev/null || true
+        return 1
+    fi
+    vendor_target="${NEXTTRACE_VENDOR_DIR}/nexttrace_linux_${arch}"
+    mkdir -p "${NEXTTRACE_VENDOR_DIR}" 2>/dev/null || true
+    install -m 755 "$temp_file" "$vendor_target" 2>/dev/null || warn "已更新运行命令，但未能同步项目安装目录中的副本。"
+    rm -f "$temp_file" 2>/dev/null || true
+    info "NextTrace 升级完成: $(nexttrace_version_text "${NEXTTRACE_INSTALL_FILE}")"
+    log_action "在线升级 NextTrace"
+}
 
-    printf '%s\n' "$nexttrace_bin" > "$NEXTTRACE_MARKER" 2>/dev/null || true
-    info "NextTrace 已安装: ${nexttrace_bin}"
-    log_action "安装 NextTrace: ${nexttrace_bin}"
+do_nexttrace_menu() {
+    while true; do
+        echo ""
+        echo "========================================"
+        echo "          NextTrace 管理"
+        echo "========================================"
+        if command -v nexttrace &>/dev/null; then
+            echo "  当前状态: $(nexttrace_version_text)"
+        else
+            echo "  当前状态: 未安装"
+        fi
+        echo "  1) 从项目内置文件安装 / 修复"
+        echo "  2) 从官方 Release 在线升级"
+        echo "  0) 返回主菜单"
+        echo "========================================"
+        local choice
+        read -rp "请选择操作 [0-2]: " choice
+        case "$choice" in
+            0) return ;;
+            1) install_nexttrace offline force ;;
+            2) update_nexttrace_online ;;
+            *) err "无效选择，请输入 0-2。" ;;
+        esac
+    done
 }
 
 install_manager_runtime() {
@@ -1427,6 +1581,55 @@ sync_updated_runtime() {
     [[ "$sync_ok" == "true" && "$migration_ok" == "true" ]]
 }
 
+do_local_redeploy() {
+    echo ""
+    info "开始使用本机文件离线重部署，不会访问任何下载源。"
+    local source_dir source_web sync_ok=true
+    source_dir="$(dirname "${SCRIPT_PATH}")"
+    source_web="${source_dir}/web_panel.py"
+
+    if ! bash -n "${SCRIPT_PATH}" >/dev/null 2>&1; then
+        err "当前 nft.sh 语法校验失败，已取消重部署。"
+        return
+    fi
+    if [[ ! -f "$source_web" ]]; then
+        err "缺少 ${source_web}。请将 nft.sh 与 web_panel.py 放在同一目录后重试。"
+        return
+    fi
+    if ! command -v python3 &>/dev/null || ! python3 -m py_compile "$source_web" >/dev/null 2>&1; then
+        err "本地 web_panel.py 校验失败，已取消重部署。"
+        return
+    fi
+
+    if grep -q -- '--snapshot-traffic' "$source_web" 2>/dev/null; then
+        python3 "$source_web" --snapshot-traffic >/dev/null 2>&1 || warn "服务停止前的流量快照未完成，将继续重部署。"
+    fi
+    if command -v systemctl &>/dev/null; then
+        systemctl stop "${WEB_SERVICE_NAME}" >/dev/null 2>&1 || true
+        systemctl stop "${KEEPALIVE_SERVICE_NAME}" >/dev/null 2>&1 || true
+    fi
+
+    install_manager_files || sync_ok=false
+    if [[ "$sync_ok" == "true" ]]; then
+        install_web_service "" defer || sync_ok=false
+    fi
+    install_nexttrace offline || warn "NextTrace 暂不可用，其余服务继续部署。"
+    install_keepalive_service defer || sync_ok=false
+
+    if [[ "$sync_ok" == "true" ]]; then
+        python3 "${WEB_PANEL_FILE}" --migrate-only || sync_ok=false
+    fi
+    restart_runtime_services || sync_ok=false
+
+    if [[ "$sync_ok" == "true" ]]; then
+        info "离线重部署完成，配置与流量统计数据均已保留。"
+        info "Web 面板地址: http://$(get_local_ip):${WEB_PORT}"
+        log_action "使用本机文件离线重部署 v${SCRIPT_VERSION}"
+    else
+        err "离线重部署未完整完成，已尝试恢复并重启现有服务，请执行诊断/自检。"
+    fi
+}
+
 do_post_update() {
     check_root
     sync_updated_runtime
@@ -1502,7 +1705,7 @@ do_uninstall_manager() {
     rm -f "${FIREWALL_CONF}" "${FIREWALL_PORTS_FILE}" "${FIREWALL_SSH_PORT_FILE}" 2>/dev/null || true
     rm -f "${UPDATE_URL_FILE}" 2>/dev/null || true
     rm -f "${WEB_AUTH_FILE}" 2>/dev/null || true
-    rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" 2>/dev/null || true
+    rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" "${CONF_DIR}/web-settings.json" "${CONF_DIR}/.web-stats.lock" 2>/dev/null || true
     rm -f "${CONF_DIR}"/*.conf.bak.* 2>/dev/null || true
     rm -rf "${CONF_DIR}/backups" 2>/dev/null || true
     rmdir "${CONF_DIR}" 2>/dev/null || true
@@ -1935,6 +2138,38 @@ do_targets_delete() {
     fi
 }
 
+do_targets_trace() {
+    echo ""
+    init_conf || return
+    do_targets_list || return
+    if ! command -v nexttrace &>/dev/null; then
+        err "NextTrace 未安装，请先返回主菜单进入【NextTrace 管理】安装。"
+        return
+    fi
+
+    local choice target alias ip
+    read -rp "请选择要检测路由的主机序号 (0 取消): " choice
+    if [[ "$choice" == "0" || -z "$choice" ]]; then
+        info "已取消。"
+        return
+    fi
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#TARGETS[@]} )); then
+        err "无效的序号。"
+        return
+    fi
+    target="${TARGETS[$((choice - 1))]}"
+    IFS='|' read -r alias ip <<< "$target"
+    echo ""
+    info "正在执行本机到 ${alias} (${ip}) 的 NextTrace 路由..."
+    echo "────────────────────────────────────────────"
+    nexttrace "$ip"
+    local status=$?
+    echo "────────────────────────────────────────────"
+    if (( status != 0 )); then
+        err "NextTrace 执行失败，退出码: ${status}"
+    fi
+}
+
 do_targets_menu() {
     while true; do
         echo ""
@@ -1945,17 +2180,19 @@ do_targets_menu() {
         echo "  2) 新增目标主机"
         echo "  3) 修改目标主机"
         echo "  4) 删除目标主机"
+        echo "  5) NextTrace 路由检测"
         echo "  0) 返回主菜单"
         echo "========================================"
         local choice
-        read -rp "请选择操作 [0-4]: " choice
+        read -rp "请选择操作 [0-5]: " choice
         case "$choice" in
             0) return ;;
             1) do_targets_list ;;
             2) do_targets_add ;;
             3) do_targets_edit ;;
             4) do_targets_delete ;;
-            *) err "无效选择，请输入 0-4。" ;;
+            5) do_targets_trace ;;
+            *) err "无效选择，请输入 0-5。" ;;
         esac
     done
 }
@@ -2334,9 +2571,11 @@ main_menu() {
         echo "  7) 一键清空所有转发"
         echo "  8) 诊断/自检"
         echo "  9) 防火墙端口管理"
+        echo " 10) 离线更新 / 重部署服务"
+        echo " 11) NextTrace 管理"
         echo "  0) 退出"
         echo "========================================"
-        read -rp "请选择操作 [0-9]: " choice
+        read -rp "请选择操作 [0-11]: " choice
 
         case "$choice" in
             0)
@@ -2361,8 +2600,10 @@ main_menu() {
             7) do_clear_all ;;
             8) do_diagnose ;;
             9) do_firewall_menu ;;
+            10) do_local_redeploy ;;
+            11) do_nexttrace_menu ;;
             *)
-                err "无效选择，请输入 0-9。"
+                err "无效选择，请输入 0-11。"
                 ;;
         esac
     done
@@ -2377,6 +2618,18 @@ fi
 if [[ "${1:-}" == "--keepalive" ]]; then
     do_keepalive
     exit 0
+fi
+
+if [[ "${1:-}" == "--offline-redeploy" ]]; then
+    check_root
+    do_local_redeploy
+    exit $?
+fi
+
+if [[ "${1:-}" == "--nexttrace-update" ]]; then
+    check_root
+    update_nexttrace_online
+    exit $?
 fi
 
 check_root

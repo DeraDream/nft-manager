@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import concurrent.futures
+import fcntl
 import hashlib
 import hmac
 import http.cookies
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -22,7 +24,9 @@ CONF_FILE = os.path.join(CONF_DIR, "port-forward.conf")
 TARGETS_FILE = os.path.join(CONF_DIR, "targets.conf")
 AUTH_FILE = os.path.join(CONF_DIR, "web-auth.conf")
 STATS_FILE = os.path.join(CONF_DIR, "web-stats.json")
+STATS_LOCK_FILE = os.path.join(CONF_DIR, ".web-stats.lock")
 HISTORY_FILE = os.path.join(CONF_DIR, "web-history.json")
+SETTINGS_FILE = os.path.join(CONF_DIR, "web-settings.json")
 FIREWALL_CONF = os.path.join(CONF_DIR, "firewall.conf")
 FIREWALL_PORTS_FILE = os.path.join(CONF_DIR, "firewall-ports.db")
 FIREWALL_SSH_PORT_FILE = os.path.join(CONF_DIR, "firewall-ssh-port")
@@ -32,8 +36,10 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.6"
+WEB_PANEL_VERSION = "3.7"
 FIREWALL_LOCK = threading.Lock()
+STATS_LOCK = threading.Lock()
+DEFAULT_PANEL_TITLE = "nft-manager"
 
 
 def resolve_nft_bin():
@@ -471,6 +477,37 @@ def ensure_dirs():
     os.makedirs(CONF_DIR, exist_ok=True)
 
 
+@contextmanager
+def stats_file_lock():
+    ensure_dirs()
+    with open(STATS_LOCK_FILE, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def read_settings():
+    settings = {"panelTitle": DEFAULT_PANEL_TITLE}
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            saved = json.load(open(SETTINGS_FILE, encoding="utf-8"))
+            title = clean_label(saved.get("panelTitle", ""))[:64]
+            if title:
+                settings["panelTitle"] = title
+        except Exception:
+            pass
+    return settings
+
+
+def save_settings(payload):
+    title = clean_label(payload.get("panelTitle", ""))[:64]
+    if not title:
+        raise ValueError("顶部标题不能为空")
+    atomic_write(SETTINGS_FILE, json.dumps({"panelTitle": title}, ensure_ascii=False) + "\n")
+
+
 def password_hash(password, salt=None):
     salt = salt or secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 160000)
@@ -602,7 +639,7 @@ def write_rules_file(path, rules):
     lip = local_ip()
     with open(path, "w", encoding="utf-8") as f:
         f.write("#!/usr/sbin/nft -f\n\n")
-        f.write("# WEB_META|3\n\n")
+        f.write("# WEB_META|4\n\n")
         f.write(f"define LOCAL_IP = {lip}\n\n")
         f.write(f"table ip {TABLE_NAME} {{\n")
         f.write("    chain prerouting {\n        type nat hook prerouting priority -100; policy accept;\n")
@@ -630,10 +667,10 @@ def write_rules_file(path, rules):
                 continue
             upload_marker = f"META_COUNTER_UPLOAD|{r['lport']}|{r['ip']}|{r['dport']}"
             download_marker = f"META_COUNTER_DOWNLOAD|{r['lport']}|{r['ip']}|{r['dport']}"
-            f.write(f"        ip daddr {r['ip']} tcp dport {r['dport']} ct status dnat counter comment \"{upload_marker}\"\n")
-            f.write(f"        ip daddr {r['ip']} udp dport {r['dport']} ct status dnat counter comment \"{upload_marker}\"\n")
-            f.write(f"        ip saddr {r['ip']} tcp sport {r['dport']} ct status dnat counter comment \"{download_marker}\"\n")
-            f.write(f"        ip saddr {r['ip']} udp sport {r['dport']} ct status dnat counter comment \"{download_marker}\"\n")
+            f.write(f"        ct original protocol tcp ct original proto-dst {r['lport']} ip daddr {r['ip']} tcp dport {r['dport']} ct status dnat counter comment \"{upload_marker}\"\n")
+            f.write(f"        ct original protocol udp ct original proto-dst {r['lport']} ip daddr {r['ip']} udp dport {r['dport']} ct status dnat counter comment \"{upload_marker}\"\n")
+            f.write(f"        ct original protocol tcp ct original proto-dst {r['lport']} ip saddr {r['ip']} tcp sport {r['dport']} ct status dnat counter comment \"{download_marker}\"\n")
+            f.write(f"        ct original protocol udp ct original proto-dst {r['lport']} ip saddr {r['ip']} udp sport {r['dport']} ct status dnat counter comment \"{download_marker}\"\n")
         f.write("    }\n}\n")
 
 
@@ -649,6 +686,10 @@ def write_rules(rules):
 
 
 def reload_rules():
+    try:
+        nft_counters()
+    except Exception:
+        pass
     run_nft(["flush", "table", "ip", TABLE_NAME])
     run_nft(["delete", "table", "ip", TABLE_NAME])
     res = run_nft(["-f", CONF_FILE], timeout=15)
@@ -679,7 +720,7 @@ def migrate_legacy_data():
     except OSError:
         return False
 
-    needs_migration = "WEB_META|3" not in text or 'comment "META_COUNTER_UPLOAD|' not in text
+    needs_migration = "WEB_META|4" not in text or 'comment "META_COUNTER_UPLOAD|' not in text
     if not needs_migration:
         return True
 
@@ -724,12 +765,34 @@ def hourly_history(delta):
     hours = {str(k): int(v) for k, v in hours.items() if int(k) >= now_hour - 23 * 3600}
     key = str(now_hour)
     hours[key] = int(hours.get(key, 0)) + max(0, int(delta))
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump({"hours": hours}, f)
+    atomic_write(HISTORY_FILE, json.dumps({"hours": hours}, ensure_ascii=False) + "\n")
     return [{"hour": stamp, "bytes": int(hours.get(str(stamp), 0))} for stamp in range(now_hour - 23 * 3600, now_hour + 1, 3600)]
 
 
-def nft_counters():
+def empty_counter():
+    return {"upload": {"packets": 0, "bytes": 0}, "download": {"packets": 0, "bytes": 0}}
+
+
+def nonnegative_int(value):
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_counter(value):
+    result = empty_counter()
+    if not isinstance(value, dict):
+        return result
+    for direction in ("upload", "download"):
+        source = value.get(direction, {})
+        if isinstance(source, dict):
+            result[direction]["packets"] = nonnegative_int(source.get("packets", 0))
+            result[direction]["bytes"] = nonnegative_int(source.get("bytes", 0))
+    return result
+
+
+def read_kernel_counters():
     out = run_nft(["list", "table", "ip", TABLE_NAME], timeout=2).stdout
     counters = {}
     current = None
@@ -742,31 +805,88 @@ def nft_counters():
         if current and direction and "counter packets" in line:
             m = re.search(r"counter packets (\d+) bytes (\d+)", line)
             if m:
-                item = counters.setdefault(current, {"upload": {"packets": 0, "bytes": 0}, "download": {"packets": 0, "bytes": 0}})[direction]
+                item = counters.setdefault(current, empty_counter())[direction]
                 item["packets"] += int(m.group(1))
                 item["bytes"] += int(m.group(2))
-    previous = {}
+    return counters
+
+
+def read_stats_state(current):
+    saved = {}
     if os.path.exists(STATS_FILE):
         try:
-            previous = json.load(open(STATS_FILE, encoding="utf-8"))
+            saved = json.load(open(STATS_FILE, encoding="utf-8"))
         except Exception:
-            previous = {}
-    now = int(time.time())
-    result = {}
-    delta_total = 0
-    for key, val in counters.items():
-        old = previous.get(key, {})
-        upload = val["upload"]["bytes"]
-        download = val["download"]["bytes"]
-        old_upload = int(old.get("upload", {}).get("bytes", upload))
-        old_download = int(old.get("download", {}).get("bytes", download))
-        delta_upload = upload - old_upload if upload >= old_upload else 0
-        delta_download = download - old_download if download >= old_download else 0
-        delta_total += delta_upload + delta_download
-        result[key] = {**val, "active": (delta_upload + delta_download) > 0, "sampled_at": now}
-    with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(counters, f)
-    return result, hourly_history(delta_total)
+            saved = {}
+    if isinstance(saved, dict) and saved.get("version") == 2:
+        saved_kernel = saved.get("lastKernel", {})
+        saved_totals = saved.get("totals", {})
+        saved_activity = saved.get("activity", {})
+        if not isinstance(saved_kernel, dict):
+            saved_kernel = {}
+        if not isinstance(saved_totals, dict):
+            saved_totals = {}
+        if not isinstance(saved_activity, dict):
+            saved_activity = {}
+        return {
+            "lastKernel": {key: normalize_counter(value) for key, value in saved_kernel.items()},
+            "totals": {key: normalize_counter(value) for key, value in saved_totals.items()},
+            "activity": {key: nonnegative_int(value) for key, value in saved_activity.items()},
+        }
+
+    # v1 only stored the previous kernel snapshot. Preserve it during upgrade,
+    # including a reset that may already have happened before v2 starts.
+    previous = saved if isinstance(saved, dict) else {}
+    totals = {}
+    for key in set(previous) | set(current):
+        old = normalize_counter(previous.get(key, {}))
+        now = normalize_counter(current.get(key, {}))
+        total = empty_counter()
+        for direction in ("upload", "download"):
+            for metric in ("packets", "bytes"):
+                old_value = old[direction][metric]
+                now_value = now[direction][metric]
+                total[direction][metric] = now_value if now_value >= old_value else old_value + now_value
+        totals[key] = total
+    return {"lastKernel": current, "totals": totals, "activity": {}}
+
+
+def nft_counters():
+    with STATS_LOCK, stats_file_lock():
+        current = read_kernel_counters()
+        state = read_stats_state(current)
+        previous = state["lastKernel"]
+        totals = state["totals"]
+        activity = state["activity"]
+        now = int(time.time())
+        result = {}
+        delta_total = 0
+        for key, val in current.items():
+            old = normalize_counter(previous.get(key, {}))
+            total = normalize_counter(totals.get(key, {}))
+            rule_delta = 0
+            for direction in ("upload", "download"):
+                for metric in ("packets", "bytes"):
+                    value = val[direction][metric]
+                    old_value = old[direction][metric]
+                    delta = value - old_value if value >= old_value else value
+                    total[direction][metric] += max(0, delta)
+                    if metric == "bytes":
+                        rule_delta += max(0, delta)
+                        delta_total += max(0, delta)
+            totals[key] = total
+            if rule_delta > 0:
+                activity[key] = now
+            result[key] = {**total, "active": now - int(activity.get(key, 0)) <= 60, "sampled_at": now}
+
+        # Disabled rules have no live nft counter but retain their accumulated traffic.
+        for key, total in totals.items():
+            if key not in result:
+                result[key] = {**normalize_counter(total), "active": False, "sampled_at": now}
+
+        payload = {"version": 2, "lastKernel": current, "totals": totals, "activity": activity, "updatedAt": now}
+        atomic_write(STATS_FILE, json.dumps(payload, ensure_ascii=False) + "\n")
+        return result, hourly_history(delta_total)
 
 
 def parse_port_tokens(tokens):
@@ -925,7 +1045,7 @@ def dashboard():
         total_bytes += both_bytes
         active += 1 if c.get("active") else 0
         enriched.append({**r, "targetAlias": aliases.get(r["ip"], ""), "uploadBytes": upload_bytes, "downloadBytes": download_bytes, "totalBytes": both_bytes, "bytes": selected_bytes, "active": c["active"]})
-    return {"targets": targets, "rules": enriched, "history": history, "firewall": {"ports": read_firewall_ports(), "baselinePorts": [item["port"] for item in firewall_baseline_ports()], "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
+    return {"targets": targets, "rules": enriched, "history": history, "settings": read_settings(), "firewall": {"ports": read_firewall_ports(), "baselinePorts": [item["port"] for item in firewall_baseline_ports()], "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
 
 
 HTML = r"""<!doctype html>
@@ -938,13 +1058,14 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-
 .app{display:flex;min-height:100vh}.side{width:238px;background:#020303;border-right:1px solid #2a2d35;padding:28px 16px;position:fixed;inset:0 auto 0 0}.brand{font-weight:800;font-size:18px;margin-bottom:2px}.ver{font-size:12px;color:var(--muted);margin-bottom:34px}.nav button{width:100%;text-align:left;margin:5px 0;background:transparent;color:#d9dde7}.nav button.active{background:#112846;color:#0b84ff}.foot{position:absolute;bottom:18px;color:#737b89;font-size:12px;left:70px}
 .main{margin-left:238px;flex:1}.top{height:54px;border-bottom:1px solid #2a2d35;display:flex;align-items:center;justify-content:flex-end;padding:0 26px}.user{font-weight:700}
 .content{padding:18px 24px 40px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.rules-toolbar{justify-content:flex-end}.rule-table-wrap{border:1px solid var(--line);border-radius:8px;overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.table tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.pill{display:inline-flex;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.metric.upload{color:#46a6ff}.metric.download{color:#20d98a}.metric.total{color:#b779ff}.actions{display:flex;align-items:center;gap:8px}.actions .switch{margin-right:12px}.actions button{padding:6px 10px;margin:0}.hidden{display:none!important}.view-switch{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}.view-switch button{border-radius:0;background:#17181c;padding:7px 11px}.view-switch button.active{background:#1d4d8a}.switch{position:relative;display:inline-flex;width:38px;height:22px;vertical-align:middle;flex:none}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#4a252a;border-radius:22px}.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}.switch input:checked+.slider{background:#16855b}.switch input:checked+.slider:before{transform:translateX(16px)}.rule-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.rule-card{border:1px solid var(--line);background:#111318;padding:14px;border-radius:8px}.rule-card.disabled{opacity:.6}.rule-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.rule-card h3{font-size:15px;margin:0 0 8px}.rule-card .route{color:#cdd4e0;margin:7px 0}.rule-card .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid #2a2d35;padding-top:10px;margin-top:10px}.rule-card .metrics span{font-size:12px}.rule-card .actions{margin-top:14px}.chart-svg{display:block;width:100%;height:280px}.chart-grid{stroke:#3c414d;stroke-dasharray:3 4}.chart-line{fill:none;stroke:#8e4cff;stroke-width:3}.chart-fill{fill:rgba(142,76,255,.14)}.chart-label{fill:#89919f;font-size:11px}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.firewall-check{display:flex!important;align-items:center;gap:9px;padding:11px 12px;border:1px solid #356aa0;border-radius:6px;background:rgba(8,119,255,.1);color:#dbeafe!important;cursor:pointer}.firewall-check input{width:16px!important;height:16px;margin:0;accent-color:var(--blue)}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}.probe-pill{display:inline-flex;align-items:center;gap:6px;min-width:96px;padding:4px 9px;border-radius:999px;background:rgba(142,150,163,.14);color:#aeb5c0;white-space:nowrap}.probe-pill i{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:probe-pulse 1.8s infinite}.probe-pill b{font-variant-numeric:tabular-nums}.probe-pill.good{background:rgba(29,219,120,.14);color:#58e69d}.probe-pill.warn{background:rgba(255,205,65,.15);color:#ffd262}.probe-pill.slow{background:rgba(255,159,26,.16);color:#ffae43}.probe-pill.bad{background:rgba(255,90,102,.16);color:#ff8791}.probe-pill.off{background:rgba(142,150,163,.12);color:#9aa2ae}.probe-pill.pending i{animation:none}@keyframes probe-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 0 4px transparent}}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:5}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog.rules-dialog{width:min(1240px,96vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{text-align:right}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.firewall-check{display:flex!important;align-items:center;gap:9px;padding:11px 12px;border:1px solid #356aa0;border-radius:6px;background:rgba(8,119,255,.1);color:#dbeafe!important;cursor:pointer}.firewall-check input{width:16px!important;height:16px;margin:0;accent-color:var(--blue)}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:9;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.count-button{padding:2px 8px;background:rgba(8,119,255,.14);color:#69adff;border:1px solid rgba(8,119,255,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}.probe-pill{display:inline-flex;align-items:center;gap:6px;min-width:96px;padding:4px 9px;border-radius:999px;background:rgba(142,150,163,.14);color:#aeb5c0;white-space:nowrap}.probe-pill i{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:probe-pulse 1.8s infinite}.probe-pill b{font-variant-numeric:tabular-nums}.probe-pill.good{background:rgba(29,219,120,.14);color:#58e69d}.probe-pill.warn{background:rgba(255,205,65,.15);color:#ffd262}.probe-pill.slow{background:rgba(255,159,26,.16);color:#ffae43}.probe-pill.bad{background:rgba(255,90,102,.16);color:#ff8791}.probe-pill.off{background:rgba(142,150,163,.12);color:#9aa2ae}.probe-pill.pending i{animation:none}@keyframes probe-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 0 4px transparent}}
 @media(max-width:900px){.side{position:static;width:100%}.app{display:block}.main{margin:0}.cards{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
 </style></head><body><div id="root"></div><script>
 const appRoot=document.getElementById('root');
 const authToken=()=>localStorage.getItem('nft_manager_token')||'';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
-let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',targetLatency:{},ruleConnectivity:{},autoProbeView:''};
+let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',targetLatency:{},ruleConnectivity:{},autoProbeView:'',publicTitle:'nft-manager'};
 const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
@@ -953,27 +1074,28 @@ function setModalError(text){let box=document.querySelector('.modal .error-box')
 function clearModalError(){let box=document.querySelector('.modal .error-box');if(box){box.textContent='';box.classList.remove('show')}}
 function expireSession(){localStorage.removeItem('nft_manager_token');state.data=null;login()}
 async function runAction(btn,fn){let old=btn?.textContent;if(btn){btn.disabled=true;btn.textContent='处理中...'}try{await fn()}catch(e){if(e.status===401)expireSession();else setModalError(msg(e))}finally{if(btn){btn.disabled=false;btn.textContent=old}}}
-function loading(){appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>正在加载...</p></form></div>`}
-function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>nft-manager</h2><p class=muted>默认账号 admin / admin</p><input name=u value=admin placeholder=账号><input name=p type=password value=admin placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
+function loading(){appRoot.innerHTML=`<div class=login><form><h2>${esc(state.publicTitle)}</h2><p class=muted>正在加载...</p></form></div>`}
+function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>${esc(state.publicTitle)}</h2><p class=muted>默认账号 admin / admin</p><input name=u value=admin placeholder=账号><input name=p type=password value=admin placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err))}finally{btn.disabled=false;btn.textContent=old}}
-async function load(){try{state.data=await api('/api/state');render();autoProbeCurrentView()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
+async function load(){try{state.data=await api('/api/state');document.title=state.data.settings?.panelTitle||'nft-manager';render();autoProbeCurrentView()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){if(state.view!==v)state.autoProbeView='';state.view=v;localStorage.setItem('nft_manager_view',v);render();autoProbeCurrentView()}
-function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['firewall','防火墙管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join('');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>nft-manager</div><div class=ver>v4.0</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
+function shell(content){let n=[['dash','仪表板'],['rules','转发管理'],['targets','主机管理'],['firewall','防火墙管理'],['settings','系统设置']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')">${x[1]}</button>`).join(''),title=esc(state.data.settings?.panelTitle||'nft-manager');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>${title}</div><div class=ver>v__WEB_PANEL_VERSION__</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function hourText(stamp){return String(new Date(stamp*1000).getHours()).padStart(2,'0')+':00'}
 function trafficChart(){let h=state.data.history||[],w=960,ht=250,p=34,max=Math.max(1,...h.map(x=>x.bytes)),pts=h.map((x,i)=>`${p+i*(w-p*2)/23},${ht-p-(x.bytes/max)*(ht-p*2)}`),area=`${p},${ht-p} ${pts.join(' ')} ${w-p},${ht-p}`,grid=[0,1,2,3,4].map(i=>{let y=p+i*(ht-p*2)/4;return `<line class=chart-grid x1=${p} y1=${y} x2=${w-p} y2=${y}/><text class=chart-label x=2 y=${y+4}>${fmt(max*(4-i)/4)}</text>`}).join(''),hours=h.map((x,i)=>i%3===0?`<text class=chart-label x=${p+i*(w-p*2)/23-10} y=${ht-6}>${hourText(x.hour)}</text>`:'').join('');return `<svg class=chart-svg viewBox="0 0 ${w} ${ht}" role="img"><g>${grid}</g><polygon class=chart-fill points="${area}"/><polyline class=chart-line points="${pts.join(' ')}"/>${hours}</svg>`}
 function render(){let d=state.data;if(state.view==='dash')return shell(`<div class=cards><div class=card><h3>总流量</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用流量</h3><div class=big>${fmt(d.stats.totalBytes)}</div><div class=bar></div></div><div class=card><h3>转发配额</h3><div class=big>无限制</div><div class=bar></div></div><div class=card><h3>已用转发</h3><div class=big>${d.stats.ruleCount}</div><div class=bar></div></div></div><div class=panel><h2>24小时流量统计</h2>${trafficChart()}</div><div class=panel><h2>转发配置 <span class=muted>${d.stats.ruleCount}</span></h2>${rulesTable(true)}</div>`);
  if(state.view==='rules')return shell(`<div class="toolbar rules-toolbar"><div class=view-switch><button class="${state.ruleView==='flat'?'active':''}" onclick="setRuleView('flat')">平铺</button><button class="${state.ruleView==='grid'?'active':''}" onclick="setRuleView('grid')">方块</button></div><button onclick="checkRuleConnectivity(this)">连通性检查</button><button class=primary onclick="openRule()">新增转发</button></div>${rulesTable(false)}`);
  if(state.view==='targets')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">主机管理</h2><button onclick="checkTargetLatency(this)">延迟检测</button><button class=primary onclick="openTarget()">新增主机</button></div>${targetsTable()}</div>`);
- if(state.view==='firewall')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">防火墙管理</h2><button onclick="syncFirewall(this)">同步转发端口</button><button class=primary onclick="openFirewall()">开放端口</button></div><p class=muted>默认拒绝入站连接，始终保留 SSH 22/tcp 与 Web 面板 5555/tcp。</p>${firewallTable()}</div>`);
- return shell(`<div class=panel><h2>系统设置</h2><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
+ if(state.view==='firewall')return shell(`<div class=panel><div class=toolbar><h2 style="margin-right:auto">防火墙管理</h2><button onclick="syncFirewall(this)">同步转发端口</button><button class=primary onclick="openFirewall()">开放端口</button></div><p class=muted>默认拒绝未列出的入站连接，始终保留当前 SSH 端口与 Web 面板 5555/tcp。</p>${firewallTable()}</div>`);
+ return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
 function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
 function ruleName(r){return r.alias||`${r.targetAlias||r.ip}:${r.lport}`}
 function ruleSwitch(r){return `<label class=switch title="${r.enabled?'关闭转发':'开启转发'}"><input type=checkbox ${r.enabled?'checked':''} onchange="toggleRule(${r.lport},this.checked)"><span class=slider></span></label>`}
 function ruleActions(r){return `<button onclick='openRule(${JSON.stringify(r)})'>编辑</button><button class=danger onclick="delRules([${r.lport}])">删除</button>`}
 function probePill(result,label){if(!result)return `<span class="probe-pill pending"><i></i>${label}<b>未检测</b></span>`;if(result.skipped)return `<span class="probe-pill off"><i></i>${label}<b>已关闭</b></span>`;if(!result.reachable)return `<span class="probe-pill bad"><i></i>${label}<b>不可达</b></span>`;let ms=Number(result.latency||0),level=ms<100?'good':ms<1000?'warn':'slow';return `<span class="probe-pill ${level}"><i></i>${label}<b>${ms.toFixed(ms<10?1:0)} ms</b></span>`}
-function rulesTable(limit){let rules=state.data.rules.slice(0,limit?8:9999);if(!limit&&state.ruleView==='grid'){let cards=rules.map(r=>`<article class="rule-card ${r.enabled?'':'disabled'}"><div class=rule-card-top><h3>${ruleName(r)}</h3>${ruleSwitch(r)}</div><div class=muted>${r.targetAlias||'-'} / ${r.ip}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div><p class="status ${r.active?'on':''}">状态：${r.enabled?(r.active?'活跃':'空闲'):'已关闭'}</p>${probePill(state.ruleConnectivity[r.lport],'连通性')}<div class=actions>${ruleActions(r)}</div></article>`).join('');return `<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}let rows=rules.map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${ruleName(r)}</td><td>${r.lport}</td><td>${r.dport}</td><td class="metric upload">${fmt(r.uploadBytes)}</td><td class="metric download">${fmt(r.downloadBytes)}</td><td class="metric total">${fmt(r.totalBytes)}</td><td>${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</td><td>${probePill(state.ruleConnectivity[r.lport],'连通性')}</td><td class="status ${r.active?'on':''}">${r.enabled?(r.active?'活跃':'空闲'):'关闭'}</td><td class=actions>${ruleSwitch(r)}${ruleActions(r)}</td></tr>`).join('');return `<div class=rule-table-wrap><table class=table><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>统计口径</th><th>连通性</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=11 class=muted>暂无转发</td></tr>'}</table></div>`}
-async function toggleRule(lport,enabled){try{await api('/api/rules/toggle',{method:'POST',body:JSON.stringify({lport,enabled}),timeout:30000});await load()}catch(e){toast(msg(e));await load()}}
-function targetsTable(){let counts={};state.data.rules.forEach(r=>counts[r.ip]=(counts[r.ip]||0)+1);let rows=state.data.targets.map(t=>`<tr><td>${t.alias}</td><td>${t.ip}</td><td>${probePill(state.targetLatency[t.ip],'延迟')}</td><td>${counts[t.ip]||0}</td><td class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`).join('');return `<table class=table><tr><th>别名</th><th>IP</th><th>延迟</th><th>规则数</th><th>操作</th></tr>${rows||'<tr><td colspan=5 class=muted>暂无主机</td></tr>'}</table>`}
+function rulesTable(limit,sourceRules=null){let rules=(sourceRules||state.data.rules).slice(0,limit?8:9999);if(!limit&&!sourceRules&&state.ruleView==='grid'){let cards=rules.map(r=>`<article class="rule-card ${r.enabled?'':'disabled'}"><div class=rule-card-top><h3>${ruleName(r)}</h3>${ruleSwitch(r)}</div><div class=muted>${r.targetAlias||'-'} / ${r.ip}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div><p class="status ${r.active?'on':''}">状态：${r.enabled?(r.active?'活跃':'空闲'):'已关闭'}</p>${probePill(state.ruleConnectivity[r.lport],'连通性')}<div class=actions>${ruleActions(r)}</div></article>`).join('');return `<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}let rows=rules.map(r=>`<tr><td>${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td>${ruleName(r)}</td><td>${r.lport}</td><td>${r.dport}</td><td class="metric upload">${fmt(r.uploadBytes)}</td><td class="metric download">${fmt(r.downloadBytes)}</td><td class="metric total">${fmt(r.totalBytes)}</td><td>${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</td><td>${probePill(state.ruleConnectivity[r.lport],'连通性')}</td><td class="status ${r.active?'on':''}">${r.enabled?(r.active?'活跃':'空闲'):'关闭'}</td><td class=actions>${ruleSwitch(r)}${ruleActions(r)}</td></tr>`).join('');return `<div class=rule-table-wrap><table class=table><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>统计口径</th><th>连通性</th><th>状态</th><th>操作</th></tr>${rows||'<tr><td colspan=11 class=muted>暂无转发</td></tr>'}</table></div>`}
+async function toggleRule(lport,enabled){try{await api('/api/rules/toggle',{method:'POST',body:JSON.stringify({lport,enabled}),timeout:30000});document.querySelector('.target-rules-layer')?.remove();await load()}catch(e){toast(msg(e));await load()}}
+function targetsTable(){let summary={};state.data.rules.forEach(r=>{let s=summary[r.ip]||(summary[r.ip]={count:0,upload:0,download:0,total:0});s.count++;s.upload+=r.uploadBytes||0;s.download+=r.downloadBytes||0;s.total+=r.totalBytes||0});let rows=state.data.targets.map(t=>{let s=summary[t.ip]||{count:0,upload:0,download:0,total:0};return `<tr><td>${t.alias}</td><td>${t.ip}</td><td>${probePill(state.targetLatency[t.ip],'延迟')}</td><td>${s.count?`<button class=count-button onclick='openTargetRules(${JSON.stringify(t)})'>${s.count}</button>`:'0'}</td><td class="metric upload">${fmt(s.upload)}</td><td class="metric download">${fmt(s.download)}</td><td class="metric total">${fmt(s.total)}</td><td class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`}).join('');return `<div class=rule-table-wrap><table class=table><tr><th>别名</th><th>IP</th><th>延迟</th><th>规则数</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>操作</th></tr>${rows||'<tr><td colspan=8 class=muted>暂无主机</td></tr>'}</table></div>`}
+function openTargetRules(t){let rules=state.data.rules.filter(r=>r.ip===t.ip),layer=modal(`<h2>${esc(t.alias)} 的转发规则</h2><p class=dialog-copy>${esc(t.ip)}，共 ${rules.length} 条</p>${rulesTable(false,rules)}<div class=dialog-actions style="margin-top:18px"><button class=primary data-close>关闭</button></div>`);layer.classList.add('target-rules-layer');layer.querySelector('.dialog').classList.add('rules-dialog');layer.querySelector('[data-close]').onclick=()=>layer.remove()}
 function firewallTable(){let ports=state.data.firewall?.ports||[],baseline=state.data.firewall?.baselinePorts||[],rows=ports.map(p=>{let locked=baseline.includes(p.port);return `<tr><td>${p.port}</td><td>${p.protocol}</td><td>${p.label||'-'}</td><td>${locked?'<span class=muted>保底端口</span>':`<button class=danger onclick="delFirewall(${p.port},'${p.protocol}')">关闭</button>`}</td></tr>`}).join('');return `<div class=rule-table-wrap><table class=table><tr><th>端口</th><th>协议</th><th>来源/说明</th><th>操作</th></tr>${rows||'<tr><td colspan=4 class=muted>防火墙尚未初始化</td></tr>'}</table></div>`}
 function openFirewall(){modal(`<h2>开放端口</h2><div class=grid><div class=field><label>端口</label><input id=fwPort placeholder="例如：8080"></div><div class=field><label>协议</label><select id=fwProtocol><option value=tcp+udp>TCP + UDP</option><option value=tcp>TCP</option><option value=udp>UDP</option></select></div></div><div class=field><label>说明</label><input id=fwLabel value="手动开放"></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveFirewall(this)">开放</button></div>`)}
 async function saveFirewall(btn){await runAction(btn,async()=>{await api('/api/firewall/add',{method:'POST',body:JSON.stringify({port:document.getElementById('fwPort').value,protocol:document.getElementById('fwProtocol').value,label:document.getElementById('fwLabel').value}),timeout:30000});document.querySelector('.modal').remove();await load()})}
@@ -990,14 +1112,16 @@ function confirmDialog(title,text,action){let layer=modal(`<h2>${title}</h2><p c
 document.addEventListener('keydown',e=>{let layers=document.querySelectorAll('.modal'),layer=layers[layers.length-1];if(!layer)return;if(e.key==='Escape'){e.preventDefault();layer.remove();return}if(e.key==='Enter'&&!e.shiftKey&&e.target.tagName!=='TEXTAREA'){let button=layer.querySelector('[data-confirm],button.primary');if(button&&!button.disabled){e.preventDefault();button.click()}}})
 function parsePorts(value){let ports=value.trim().split(/[ ,]+/).filter(Boolean);if(!ports.length)throw new Error('请至少输入一个入口端口');let seen=new Set;for(let port of ports){if(!/^[0-9]+$/.test(port)||Number(port)<1||Number(port)>65535)throw new Error(`端口无效: ${port}；仅支持单个端口，请用空格或英文逗号分隔`);if(seen.has(port))throw new Error(`端口重复: ${port}`);seen.add(port)}return ports}
 function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,stats=r?.statsMode||'total',opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join(''),firewallOption=r?'':`<div class=field><label class=firewall-check><input id=openFirewall type=checkbox checked>同时开放此端口</label></div>`;modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>统计口径</label><select id=statsMode><option value=upload ${stats==='upload'?'selected':''}>上传流量</option><option value=download ${stats==='download'?'selected':''}>下载流量</option><option value=total ${stats==='total'?'selected':''}>上传 + 下载总计</option></select></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div>${firewallOption}<div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="saveRule(this)">保存</button></div>`)}
-async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),open=document.getElementById('openFirewall'),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value,openFirewall:open?open.checked:true};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});document.querySelector('.modal').remove();await load()})}
-function delRules(lports){let layer=modal(`<h2>删除转发</h2><p class=dialog-copy>确认删除该端口转发？</p><label class=firewall-check><input id=closeFirewall type=checkbox checked>删除后同时关闭此端口</label><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>删除</button></div>`);layer.querySelector('[data-cancel]').onclick=()=>layer.remove();layer.querySelector('[data-confirm]').onclick=async e=>{await runAction(e.currentTarget,async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports,closeFirewall:layer.querySelector('#closeFirewall').checked}),timeout:30000});layer.remove();await load()})}}
+async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),open=document.getElementById('openFirewall'),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value,openFirewall:open?open.checked:true};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});btn.closest('.modal')?.remove();document.querySelector('.target-rules-layer')?.remove();await load()})}
+function delRules(lports){let layer=modal(`<h2>删除转发</h2><p class=dialog-copy>确认删除该端口转发？</p><label class=firewall-check><input id=closeFirewall type=checkbox checked>删除后同时关闭此端口</label><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>删除</button></div>`);layer.querySelector('[data-cancel]').onclick=()=>layer.remove();layer.querySelector('[data-confirm]').onclick=async e=>{await runAction(e.currentTarget,async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports,closeFirewall:layer.querySelector('#closeFirewall').checked}),timeout:30000});layer.remove();document.querySelector('.target-rules-layer')?.remove();await load()})}}
 function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP</label><input id=tip value="${t?.ip||''}"></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
 async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});document.querySelector('.modal').remove();await load()})}
 function delTarget(t){confirmDialog('删除主机','确认删除该主机？存在转发规则时将阻止删除。',async()=>{await api('/api/targets/delete',{method:'POST',body:JSON.stringify({ip:t.ip}),timeout:30000});await load()})}
+async function savePanelTitle(btn){await runAction(btn,async()=>{await api('/api/settings',{method:'POST',body:JSON.stringify({panelTitle:document.getElementById('panelTitle').value})});await load();toast('顶部标题已保存')})}
 function openPassword(){modal(`<h2>修改密码</h2><div class=field><label>旧密码</label><input id=oldp type=password></div><div class=field><label>新密码</label><input id=newp type=password></div><div style="text-align:right"><button class=ghost onclick="this.closest('.modal').remove()">取消</button> <button class=primary onclick="chgPwd(this)">保存</button></div>`)}
 async function chgPwd(btn){await runAction(btn,async()=>{await api('/api/password',{method:'POST',body:JSON.stringify({oldPassword:document.getElementById('oldp').value,newPassword:document.getElementById('newp').value})});document.querySelector('.modal').remove();expireSession();toast('密码已修改，请使用新密码重新登录')})}
-if(authToken()){loading();load()}else login();
+async function boot(){try{let publicSettings=await api('/api/public-settings');state.publicTitle=publicSettings.panelTitle||'nft-manager';document.title=state.publicTitle}catch(e){}if(authToken()){loading();load()}else login()}
+boot();
 setInterval(()=>{if(state.data&&authToken())load()},10000);
 </script></body></html>"""
 
@@ -1031,12 +1155,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/api/public-settings":
+            self.send_json(read_settings())
+            return
         if path == "/api/state":
             if not self.require():
                 return
             self.send_json(dashboard())
             return
-        raw = HTML.encode()
+        raw = HTML.replace("__WEB_PANEL_VERSION__", WEB_PANEL_VERSION).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
@@ -1064,6 +1191,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/password":
                 set_password(data.get("oldPassword", ""), data.get("newPassword", ""))
+            elif path == "/api/settings":
+                save_settings(data)
             elif path == "/api/targets/save":
                 targets = read_targets()
                 alias, ip, old = clean_label(data.get("alias")), data.get("ip", ""), data.get("oldIp")
@@ -1121,8 +1250,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(e)}, 400)
 
 
+def traffic_sampler_loop():
+    while True:
+        time.sleep(30)
+        try:
+            nft_counters()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     ensure_auth()
+    if "--snapshot-traffic" in sys.argv:
+        nft_counters()
+        raise SystemExit(0)
     migration_ok = migrate_legacy_data()
     if "--firewall-list" in sys.argv:
         print(json.dumps({"ports": read_firewall_ports(), "enabled": os.path.exists(FIREWALL_CONF)}, ensure_ascii=False))
@@ -1180,5 +1321,10 @@ if __name__ == "__main__":
         ensure_firewall_configuration()
     except Exception as e:
         print(f"nft-manager: 防火墙初始化失败，Web 面板继续启动：{e}")
+    try:
+        nft_counters()
+    except Exception as e:
+        print(f"nft-manager: 流量统计初始化失败，Web 面板继续启动：{e}")
+    threading.Thread(target=traffic_sampler_loop, daemon=True).start()
     print(f"nft-manager web listening on {HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
