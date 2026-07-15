@@ -192,7 +192,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 /root/nft-manager-main.zip
 ```
 
-执行 `nft`，选择 `10) 从 /root/nft-manager-main.zip 离线更新`。脚本只会在 `/tmp` 创建随机临时目录进行解压，不会生成 `/root/nft-manager-main`；校验并部署成功后会删除临时目录和 ZIP，同时保留空的 `/root/nft-manager-update` 目录。校验失败时不会修改现有运行文件；部署失败时会尝试恢复服务并保留 ZIP，供排查或重试。该入口不影响 `2) 更新脚本` 的在线更新流程。
+执行 `nft`，选择 `10) 从 /root/nft-manager-main.zip 离线更新`。脚本只会在 `/tmp` 创建随机临时目录进行解压，不会生成 `/root/nft-manager-main`；校验并部署成功后会删除临时目录和 ZIP，同时保留空的 `/root/nft-manager-update` 目录，并立即切换到新版菜单。校验失败时不会修改现有运行文件；部署失败时会尝试恢复服务并保留 ZIP，供排查或重试。该入口不影响 `2) 更新脚本` 的在线更新流程。
 
 也可以不使用 ZIP，将完整项目中的以下内容上传到固定暂存目录：
 

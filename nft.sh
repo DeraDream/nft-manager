@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.18
+# nftables 端口转发管理工具 v3.19
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.18"
-WEB_PANEL_VERSION="3.18"
+SCRIPT_VERSION="3.19"
+WEB_PANEL_VERSION="3.19"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -1749,7 +1749,12 @@ do_offline_zip_update() {
     if bash "$staged_script" --offline-redeploy; then
         rm -f "${OFFLINE_ZIP_FILE}" 2>/dev/null || warn "更新成功，但无法删除 ${OFFLINE_ZIP_FILE}"
         info "离线更新包已删除。"
-        return 0
+        if [[ -x "${SCRIPT_INSTALL_FILE}" ]]; then
+            info "正在进入新版菜单..."
+            exec "${SCRIPT_INSTALL_FILE}"
+        fi
+        err "新版脚本不存在或不可执行: ${SCRIPT_INSTALL_FILE}"
+        return 1
     fi
 
     err "离线更新失败，ZIP 已保留: ${OFFLINE_ZIP_FILE}"
