@@ -39,13 +39,23 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.24"
+WEB_PANEL_VERSION = "3.25"
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 BANDWIDTH_LOCK = threading.Lock()
-BANDWIDTH_STATE = {"interface": "", "timestamp": 0.0, "rx": 0, "tx": 0, "downloadMbps": 0.0, "uploadMbps": 0.0}
+BANDWIDTH_STATE = {
+    "interface": "",
+    "timestamp": 0.0,
+    "rx": 0,
+    "tx": 0,
+    "forwardCounters": {},
+    "forwardCountersAvailable": False,
+    "downloadMbps": 0.0,
+    "uploadMbps": 0.0,
+}
 BANDWIDTH_RETENTION = 24 * 60 * 60
 BANDWIDTH_SAMPLE_INTERVAL = 10
+BANDWIDTH_SCHEMA_VERSION = "2"
 DEFAULT_PANEL_TITLE = "nft-manager"
 DEFAULT_DASHBOARD_POLL_SECONDS = 10
 
@@ -842,6 +852,16 @@ def bandwidth_connection():
         "CREATE TABLE IF NOT EXISTS samples ("
         "timestamp INTEGER PRIMARY KEY, download_mbps REAL NOT NULL, upload_mbps REAL NOT NULL)"
     )
+    connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    row = connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
+    if not row or row[0] != BANDWIDTH_SCHEMA_VERSION:
+        # v1 used raw interface RX/TX. Forwarded packets cross the same physical
+        # interface twice, so its upload/download history cannot be converted.
+        connection.execute("DELETE FROM samples")
+        connection.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
+            (BANDWIDTH_SCHEMA_VERSION,),
+        )
     return connection
 
 
@@ -860,17 +880,53 @@ def bandwidth_history(connection, now):
     ]
 
 
+def forwarding_byte_deltas(previous, current):
+    deltas = {"upload": 0, "download": 0}
+    previous = previous if isinstance(previous, dict) else {}
+    current = current if isinstance(current, dict) else {}
+    for key, value in current.items():
+        old_value = previous.get(key, {})
+        for direction in ("upload", "download"):
+            now_bytes = nonnegative_int((value.get(direction, {}) if isinstance(value, dict) else {}).get("bytes", 0))
+            old_bytes = nonnegative_int((old_value.get(direction, {}) if isinstance(old_value, dict) else {}).get("bytes", 0))
+            # nftables counters return to zero when rules are reloaded. Treat the
+            # new value as the post-reset delta instead of producing a negative rate.
+            deltas[direction] += now_bytes - old_bytes if now_bytes >= old_bytes else now_bytes
+    return deltas
+
+
+def classify_bandwidth_bytes(rx_delta, tx_delta, forward_upload_delta, forward_download_delta):
+    rx_delta = nonnegative_int(rx_delta)
+    tx_delta = nonnegative_int(tx_delta)
+    forward_upload_delta = nonnegative_int(forward_upload_delta)
+    forward_download_delta = nonnegative_int(forward_download_delta)
+    forwarded_total = forward_upload_delta + forward_download_delta
+
+    # A forwarded packet is counted once on RX and once on TX by a single-NIC
+    # gateway. Remove that duplicated aggregate, then add each nftables direction
+    # back to the matching client-facing download/upload side. Any remaining bytes
+    # are traffic generated or consumed by the server itself.
+    local_download_delta = max(0, rx_delta - forwarded_total)
+    local_upload_delta = max(0, tx_delta - forwarded_total)
+    return (
+        local_download_delta + forward_download_delta,
+        local_upload_delta + forward_upload_delta,
+    )
+
+
 def bandwidth_snapshot():
-    now = time.time()
     interface = default_network_interface()
     if not interface:
+        now = time.time()
         return {"available": False, "interface": "", "downloadMbps": 0.0, "uploadMbps": 0.0, "sampledAt": int(now), "history": []}
-    try:
-        rx_bytes, tx_bytes = interface_byte_counters(interface)
-    except (OSError, ValueError):
-        return {"available": False, "interface": interface, "downloadMbps": 0.0, "uploadMbps": 0.0, "sampledAt": int(now), "history": []}
 
     with BANDWIDTH_LOCK:
+        now = time.time()
+        try:
+            rx_bytes, tx_bytes = interface_byte_counters(interface)
+        except (OSError, ValueError):
+            return {"available": False, "interface": interface, "downloadMbps": 0.0, "uploadMbps": 0.0, "sampledAt": int(now), "history": []}
+        forward_available, forward_counters = read_kernel_counters_with_status()
         previous = dict(BANDWIDTH_STATE)
         elapsed = now - float(previous.get("timestamp", 0) or 0)
         valid_delta = (
@@ -882,11 +938,34 @@ def bandwidth_snapshot():
         download_mbps = float(previous.get("downloadMbps", 0.0))
         upload_mbps = float(previous.get("uploadMbps", 0.0))
         if valid_delta:
-            download_mbps = (rx_bytes - int(previous["rx"])) * 8 / elapsed / 1_000_000
-            upload_mbps = (tx_bytes - int(previous["tx"])) * 8 / elapsed / 1_000_000
+            rx_delta = rx_bytes - int(previous["rx"])
+            tx_delta = tx_bytes - int(previous["tx"])
+            if forward_available and previous.get("forwardCountersAvailable"):
+                forward_deltas = forwarding_byte_deltas(previous.get("forwardCounters", {}), forward_counters)
+                download_delta, upload_delta = classify_bandwidth_bytes(
+                    rx_delta,
+                    tx_delta,
+                    forward_deltas["upload"],
+                    forward_deltas["download"],
+                )
+            else:
+                # Keep monitoring available when nftables counters cannot be read.
+                # The next successful read establishes a fresh correction baseline.
+                download_delta, upload_delta = rx_delta, tx_delta
+            download_mbps = download_delta * 8 / elapsed / 1_000_000
+            upload_mbps = upload_delta * 8 / elapsed / 1_000_000
 
         BANDWIDTH_STATE.update(
-            {"interface": interface, "timestamp": now, "rx": rx_bytes, "tx": tx_bytes, "downloadMbps": download_mbps, "uploadMbps": upload_mbps}
+            {
+                "interface": interface,
+                "timestamp": now,
+                "rx": rx_bytes,
+                "tx": tx_bytes,
+                "forwardCounters": forward_counters if forward_available else {},
+                "forwardCountersAvailable": forward_available,
+                "downloadMbps": download_mbps,
+                "uploadMbps": upload_mbps,
+            }
         )
         history = []
         try:
@@ -934,8 +1013,7 @@ def normalize_counter(value):
     return result
 
 
-def read_kernel_counters():
-    out = run_nft(["list", "table", "ip", TABLE_NAME], timeout=2).stdout
+def parse_kernel_counters(out):
     counters = {}
     current = None
     direction = None
@@ -950,6 +1028,18 @@ def read_kernel_counters():
                 item = counters.setdefault(current, empty_counter())[direction]
                 item["packets"] += int(m.group(1))
                 item["bytes"] += int(m.group(2))
+    return counters
+
+
+def read_kernel_counters_with_status():
+    result = run_nft(["list", "table", "ip", TABLE_NAME], timeout=2)
+    if result.returncode != 0:
+        return False, {}
+    return True, parse_kernel_counters(result.stdout)
+
+
+def read_kernel_counters():
+    _, counters = read_kernel_counters_with_status()
     return counters
 
 

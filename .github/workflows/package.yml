@@ -1,0 +1,78 @@
+name: Package
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build release archives
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate sources and versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          script_version="$(sed -nE 's/^SCRIPT_VERSION="([^"]+)".*/\1/p' nft.sh | head -1)"
+          web_version="$(sed -nE 's/^WEB_PANEL_VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' web_panel.py | head -1)"
+          installer_version="$(sed -nE 's/^INSTALLER_VERSION="([^"]+)".*/\1/p' install.sh | head -1)"
+
+          if [[ -z "$script_version" || "$script_version" != "$web_version" || "$script_version" != "$installer_version" ]]; then
+            echo "Version mismatch: script=${script_version:-missing}, web=${web_version:-missing}, installer=${installer_version:-missing}" >&2
+            exit 1
+          fi
+
+          bash -n nft.sh install.sh
+          python3 -m py_compile web_panel.py
+          python3 - <<'PY'
+          import web_panel
+
+          assert web_panel.classify_bandwidth_bytes(850, 850, 10, 840) == (840, 10)
+          assert web_panel.classify_bandwidth_bytes(1000, 900, 100, 700) == (900, 200)
+          assert web_panel.forwarding_byte_deltas(
+              {"rule": {"upload": {"bytes": 100}, "download": {"bytes": 200}}},
+              {"rule": {"upload": {"bytes": 150}, "download": {"bytes": 50}}},
+          ) == {"upload": 50, "download": 50}
+          PY
+          printf 'PACKAGE_NAME=nft-manager-v%s\n' "$script_version" >> "$GITHUB_ENV"
+
+      - name: Build ZIP and TAR.GZ packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          package_dir="dist/${PACKAGE_NAME}"
+          mkdir -p "$package_dir"
+          install -m 0644 README.md web_panel.py "$package_dir/"
+          install -m 0755 install.sh nft.sh "$package_dir/"
+          cp -a vendor "$package_dir/"
+
+          tar -C dist -czf "dist/${PACKAGE_NAME}.tar.gz" "$PACKAGE_NAME"
+          (
+            cd dist
+            zip -qr "${PACKAGE_NAME}.zip" "$PACKAGE_NAME"
+            sha256sum "${PACKAGE_NAME}.zip" "${PACKAGE_NAME}.tar.gz" > SHA256SUMS
+          )
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            dist/${{ env.PACKAGE_NAME }}.zip
+            dist/${{ env.PACKAGE_NAME }}.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
