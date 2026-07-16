@@ -164,6 +164,8 @@ admin / admin
 
 ## 配置更新源
 
+更新检查会校验脚本内容和版本号，并在当前配置源、GitHub Raw、GitHub API 和 jsDelivr 之间自动回退；选择更新时会优先复用菜单已经校验的新版文件。
+
 如果需要使用菜单里的更新功能，请将 GitHub Raw 地址写入：
 
 ```bash
@@ -261,7 +263,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 - 脚本写入的 sysctl 配置
 - 脚本写入的 logrotate 配置
 
-卸载过程中会询问是否清空当前全部 nftables 运行规则。脚本不会卸载系统的 `nftables` 软件包。
+卸载只需在唯一一次 `[y/N]` 确认中输入 `y`，回车或其他输入均取消。脚本会删除本项目创建的运行规则，保留其他 nftables 规则，也不会卸载系统的 `nftables` 软件包。
 
 ## 注意
 

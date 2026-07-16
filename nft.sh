@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.28
+# nftables 端口转发管理工具 v3.29
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.28"
-WEB_PANEL_VERSION="3.28"
+SCRIPT_VERSION="3.29"
+WEB_PANEL_VERSION="3.29"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -44,13 +44,25 @@ WEB_SERVICE_NAME="nft-manager-web.service"
 WEB_SERVICE_FILE="/etc/systemd/system/${WEB_SERVICE_NAME}"
 DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/DeraDream/nft-manager/main/nft.sh"
 FALLBACK_UPDATE_URL="https://cdn.jsdelivr.net/gh/DeraDream/nft-manager@main/nft.sh"
+GITHUB_API_CONTENT_BASE="https://api.github.com/repos/DeraDream/nft-manager/contents"
+GITHUB_API_UPDATE_URL="${GITHUB_API_CONTENT_BASE}/nft.sh?ref=main"
 UPDATE_URL="${NFT_FORWARD_UPDATE_URL:-$DEFAULT_UPDATE_URL}"
 UPDATE_DOWNLOADED_URL=""
+UPDATE_CACHE_FILE=""
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
 UPDATE_CHECKED=false
 UPDATE_AVAILABLE=false
 UPDATE_REMOTE_VERSION=""
 UPDATE_STATUS_TEXT="未检查"
+
+clear_update_cache() {
+    if [[ -n "${UPDATE_CACHE_FILE:-}" ]]; then
+        rm -f "${UPDATE_CACHE_FILE}" 2>/dev/null || true
+    fi
+    UPDATE_CACHE_FILE=""
+}
+
+trap clear_update_cache EXIT
 
 resolve_nft_bin() {
     local bin
@@ -925,13 +937,17 @@ check_firewall_status() {
 
 # ============== 更新检查 / 在线更新 ==============
 load_update_url() {
+    local configured_url=""
     if [[ -n "${NFT_FORWARD_UPDATE_URL:-}" ]]; then
         printf '%s' "$NFT_FORWARD_UPDATE_URL"
         return
     fi
     if [[ -f "$UPDATE_URL_FILE" ]]; then
-        sed -nE '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d; 1p' "$UPDATE_URL_FILE" 2>/dev/null
-        return
+        configured_url=$(sed -nE '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d; 1p' "$UPDATE_URL_FILE" 2>/dev/null || true)
+        if [[ -n "$configured_url" ]]; then
+            printf '%s' "$configured_url"
+            return
+        fi
     fi
     printf '%s' "$DEFAULT_UPDATE_URL"
 }
@@ -955,27 +971,59 @@ version_gt() {
 }
 
 download_update_script() {
-    local dest="$1" requested_url source_url
+    local dest="$1" timeout="${2:-12}" retries="${3:-1}" verification_timeout="${4:-${2:-12}}"
+    local requested_url candidate candidate_file remote_version
+    local candidate_timeout candidate_retries
+    local best_version="" best_url="" tried=$'\n'
     requested_url=$(load_update_url)
     if [[ -z "$requested_url" ]]; then
         return 2
     fi
 
-    # 按当前配置源、GitHub Raw、jsDelivr 顺序尝试。每个源都要通过脚本校验，
-    # 防止代理返回 HTML 错误页后被误判为下载成功。
-    local -a candidates=("$requested_url" "$DEFAULT_UPDATE_URL" "$FALLBACK_UPDATE_URL")
-    local candidate
+    # 配置源可能存在 CDN 缓存：若它返回的版本不比本地新，继续核对
+    # GitHub Raw/API。每个候选文件都必须通过 shebang、版本号和 Bash 语法校验。
+    local -a candidates=("$requested_url" "$DEFAULT_UPDATE_URL" "$GITHUB_API_UPDATE_URL" "$FALLBACK_UPDATE_URL")
+    candidate_file="${dest}.candidate.$$"
+    rm -f "$dest" "$candidate_file" 2>/dev/null || true
+
     for candidate in "${candidates[@]}"; do
         [[ -n "$candidate" ]] || continue
-        [[ "$candidate" == "$source_url" ]] && continue
-        source_url="$candidate"
-        if download_remote_file "$source_url" "$dest" 8 && is_valid_update_script "$dest"; then
-            UPDATE_URL="$source_url"
-            UPDATE_DOWNLOADED_URL="$source_url"
-            return 0
+        [[ "$tried" == *$'\n'"${candidate}"$'\n'* ]] && continue
+        tried+="${candidate}"$'\n'
+        rm -f "$candidate_file" 2>/dev/null || true
+
+        candidate_timeout="$timeout"
+        candidate_retries="$retries"
+        if [[ -n "$best_version" ]] && ! version_gt "$best_version" "$SCRIPT_VERSION" && (( verification_timeout < timeout )); then
+            candidate_timeout="$verification_timeout"
+            candidate_retries=0
         fi
-        rm -f "$dest" 2>/dev/null || true
+
+        if download_remote_file "$candidate" "$candidate_file" "$candidate_timeout" "$candidate_retries" && is_valid_update_script "$candidate_file"; then
+            remote_version=$(extract_script_version "$candidate_file")
+            if [[ -z "$best_version" ]] || version_gt "$remote_version" "$best_version"; then
+                cp -f "$candidate_file" "$dest" 2>/dev/null || continue
+                best_version="$remote_version"
+                best_url="$candidate"
+            fi
+
+            # 任意源发现新版即可使用；Raw/API 是权威源，有效时无需再等待 CDN。
+            if version_gt "$remote_version" "$SCRIPT_VERSION" || [[ "$candidate" == "$DEFAULT_UPDATE_URL" || "$candidate" == "$GITHUB_API_UPDATE_URL" ]]; then
+                rm -f "$candidate_file" 2>/dev/null || true
+                UPDATE_URL="$best_url"
+                UPDATE_DOWNLOADED_URL="$best_url"
+                return 0
+            fi
+        fi
     done
+
+    rm -f "$candidate_file" 2>/dev/null || true
+    if [[ -n "$best_version" && -s "$dest" ]]; then
+        UPDATE_URL="$best_url"
+        UPDATE_DOWNLOADED_URL="$best_url"
+        return 0
+    fi
+    rm -f "$dest" 2>/dev/null || true
     return 1
 }
 
@@ -998,12 +1046,29 @@ cache_busted_url() {
 }
 
 download_remote_file() {
-    local source_url="$1" dest="$2" timeout="${3:-30}" request_url
+    local source_url="$1" dest="$2" timeout="${3:-30}" retries="${4:-1}" request_url
+    local api_request=false
     request_url=$(cache_busted_url "$source_url")
+    [[ "${source_url%%\?*}" == "${GITHUB_API_CONTENT_BASE}/"* ]] && api_request=true
+
     if command -v curl &>/dev/null; then
-        curl -fsSL --retry 0 --connect-timeout 3 --max-time "$timeout" "$request_url" -o "$dest"
+        local -a curl_args=(-fsSL --connect-timeout 5 --max-time "$timeout" --retry "$retries" --retry-delay 1)
+        if (( retries > 0 )); then
+            if curl --help all 2>/dev/null | grep -q -- '--retry-max-time'; then
+                curl_args+=(--retry-max-time "$timeout")
+            fi
+            if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+                curl_args+=(--retry-all-errors)
+            else
+                curl_args+=(--retry-connrefused)
+            fi
+        fi
+        [[ "$api_request" == "true" ]] && curl_args+=(-H 'Accept: application/vnd.github.raw+json')
+        curl "${curl_args[@]}" "$request_url" -o "$dest"
     elif command -v wget &>/dev/null; then
-        wget -q --tries=1 --timeout="$timeout" -O "$dest" "$request_url"
+        local -a wget_args=(-q "--tries=$((retries + 1))" "--timeout=${timeout}")
+        [[ "$api_request" == "true" ]] && wget_args+=(--header='Accept: application/vnd.github.raw+json')
+        wget "${wget_args[@]}" -O "$dest" "$request_url"
     else
         return 3
     fi
@@ -1020,6 +1085,10 @@ load_web_panel_url() {
     [[ -n "$update_url" ]] || update_url=$(load_update_url)
     update_base="${update_url%%\?*}"
     update_query="${update_url#*\?}"
+    if [[ "$update_base" == "${GITHUB_API_CONTENT_BASE}/nft.sh" ]]; then
+        printf '%s' "${GITHUB_API_CONTENT_BASE}/web_panel.py?ref=main"
+        return
+    fi
     if [[ "$update_base" == */nft.sh ]]; then
         if [[ "$update_url" == *\?* ]]; then
             printf '%s?%s' "${update_base%/nft.sh}/web_panel.py" "$update_query"
@@ -1042,6 +1111,7 @@ check_update_status() {
     UPDATE_AVAILABLE=false
     UPDATE_REMOTE_VERSION=""
     UPDATE_URL=$(load_update_url)
+    clear_update_cache
 
     if [[ -z "$UPDATE_URL" ]]; then
         UPDATE_STATUS_TEXT="未配置更新源"
@@ -1050,20 +1120,20 @@ check_update_status() {
 
     local tmp_file remote_version
     tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-forward-update.$$") || true
-    if ! download_update_script "$tmp_file" >/dev/null 2>&1; then
+    if ! download_update_script "$tmp_file" 12 1 5 >/dev/null 2>&1; then
         rm -f "$tmp_file" 2>/dev/null || true
         UPDATE_STATUS_TEXT="检查失败"
         return
     fi
 
     remote_version=$(extract_script_version "$tmp_file")
-    rm -f "$tmp_file" 2>/dev/null || true
-
     if [[ -z "$remote_version" ]]; then
+        rm -f "$tmp_file" 2>/dev/null || true
         UPDATE_STATUS_TEXT="远程版本无效"
         return
     fi
 
+    UPDATE_CACHE_FILE="$tmp_file"
     UPDATE_REMOTE_VERSION="$remote_version"
     if version_gt "$remote_version" "$SCRIPT_VERSION"; then
         UPDATE_AVAILABLE=true
@@ -1085,12 +1155,19 @@ do_update() {
     info "当前版本: v${SCRIPT_VERSION}"
     info "更新源: ${UPDATE_URL}"
 
-    local tmp_file remote_version install_target
-    tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-forward-update.$$") || true
-    if ! download_update_script "$tmp_file"; then
-        rm -f "$tmp_file" 2>/dev/null || true
-        err "下载更新失败，请检查网络或 UPDATE_URL。"
-        return
+    local tmp_file="" remote_version install_target
+    if [[ -n "${UPDATE_CACHE_FILE:-}" ]] && is_valid_update_script "$UPDATE_CACHE_FILE"; then
+        tmp_file="$UPDATE_CACHE_FILE"
+        UPDATE_CACHE_FILE=""
+    else
+        clear_update_cache
+        tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-forward-update.$$") || true
+        if ! download_update_script "$tmp_file" 30 2; then
+            rm -f "$tmp_file" 2>/dev/null || true
+            UPDATE_STATUS_TEXT="检查失败"
+            err "下载更新失败，已重试 GitHub Raw、GitHub API 和 jsDelivr。"
+            return
+        fi
     fi
 
     remote_version=$(extract_script_version "$tmp_file")
@@ -1106,9 +1183,16 @@ do_update() {
         return
     fi
 
+    UPDATE_CHECKED=true
+    UPDATE_REMOTE_VERSION="$remote_version"
+
     if version_gt "$remote_version" "$SCRIPT_VERSION"; then
+        UPDATE_AVAILABLE=true
+        UPDATE_STATUS_TEXT="可升级到 v${remote_version}"
         info "发现新版本: v${remote_version}"
     elif [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+        UPDATE_AVAILABLE=false
+        UPDATE_STATUS_TEXT="已是最新"
         info "当前已是最新版本，未执行更新。"
         rm -f "$tmp_file" 2>/dev/null || true
         return
@@ -1176,6 +1260,41 @@ web_panel_version() {
 web_panel_needs_sync() {
     [[ ! -x "${WEB_PANEL_FILE}" ]] && return 0
     [[ "$(web_panel_version "${WEB_PANEL_FILE}")" != "${WEB_PANEL_VERSION}" ]]
+}
+
+is_valid_web_panel_release() {
+    local file="$1"
+    [[ -s "$file" ]] || return 1
+    command -v python3 &>/dev/null || return 1
+    python3 -m py_compile "$file" >/dev/null 2>&1 || return 1
+    [[ "$(web_panel_version "$file")" == "$WEB_PANEL_VERSION" ]]
+}
+
+download_web_panel_release() {
+    local dest="$1" requested_url candidate candidate_file tried=$'\n'
+    requested_url=$(load_web_panel_url)
+    local -a candidates=(
+        "$requested_url"
+        "${DEFAULT_UPDATE_URL%/nft.sh}/web_panel.py"
+        "${GITHUB_API_CONTENT_BASE}/web_panel.py?ref=main"
+        "${FALLBACK_UPDATE_URL%/nft.sh}/web_panel.py"
+    )
+    candidate_file="${dest}.candidate.$$"
+    rm -f "$dest" "$candidate_file" 2>/dev/null || true
+
+    for candidate in "${candidates[@]}"; do
+        [[ -n "$candidate" ]] || continue
+        [[ "$tried" == *$'\n'"${candidate}"$'\n'* ]] && continue
+        tried+="${candidate}"$'\n'
+        rm -f "$candidate_file" 2>/dev/null || true
+        if download_remote_file "$candidate" "$candidate_file" 30 2 && is_valid_web_panel_release "$candidate_file"; then
+            mv -f "$candidate_file" "$dest" 2>/dev/null || return 1
+            return 0
+        fi
+    done
+
+    rm -f "$dest" "$candidate_file" 2>/dev/null || true
+    return 1
 }
 
 is_manager_global_command() {
@@ -1325,7 +1444,7 @@ install_web_panel_file() {
         return 1
     }
 
-    local source_dir tmp_file web_panel_url
+    local source_dir tmp_file
     source_dir="$(dirname "${SCRIPT_PATH}")"
     if [[ "$force_download" != "force" && -f "${source_dir}/web_panel.py" ]]; then
         if ! python3 -m py_compile "${source_dir}/web_panel.py" >/dev/null 2>&1; then
@@ -1344,16 +1463,15 @@ install_web_panel_file() {
     fi
 
     tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-manager-web.$$") || true
-    web_panel_url=$(load_web_panel_url)
-    if ! download_remote_file "$web_panel_url" "$tmp_file" 30; then
+    if ! download_web_panel_release "$tmp_file"; then
         rm -f "$tmp_file" 2>/dev/null || true
-        err "下载 Web 面板失败: ${web_panel_url}"
+        err "无法下载与 v${WEB_PANEL_VERSION} 匹配的 Web 面板文件。"
         return 1
     fi
 
-    if ! python3 -m py_compile "$tmp_file" >/dev/null 2>&1; then
+    if ! is_valid_web_panel_release "$tmp_file"; then
         rm -f "$tmp_file" 2>/dev/null || true
-        err "Web 面板文件校验失败。"
+        err "Web 面板文件校验失败或版本不匹配。"
         return 1
     fi
 
@@ -1803,18 +1921,13 @@ do_uninstall_manager() {
     warn "即将完整卸载 nftables 端口转发管理器。"
     warn "将删除全局命令、安装目录、systemd 保活服务、转发配置、目标主机库、更新源、日志、脚本写入的 sysctl 配置以及本脚本安装的 NextTrace。"
     warn "不会卸载系统 nftables 软件包。"
-    read -rp "确认卸载？[y/N]: " confirm1
-    if [[ ! "$confirm1" =~ ^[Yy]$ ]]; then
-        info "已取消。"
-        return
-    fi
-    read -rp "请再次输入 UNINSTALL 确认完整卸载: " confirm2
-    if [[ "$confirm2" != "UNINSTALL" ]]; then
+    read -rp "确认完整卸载？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         info "已取消。"
         return
     fi
 
-    local clear_ruleset managed_nexttrace=""
+    local managed_nexttrace=""
     if [[ -f "${NEXTTRACE_MARKER}" ]]; then
         managed_nexttrace=$(cat "${NEXTTRACE_MARKER}" 2>/dev/null || true)
     fi
@@ -1849,11 +1962,6 @@ do_uninstall_manager() {
         "$NFT_BIN" delete table ip "${TABLE_NAME}" 2>/dev/null || true
         "$NFT_BIN" flush table inet "${FIREWALL_TABLE}" 2>/dev/null || true
         "$NFT_BIN" delete table inet "${FIREWALL_TABLE}" 2>/dev/null || true
-        read -rp "是否清空当前全部 nftables 运行规则？[y/N]: " clear_ruleset
-        if [[ "$clear_ruleset" =~ ^[Yy]$ ]]; then
-            "$NFT_BIN" flush ruleset 2>/dev/null || true
-            info "已清空当前 nftables 运行规则。"
-        fi
     fi
 
     rm -f "${CONF_FILE}" 2>/dev/null || true
@@ -2748,7 +2856,6 @@ main_menu() {
                 fi
                 ;;
             2)
-                check_update_status force
                 do_update
                 ;;
             3) do_list ;;
