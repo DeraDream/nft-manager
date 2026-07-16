@@ -33,7 +33,7 @@
 - 主机管理支持使用 NextTrace 查看本机到目标主机的路由
 - 项目内置 NextTrace Tiny 的 Linux amd64/arm64 离线文件，并提供 SSH 安装与在线升级菜单
 - 支持在线检查和更新脚本
-- 更新时自动在当前配置源、GitHub Raw 和 jsDelivr 镜像之间切换，兼容海外和大陆 VPS
+- 更新时自动在当前配置源、GitHub Raw、GitHub API 和 jsDelivr 镜像之间切换，兼容海外和大陆 VPS
 
 ## 安装
 
@@ -263,7 +263,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 - 脚本写入的 sysctl 配置
 - 脚本写入的 logrotate 配置
 
-卸载只需在唯一一次 `[y/N]` 确认中输入 `y`，回车或其他输入均取消。脚本会删除本项目创建的运行规则，保留其他 nftables 规则，也不会卸载系统的 `nftables` 软件包。
+卸载只需在唯一一次 `[y/N]` 确认中输入 `y`，回车或其他输入均取消。确认后会直接完整卸载所有项目文件、服务和数据，并自动清空当前全部 nftables 运行规则；脚本不会卸载系统的 `nftables` 软件包。
 
 ## 注意
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.29
+# nftables 端口转发管理工具 v3.30
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.29"
-WEB_PANEL_VERSION="3.29"
+SCRIPT_VERSION="3.30"
+WEB_PANEL_VERSION="3.30"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -1958,10 +1958,11 @@ do_uninstall_manager() {
     web_firewall_close
 
     if nft_available; then
-        "$NFT_BIN" flush table ip "${TABLE_NAME}" 2>/dev/null || true
-        "$NFT_BIN" delete table ip "${TABLE_NAME}" 2>/dev/null || true
-        "$NFT_BIN" flush table inet "${FIREWALL_TABLE}" 2>/dev/null || true
-        "$NFT_BIN" delete table inet "${FIREWALL_TABLE}" 2>/dev/null || true
+        if "$NFT_BIN" flush ruleset 2>/dev/null; then
+            info "已清空当前全部 nftables 运行规则。"
+        else
+            warn "无法清空当前 nftables 运行规则，请手动执行: nft flush ruleset"
+        fi
     fi
 
     rm -f "${CONF_FILE}" 2>/dev/null || true
@@ -2152,12 +2153,6 @@ do_install() {
         info "nftables 已安装。"
         "$NFT_BIN" --version 2>/dev/null || true
         echo ""
-        warn "安装将清空所有已有 nftables 配置，由本脚本统一接管。"
-        read -rp "是否继续？[y/N]: " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            info "已取消，退出脚本。"
-            exit 0
-        fi
 
         rm -f "${MAIN_CONF}" 2>/dev/null || true
         rm -f "${CONF_FILE}" "${TARGETS_FILE}" "${UPDATE_URL_FILE}" 2>/dev/null || true
