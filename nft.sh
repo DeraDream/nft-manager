@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.30
+# nftables 端口转发管理工具 v3.31
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.30"
-WEB_PANEL_VERSION="3.30"
+SCRIPT_VERSION="3.31"
+WEB_PANEL_VERSION="3.31"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -1007,8 +1007,9 @@ download_update_script() {
                 best_url="$candidate"
             fi
 
-            # 任意源发现新版即可使用；Raw/API 是权威源，有效时无需再等待 CDN。
-            if version_gt "$remote_version" "$SCRIPT_VERSION" || [[ "$candidate" == "$DEFAULT_UPDATE_URL" || "$candidate" == "$GITHUB_API_UPDATE_URL" ]]; then
+            # Raw 也可能短暂命中旧的边缘缓存。只有发现比本地新的版本才提前返回；
+            # 否则继续比较 API 和 CDN，最后使用所有有效响应中版本最高的文件。
+            if version_gt "$remote_version" "$SCRIPT_VERSION"; then
                 rm -f "$candidate_file" 2>/dev/null || true
                 UPDATE_URL="$best_url"
                 UPDATE_DOWNLOADED_URL="$best_url"
