@@ -39,7 +39,7 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.27"
+WEB_PANEL_VERSION = "3.28"
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 BANDWIDTH_LOCK = threading.Lock()
@@ -311,6 +311,8 @@ def firewall_config_text(ports):
         "        type filter hook input priority filter; policy drop;",
         "        ct state established,related accept",
         "        iifname \"lo\" accept",
+        "        ip protocol icmp accept",
+        "        meta l4proto ipv6-icmp accept",
     ]
     if tcp_ports:
         lines.append("        tcp dport { " + ", ".join(map(str, tcp_ports)) + " } accept")
