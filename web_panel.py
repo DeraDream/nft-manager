@@ -39,7 +39,7 @@ HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.33"
+WEB_PANEL_VERSION = "3.34"
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 BANDWIDTH_LOCK = threading.Lock()
@@ -200,11 +200,15 @@ def rule_connectivity_checks():
 
 
 def local_ip():
-    out = run(["bash", "-lc", "ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K[0-9.]+' | head -1"], timeout=2).stdout.strip()
-    if out:
-        return out
-    out = run(["bash", "-lc", "hostname -I 2>/dev/null | awk '{print $1}'"], timeout=2).stdout.strip()
-    return out or "127.0.0.1"
+    result = run(["ip", "-4", "route", "get", "1.1.1.1"], timeout=2)
+    match = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)\b", result.stdout)
+    if match and valid_ip(match.group(1)):
+        return match.group(1)
+    result = run(["hostname", "-I"], timeout=2)
+    for value in result.stdout.split():
+        if valid_ip(value):
+            return value
+    return "127.0.0.1"
 
 
 def normalize_firewall_protocol(protocol):
@@ -1503,7 +1507,7 @@ function render(){let d=state.data;if(state.view==='dash'){let b=d.bandwidth||{}
  if(state.view==='rules'){let next=state.ruleView==='flat'?'grid':'flat',label=state.ruleView==='flat'?'平铺':'方块',icon=state.ruleView==='flat'?'☷':'▦';return shell(`<div class=page-with-fabs>${rulesTable(false)}${fabStack([fabButton(icon,label,`setRuleView('${next}')`,false,`切换为${next==='grid'?'方块':'平铺'}视图`),fabButton('⌁','连通性',`checkRuleConnectivity(this)`,false,'检查全部转发连通性'),fabButton('+','新增转发',`openRule()`,true),fabButton('↺','默认排序',`resetListSort('rule')`,false,'清除转发列表排序')])}</div>`)}
  if(state.view==='targets')return shell(`<div class=page-with-fabs><div class=panel><h2>主机管理</h2>${targetsTable()}</div>${fabStack([fabButton('◷','延迟检测',`checkTargetLatency(this)`),fabButton('+','新增主机',`openTarget()`,true),fabButton('↺','默认排序',`resetListSort('target')`,false,'清除主机列表排序')])}</div>`);
  if(state.view==='firewall')return shell(`<div class=page-with-fabs><div class=panel><h2>防火墙管理</h2><p class=muted>默认拒绝未列出的入站连接，始终保留当前 SSH 端口与 Web 面板 5555/tcp。</p>${firewallTable()}</div>${fabStack([fabButton('↻','同步端口',`syncFirewall(this)`),fabButton('+','开放端口',`openFirewall()`,true)])}</div>`);
- return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><div class=field style="max-width:520px"><label>首页轮询间隔（秒）</label><div class=actions><input id=dashboardPollSeconds type=number min=2 max=300 step=1 value="${Number(d.settings?.dashboardPollSeconds||10)}"><button class=primary onclick="savePollInterval(this)">保存间隔</button></div><p class=muted>控制流量、规则等完整首页数据刷新，范围 2-300 秒；带宽速率在首页可见时固定每秒刷新。</p></div><div class=field><label>显示模式</label><div class=theme-switch><button class="${state.theme==='light'?'active':''}" onclick="setTheme('light')">日间</button><button class="${state.theme==='dark'?'active':''}" onclick="setTheme('dark')">夜间</button><button class="${state.theme==='system'?'active':''}" onclick="setTheme('system')">跟随系统</button></div></div><p>Web 面板地址：<span class=pill>http://${d.stats.localIp}:${d.stats.port}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
+ return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><div class=field style="max-width:520px"><label>首页轮询间隔（秒）</label><div class=actions><input id=dashboardPollSeconds type=number min=2 max=300 step=1 value="${Number(d.settings?.dashboardPollSeconds||10)}"><button class=primary onclick="savePollInterval(this)">保存间隔</button></div><p class=muted>控制流量、规则等完整首页数据刷新，范围 2-300 秒；带宽速率在首页可见时固定每秒刷新。</p></div><div class=field><label>显示模式</label><div class=theme-switch><button class="${state.theme==='light'?'active':''}" onclick="setTheme('light')">日间</button><button class="${state.theme==='dark'?'active':''}" onclick="setTheme('dark')">夜间</button><button class="${state.theme==='system'?'active':''}" onclick="setTheme('system')">跟随系统</button></div></div><p>Web 面板地址：<span class=pill>${esc(location.origin)}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
 function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
 function setTheme(theme){if(!['light','dark','system'].includes(theme))return;state.theme=theme;localStorage.setItem('nft_manager_theme',theme);document.documentElement.dataset.theme=theme;render();toast('显示模式已切换','success')}
 function ruleName(r){return r.alias||`${r.targetAlias||r.ip}:${r.lport}`}
