@@ -38,12 +38,15 @@ FIREWALL_TABLE = "nft_manager_firewall"
 HOST = os.environ.get("NFT_MANAGER_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("NFT_MANAGER_WEB_PORT", "5555"))
 MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
+MAX_CONFIG_BYTES = 5 * 1024 * 1024
+MAX_CONFIG_RULES = 10000
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.34"
+WEB_PANEL_VERSION = "3.35"
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 BANDWIDTH_LOCK = threading.Lock()
 RULE_RATE_LOCK = threading.Lock()
+CONFIG_LOCK = threading.Lock()
 BANDWIDTH_STATE = {
     "interface": "",
     "timestamp": 0.0,
@@ -443,6 +446,21 @@ def add_forward_firewall_ports(ports):
         return apply_firewall_ports(current)
 
 
+def sync_imported_firewall_ports(rules):
+    with FIREWALL_LOCK:
+        current = read_firewall_ports()
+        for rule in rules:
+            port = int(rule["lport"])
+            if rule.get("enabled", True):
+                if not any(item["port"] == port and item["protocol"] == "tcp+udp" for item in current):
+                    current.append({"port": port, "protocol": "tcp+udp", "label": "转发端口"})
+            else:
+                current = [
+                    item for item in current if not (item["port"] == port and item["label"] == "转发端口")
+                ]
+        return apply_firewall_ports(current)
+
+
 def remove_firewall_port(port, protocol=None):
     port = int(port)
     baseline_ports = {item["port"] for item in firewall_baseline_ports()}
@@ -647,6 +665,198 @@ def write_targets(targets):
         f.write("# alias|ip\n")
         for t in targets:
             f.write(f"{clean_label(t['alias'])}|{t['ip']}\n")
+
+
+def normalized_config_payload(content):
+    if not isinstance(content, str):
+        raise ValueError("配置文件内容无效")
+    if len(content.encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise ValueError("配置文件不能超过 5 MB")
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        raise ValueError("配置文件不是有效的 nft-manager 配置")
+    if not isinstance(payload, dict) or payload.get("format") != "nft-manager-config":
+        raise ValueError("配置文件格式不正确")
+    if payload.get("schemaVersion") != 1:
+        raise ValueError("暂不支持该配置文件版本")
+
+    raw_targets = payload.get("targets", [])
+    raw_rules = payload.get("rules", [])
+    if not isinstance(raw_targets, list) or not isinstance(raw_rules, list):
+        raise ValueError("配置文件中的主机或转发规则格式无效")
+    if len(raw_rules) > MAX_CONFIG_RULES:
+        raise ValueError(f"配置文件最多包含 {MAX_CONFIG_RULES} 条转发规则")
+
+    targets = []
+    target_ips = set()
+    for item in raw_targets:
+        if not isinstance(item, dict):
+            raise ValueError("配置文件包含无效主机记录")
+        alias = clean_label(item.get("alias"))
+        ip = str(item.get("ip", "")).strip()
+        if not alias or not valid_ip(ip):
+            raise ValueError("配置文件包含无效主机别名或 IPv4 地址")
+        if ip in target_ips:
+            raise ValueError(f"配置文件中的主机 IP 重复: {ip}")
+        target_ips.add(ip)
+        targets.append({"alias": alias, "ip": ip})
+
+    rules = []
+    lports = set()
+    for item in raw_rules:
+        if not isinstance(item, dict):
+            raise ValueError("配置文件包含无效转发规则")
+        raw_lport = item.get("lport", 0)
+        raw_dport = item.get("dport", 0)
+        if (
+            isinstance(raw_lport, bool)
+            or isinstance(raw_dport, bool)
+            or not str(raw_lport).isdigit()
+            or not str(raw_dport).isdigit()
+        ):
+            raise ValueError("配置文件包含无效端口")
+        lport = int(raw_lport)
+        dport = int(raw_dport)
+        ip = str(item.get("ip", "")).strip()
+        if not valid_port(lport) or not valid_port(dport) or not valid_ip(ip):
+            raise ValueError("配置文件包含无效入口端口、出口端口或目标 IPv4")
+        if lport in lports:
+            raise ValueError(f"配置文件中的入口端口重复: {lport}")
+        lports.add(lport)
+        stats_mode = item.get("statsMode", "total")
+        if stats_mode not in ("upload", "download", "total"):
+            raise ValueError("配置文件包含无效统计口径")
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("配置文件包含无效规则开关状态")
+        rules.append({
+            "lport": lport,
+            "ip": ip,
+            "dport": dport,
+            "alias": clean_label(item.get("alias")),
+            "desc": clean_label(item.get("desc")),
+            "statsMode": stats_mode,
+            "enabled": enabled,
+        })
+    return {"targets": targets, "rules": rules}
+
+
+def exported_config():
+    targets = read_targets()
+    rules = parse_rules()
+    known_ips = {target["ip"] for target in targets}
+    for rule in rules:
+        if rule["ip"] not in known_ips:
+            targets.append({"alias": rule["ip"], "ip": rule["ip"]})
+            known_ips.add(rule["ip"])
+    return {
+        "format": "nft-manager-config",
+        "schemaVersion": 1,
+        "exportedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sourceVersion": WEB_PANEL_VERSION,
+        "targets": targets,
+        "rules": rules,
+    }
+
+
+def unique_import_alias(alias, used_aliases):
+    if alias not in used_aliases:
+        return alias
+    index = 2
+    while f"{alias}（导入 {index}）" in used_aliases:
+        index += 1
+    return f"{alias}（导入 {index}）"
+
+
+def config_import_plan(content):
+    imported = normalized_config_payload(content)
+    existing_targets = read_targets()
+    existing_rules = parse_rules()
+    existing_ips = {target["ip"] for target in existing_targets}
+    used_aliases = {target["alias"] for target in existing_targets}
+    targets = []
+    renamed_hosts = 0
+
+    for target in imported["targets"]:
+        if target["ip"] in existing_ips:
+            continue
+        alias = unique_import_alias(target["alias"], used_aliases)
+        renamed_hosts += alias != target["alias"]
+        targets.append({"alias": alias, "ip": target["ip"]})
+        existing_ips.add(target["ip"])
+        used_aliases.add(alias)
+
+    used_ports = {rule["lport"] for rule in existing_rules}
+    rules = [rule for rule in imported["rules"] if rule["lport"] not in used_ports]
+    skipped_ports = [rule["lport"] for rule in imported["rules"] if rule["lport"] in used_ports]
+
+    target_aliases = {target["ip"]: target["alias"] for target in existing_targets + targets}
+    for rule in rules:
+        if rule["ip"] in target_aliases:
+            continue
+        alias = unique_import_alias(rule["ip"], used_aliases)
+        targets.append({"alias": alias, "ip": rule["ip"]})
+        target_aliases[rule["ip"]] = alias
+        used_aliases.add(alias)
+
+    return {
+        "imported": imported,
+        "targets": targets,
+        "rules": rules,
+        "skippedPorts": skipped_ports,
+        "renamedHosts": renamed_hosts,
+        "existingTargets": existing_targets,
+        "existingRules": existing_rules,
+    }
+
+
+def preview_config_import(content):
+    plan = config_import_plan(content)
+    return {
+        "targetCount": len(plan["imported"]["targets"]),
+        "ruleCount": len(plan["imported"]["rules"]),
+        "addTargetCount": len(plan["targets"]),
+        "addRuleCount": len(plan["rules"]),
+        "skippedRuleCount": len(plan["skippedPorts"]),
+        "skippedPorts": plan["skippedPorts"][:20],
+        "renamedHostCount": plan["renamedHosts"],
+    }
+
+
+def import_config(content):
+    with CONFIG_LOCK:
+        plan = config_import_plan(content)
+        old_targets = plan["existingTargets"]
+        old_rules = plan["existingRules"]
+        merged_targets = old_targets + plan["targets"]
+        merged_rules = old_rules + plan["rules"]
+        targets_changed = bool(plan["targets"])
+        rules_changed = bool(plan["rules"])
+        try:
+            if targets_changed:
+                write_targets(merged_targets)
+            if rules_changed:
+                write_rules(merged_rules)
+                reload_rules()
+                sync_imported_firewall_ports(plan["rules"])
+        except Exception:
+            if targets_changed:
+                write_targets(old_targets)
+            if rules_changed:
+                write_rules(old_rules)
+                try:
+                    reload_rules()
+                except Exception:
+                    pass
+            raise
+        return {
+            "addedTargets": len(plan["targets"]),
+            "addedRules": len(plan["rules"]),
+            "skippedRules": len(plan["skippedPorts"]),
+            "skippedPorts": plan["skippedPorts"][:20],
+            "renamedHosts": plan["renamedHosts"],
+        }
 
 
 def parse_rules():
@@ -1450,12 +1660,12 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-
 .main{margin-left:238px;flex:1;min-width:0}.top{height:54px;border-bottom:1px solid #2a2d35;display:flex;align-items:center;justify-content:flex-end;padding:0 26px}.user{font-weight:700}.mobile-brand{display:none;font-weight:800;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nav-icon{display:none}
 .content{padding:18px 24px 40px}.page-with-fabs{min-height:calc(100vh - 112px);padding-bottom:190px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.chart-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.chart-pair>.panel{min-width:0}.chart-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.bandwidth-live{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px 12px;font-size:12px;font-weight:700}.bandwidth-live .download{color:var(--bandwidth-download)}.bandwidth-live .upload{color:var(--bandwidth-upload)}.bandwidth-interface{width:100%;color:var(--muted);font-weight:500;text-align:right}.chart-legend{display:flex;justify-content:flex-end;gap:14px;margin:-4px 2px 4px;color:var(--muted);font-size:12px}.chart-legend span{display:inline-flex;align-items:center;gap:6px}.chart-legend i{width:16px;height:3px;border-radius:3px}.chart-legend .download i{background:var(--bandwidth-download)}.chart-legend .upload i{background:var(--bandwidth-upload)}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.rule-table-wrap{border:1px solid var(--line);border-radius:8px;overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.table tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.pill{display:inline-flex;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.metric.upload{color:#46a6ff}.metric.download{color:#20d98a}.metric.total{color:#b779ff}.actions{display:flex;align-items:center;gap:8px}.actions .switch{margin-right:12px}.actions button{padding:6px 10px;margin:0}.hidden{display:none!important}.view-switch{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}.view-switch button{border-radius:0;background:#17181c;padding:7px 11px}.view-switch button.active{background:#1d4d8a}.switch{position:relative;display:inline-flex;width:38px;height:22px;vertical-align:middle;flex:none}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#4a252a;border-radius:22px}.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}.switch input:checked+.slider{background:#16855b}.switch input:checked+.slider:before{transform:translateX(16px)}.rule-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.rule-card{border:1px solid var(--line);background:#111318;padding:14px;border-radius:8px}.rule-card.disabled{opacity:.6}.rule-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.rule-card h3{font-size:15px;margin:0 0 8px}.rule-card .route{color:#cdd4e0;margin:7px 0}.rule-card .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid #2a2d35;padding-top:10px;margin-top:10px}.rule-card .metrics span{font-size:12px}.rule-card .actions{margin-top:14px}.chart-wrap{position:relative;touch-action:pan-y}.chart-svg{display:block;width:100%;height:300px}.chart-grid{stroke:var(--line);stroke-dasharray:3 4}.chart-axis{stroke:var(--muted);stroke-width:1.4}.chart-line{fill:none;stroke:var(--traffic-line);stroke-width:3}.chart-line.bandwidth-download{stroke:var(--bandwidth-download);stroke-width:2.5}.chart-line.bandwidth-upload{stroke:var(--bandwidth-upload);stroke-width:2.5}.chart-fill{fill:var(--traffic-fill)}.chart-label{fill:var(--muted);font-size:11px}.chart-axis-title{fill:var(--text);font-size:12px;font-weight:700}.chart-hover-guide{display:none;stroke:var(--muted);stroke-width:1;stroke-dasharray:4 3;pointer-events:none}.chart-hover-dot{display:none;stroke:var(--panel);stroke-width:3;pointer-events:none}.chart-hover-dot.traffic{fill:var(--traffic-line)}.chart-hover-dot.download{fill:var(--bandwidth-download)}.chart-hover-dot.upload{fill:var(--bandwidth-upload)}.chart-tooltip{position:absolute;z-index:3;display:none;min-width:150px;max-width:230px;padding:9px 11px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);box-shadow:0 10px 26px rgba(0,0,0,.28);font-size:12px;line-height:1.55;pointer-events:none}.chart-tooltip.show{display:block}.chart-tooltip-time{margin-bottom:3px;color:var(--muted);font-weight:700}.chart-tooltip-row{display:flex;justify-content:space-between;gap:16px;white-space:nowrap}.chart-tooltip-row b{font-variant-numeric:tabular-nums}.chart-tooltip-row.traffic b{color:var(--traffic-line)}.chart-tooltip-row.download b{color:var(--bandwidth-download)}.chart-tooltip-row.upload b{color:var(--bandwidth-upload)}.fab-stack{position:fixed;z-index:7;right:24px;bottom:24px;display:flex;flex-direction:column;align-items:flex-end;gap:10px}.fab{min-width:112px;height:46px;padding:0 15px;border:1px solid rgba(105,173,255,.45);border-radius:23px;background:rgba(17,40,70,.94);color:#eaf3ff;display:flex;align-items:center;justify-content:flex-start;gap:9px;box-shadow:0 10px 28px rgba(0,0,0,.3);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.fab:hover{background:#164b83}.fab.primary{border-color:rgba(8,119,255,.72);background:var(--blue)}.fab-icon{display:grid;place-items:center;width:20px;height:20px;font-size:18px;font-weight:800;line-height:1}.fab-label{font-size:13px;font-weight:700;white-space:nowrap}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:20}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog.rules-dialog{width:min(1240px,96vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{display:flex;align-items:center;justify-content:flex-end;gap:14px;margin-top:18px}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.firewall-check{display:flex!important;align-items:center;gap:9px;padding:11px 12px;border:1px solid #356aa0;border-radius:6px;background:rgba(8,119,255,.1);color:#dbeafe!important;cursor:pointer}.firewall-check input{width:16px!important;height:16px;margin:0;accent-color:var(--blue)}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:30;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.count-button{padding:2px 8px;background:rgba(8,119,255,.14);color:#69adff;border:1px solid rgba(8,119,255,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}.live-rate{display:inline-flex;align-items:center;gap:10px;white-space:nowrap;font-weight:700;font-variant-numeric:tabular-nums}.live-rate .upload{color:var(--upload)}.live-rate .download{color:var(--download)}.live-rate-slot{min-width:150px}.rule-card .live-rate-slot{display:block;min-width:0;margin-top:9px}.mobile-rate-cell,.mobile-rate-card{display:none!important}.probe-pill{display:inline-flex;align-items:center;gap:6px;min-width:96px;padding:4px 9px;border-radius:999px;background:rgba(142,150,163,.14);color:#aeb5c0;white-space:nowrap}.probe-pill i{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:probe-pulse 1.8s infinite}.probe-pill b{font-variant-numeric:tabular-nums}.probe-pill.good{background:rgba(29,219,120,.14);color:#58e69d}.probe-pill.warn{background:rgba(255,205,65,.15);color:#ffd262}.probe-pill.slow{background:rgba(255,159,26,.16);color:#ffae43}.probe-pill.bad{background:rgba(255,90,102,.16);color:#ff8791}.probe-pill.off{background:rgba(142,150,163,.12);color:#9aa2ae}.probe-pill.pending i{animation:none}@keyframes probe-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 0 4px transparent}}
-button,button.ghost{background:var(--button-bg);color:var(--button-text)}button.primary,button.danger{color:#fff}.login input{background:var(--surface);color:var(--text)}.side{background:var(--sidebar);border-color:var(--line-soft)}.nav button{color:var(--nav-text)}.top{border-color:var(--line-soft)}.table th,.table td{border-color:var(--line-soft)}.view-switch button{background:var(--panel)}.rule-card{background:var(--surface)}.rule-card .route{color:var(--text)}.rule-card .metrics{border-color:var(--line-soft)}.pill{background:var(--pill-bg);color:var(--pill-text)}.metric.upload{color:var(--upload)}.metric.download{color:var(--download)}.metric.total{color:var(--total)}.trace-output{background:var(--trace-bg);color:var(--trace-text)}.dialog-copy{color:var(--text)}.field label{color:var(--text)}.field input,.field select,.field textarea{background:var(--surface2);color:var(--text)}.firewall-check{color:var(--text)!important}.tags,.preview{background:var(--surface2);color:var(--text)}.toast{display:flex;align-items:center;gap:10px;border:1px solid var(--line);background:var(--panel2);color:var(--text);box-shadow:0 14px 36px rgba(0,0,0,.22);animation:toast-in .2s ease-out}.toast-icon{display:grid;place-items:center;flex:none;width:24px;height:24px;border-radius:50%;background:rgba(8,119,255,.14);color:#3996ff;font-weight:800}.toast.success .toast-icon{background:rgba(29,219,120,.14);color:var(--green)}.toast.error .toast-icon{background:rgba(255,90,102,.14);color:var(--danger)}.toast.success{border-color:rgba(29,160,98,.42)}.toast.error{border-color:rgba(226,63,77,.48)}@keyframes toast-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}.theme-switch{display:inline-grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}.theme-switch button{min-width:92px;background:transparent;color:var(--muted)}.theme-switch button.active{background:var(--blue);color:#fff}
+button,button.ghost{background:var(--button-bg);color:var(--button-text)}button.primary,button.danger{color:#fff}.login input{background:var(--surface);color:var(--text)}.side{background:var(--sidebar);border-color:var(--line-soft)}.nav button{color:var(--nav-text)}.top{border-color:var(--line-soft)}.table th,.table td{border-color:var(--line-soft)}.view-switch button{background:var(--panel)}.rule-card{background:var(--surface)}.rule-card .route{color:var(--text)}.rule-card .metrics{border-color:var(--line-soft)}.pill{background:var(--pill-bg);color:var(--pill-text)}.metric.upload{color:var(--upload)}.metric.download{color:var(--download)}.metric.total{color:var(--total)}.trace-output{background:var(--trace-bg);color:var(--trace-text)}.dialog-copy{color:var(--text)}.field label{color:var(--text)}.field input,.field select,.field textarea{background:var(--surface2);color:var(--text)}.firewall-check{color:var(--text)!important}.tags,.preview{background:var(--surface2);color:var(--text)}.toast{display:flex;align-items:center;gap:10px;border:1px solid var(--line);background:var(--panel2);color:var(--text);box-shadow:0 14px 36px rgba(0,0,0,.22);animation:toast-in .2s ease-out}.toast-icon{display:grid;place-items:center;flex:none;width:24px;height:24px;border-radius:50%;background:rgba(8,119,255,.14);color:#3996ff;font-weight:800}.toast.success .toast-icon{background:rgba(29,219,120,.14);color:var(--green)}.toast.error .toast-icon{background:rgba(255,90,102,.14);color:var(--danger)}.toast.success{border-color:rgba(29,160,98,.42)}.toast.error{border-color:rgba(226,63,77,.48)}@keyframes toast-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}.theme-switch{display:inline-grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}.theme-switch button{min-width:92px;background:transparent;color:var(--muted)}.theme-switch button.active{background:var(--blue);color:#fff}.config-transfer{margin-top:24px;padding-top:20px;border-top:1px solid var(--line-soft)}.config-transfer h3{margin:0 0 6px;font-size:16px}.config-actions{display:flex;gap:10px;margin-top:12px}.drop-zone{min-height:150px;border:2px dashed var(--line);border-radius:8px;background:var(--surface);display:grid;place-items:center;padding:22px;text-align:center;cursor:pointer;transition:border-color .16s,background .16s}.drop-zone:hover,.drop-zone.dragging{border-color:var(--blue);background:rgba(8,119,255,.08)}.drop-zone.ready{border-style:solid;border-color:var(--green)}.drop-zone strong{display:block;margin-bottom:6px;font-size:16px}.drop-zone small{color:var(--muted)}.import-summary{display:none;margin-top:14px;padding:13px;border:1px solid var(--line);border-radius:7px;background:var(--surface)}.import-summary.show{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.import-summary div{padding:8px}.import-summary b{display:block;margin-top:3px;font-size:18px}.import-note{grid-column:1/-1;color:var(--muted)}
 .chart-svg{height:auto}
 .sort-head{display:inline-flex;align-items:center;gap:5px;padding:2px 0;border-radius:0;background:transparent!important;color:inherit!important;font-weight:inherit}.sort-head:hover,.sort-head.active{color:var(--nav-active-text)!important}.sort-arrow{display:inline-block;min-width:10px;color:var(--muted);font-size:11px}.sort-head.active .sort-arrow{color:currentColor}.sort-strip{display:none;align-items:center;gap:7px;margin:0 0 12px;padding:8px;border:1px solid var(--line-soft);border-radius:7px;background:var(--surface)}.sort-strip.grid-sort{display:flex}.sort-strip-label{margin:0 3px;color:var(--muted);font-size:12px}.sort-strip button{padding:6px 9px;background:transparent;color:var(--muted);border:1px solid transparent}.sort-strip button.active{background:var(--nav-active-bg);color:var(--nav-active-text);border-color:var(--line)}
 @media(max-width:1100px) and (min-width:761px){.cards{grid-template-columns:repeat(2,minmax(160px,1fr))}}
 @media(max-width:760px){
-body{font-size:14px;overflow-x:hidden}.app{display:block;min-height:100dvh}.side{position:fixed;z-index:8;inset:auto 0 0 0;width:auto;height:calc(66px + env(safe-area-inset-bottom));padding:0 8px env(safe-area-inset-bottom);border:0;border-top:1px solid var(--line-soft);background:var(--tab-glass);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}.brand,.ver,.foot{display:none}.nav{height:66px;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));align-items:stretch}.nav button{min-width:0;width:auto;height:66px;margin:0;padding:7px 2px 6px;border-radius:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:3px;text-align:center;color:var(--muted);font-size:11px;line-height:1.15;background:transparent}.nav button:hover{background:transparent}.nav button.active{background:transparent;color:#187ee8;box-shadow:none}.nav-icon{display:block;font-size:21px;line-height:22px;font-weight:500}.main{margin:0;min-width:0}.top{position:sticky;z-index:4;top:0;height:50px;padding:0 14px;justify-content:space-between;background:var(--glass);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}.mobile-brand{display:block;max-width:70%}.user{font-size:12px;color:var(--muted)}.content{padding:12px 12px calc(84px + env(safe-area-inset-bottom))}.page-with-fabs{min-height:calc(100dvh - 146px);padding-bottom:250px}.page-with-fabs>.panel{margin-top:0;padding:0;border:0;background:transparent}.cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card{min-height:116px;padding:13px}.card h3{margin-bottom:10px;font-size:12px}.big{font-size:19px;overflow-wrap:anywhere}.bar{margin-top:11px}.panel{margin-top:12px;padding:12px;border-radius:8px}.panel h2{font-size:18px;margin-bottom:12px}.toolbar{align-items:stretch;flex-wrap:wrap;gap:8px;margin-bottom:12px}.toolbar h2{width:100%;margin:0!important}.toolbar button{min-height:42px;flex:1;padding:9px 8px}.grid{grid-template-columns:1fr;gap:0}.field>.actions{display:grid;grid-template-columns:1fr auto;align-items:stretch}.field>.actions button{min-height:44px}.rule-grid{grid-template-columns:1fr;gap:12px}.rule-card{padding:15px;border-color:var(--item-border);background:var(--item-bg);box-shadow:0 8px 22px rgba(0,0,0,.2)}.rule-card .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}.rule-card .actions button{min-height:40px}.chart-svg{height:230px}.chart-label{font-size:20px}.chart-axis-title{font-size:21px}.rule-table-wrap{border:0;overflow:visible}.table,.table tbody,.table tr,.table td{display:block;width:100%}.table thead{display:none}.table tbody{display:grid;gap:12px}.table tr{padding:14px;border:1px solid var(--item-border);border-radius:8px;background:var(--item-bg);box-shadow:0 8px 22px rgba(0,0,0,.2)}.table td{min-height:35px;padding:7px 0;border:0;display:grid;grid-template-columns:minmax(88px,36%) minmax(0,1fr);gap:12px;align-items:center;text-align:right;font-weight:600;overflow-wrap:anywhere}.table td:before{content:attr(data-label);color:var(--muted);font-size:12px;font-weight:500;text-align:left}.table td.actions{display:flex;justify-content:flex-end;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--line-soft);margin-top:6px}.table td.actions:before{margin-right:auto}.table td.actions button{min-height:40px}.table td[colspan]{display:block;text-align:center;color:var(--muted)}.table td[colspan]:before{display:none}.desktop-rate-cell,.desktop-rate-card{display:none!important}.mobile-rate-cell{display:grid!important}.mobile-rate-card{display:block!important}.probe-pill{margin-left:auto}.fab-stack{right:14px;bottom:calc(80px + env(safe-area-inset-bottom));gap:9px}.fab{min-width:104px;height:44px;border-radius:22px;padding:0 13px}.dialog{width:calc(100vw - 24px);max-width:none;max-height:calc(100dvh - 28px);padding:16px;border-radius:9px;overscroll-behavior:contain}.dialog.trace-dialog,.dialog.rules-dialog{width:calc(100vw - 16px)}.dialog h2{font-size:20px;margin-top:0}.dialog-actions{position:sticky;bottom:-16px;margin:16px -16px -16px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));display:flex;justify-content:flex-end;gap:9px;background:var(--panel2);border-top:1px solid var(--line)}.dialog-actions button{min-width:92px;min-height:42px}.trace-output{max-height:58dvh;padding:10px;font-size:11px}.field input,.field select,.field textarea{font-size:16px;min-height:44px}.field textarea{min-height:88px}.firewall-check{min-height:46px}.toast{left:12px;right:12px;top:auto;bottom:calc(78px + env(safe-area-inset-bottom));max-width:none}.theme-switch{display:grid;width:100%}.theme-switch button{min-width:0}.login{min-height:100dvh;height:auto;padding:18px}.login form{width:100%;max-width:360px;padding:22px}.login input{font-size:16px}.pill{max-width:100%;overflow-wrap:anywhere}.content>.panel:first-child{margin-top:0}
+body{font-size:14px;overflow-x:hidden}.app{display:block;min-height:100dvh}.side{position:fixed;z-index:8;inset:auto 0 0 0;width:auto;height:calc(66px + env(safe-area-inset-bottom));padding:0 8px env(safe-area-inset-bottom);border:0;border-top:1px solid var(--line-soft);background:var(--tab-glass);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}.brand,.ver,.foot{display:none}.nav{height:66px;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));align-items:stretch}.nav button{min-width:0;width:auto;height:66px;margin:0;padding:7px 2px 6px;border-radius:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:3px;text-align:center;color:var(--muted);font-size:11px;line-height:1.15;background:transparent}.nav button:hover{background:transparent}.nav button.active{background:transparent;color:#187ee8;box-shadow:none}.nav-icon{display:block;font-size:21px;line-height:22px;font-weight:500}.main{margin:0;min-width:0}.top{position:sticky;z-index:4;top:0;height:50px;padding:0 14px;justify-content:space-between;background:var(--glass);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}.mobile-brand{display:block;max-width:70%}.user{font-size:12px;color:var(--muted)}.content{padding:12px 12px calc(84px + env(safe-area-inset-bottom))}.page-with-fabs{min-height:calc(100dvh - 146px);padding-bottom:250px}.page-with-fabs>.panel{margin-top:0;padding:0;border:0;background:transparent}.cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card{min-height:116px;padding:13px}.card h3{margin-bottom:10px;font-size:12px}.big{font-size:19px;overflow-wrap:anywhere}.bar{margin-top:11px}.panel{margin-top:12px;padding:12px;border-radius:8px}.panel h2{font-size:18px;margin-bottom:12px}.toolbar{align-items:stretch;flex-wrap:wrap;gap:8px;margin-bottom:12px}.toolbar h2{width:100%;margin:0!important}.toolbar button{min-height:42px;flex:1;padding:9px 8px}.grid{grid-template-columns:1fr;gap:0}.field>.actions{display:grid;grid-template-columns:1fr auto;align-items:stretch}.field>.actions button{min-height:44px}.rule-grid{grid-template-columns:1fr;gap:12px}.rule-card{padding:15px;border-color:var(--item-border);background:var(--item-bg);box-shadow:0 8px 22px rgba(0,0,0,.2)}.rule-card .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}.rule-card .actions button{min-height:40px}.chart-svg{height:230px}.chart-label{font-size:20px}.chart-axis-title{font-size:21px}.rule-table-wrap{border:0;overflow:visible}.table,.table tbody,.table tr,.table td{display:block;width:100%}.table thead{display:none}.table tbody{display:grid;gap:12px}.table tr{padding:14px;border:1px solid var(--item-border);border-radius:8px;background:var(--item-bg);box-shadow:0 8px 22px rgba(0,0,0,.2)}.table td{min-height:35px;padding:7px 0;border:0;display:grid;grid-template-columns:minmax(88px,36%) minmax(0,1fr);gap:12px;align-items:center;text-align:right;font-weight:600;overflow-wrap:anywhere}.table td:before{content:attr(data-label);color:var(--muted);font-size:12px;font-weight:500;text-align:left}.table td.actions{display:flex;justify-content:flex-end;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--line-soft);margin-top:6px}.table td.actions:before{margin-right:auto}.table td.actions button{min-height:40px}.table td[colspan]{display:block;text-align:center;color:var(--muted)}.table td[colspan]:before{display:none}.desktop-rate-cell,.desktop-rate-card{display:none!important}.mobile-rate-cell{display:grid!important}.mobile-rate-card{display:block!important}.probe-pill{margin-left:auto}.fab-stack{right:14px;bottom:calc(80px + env(safe-area-inset-bottom));gap:9px}.fab{min-width:104px;height:44px;border-radius:22px;padding:0 13px}.dialog{width:calc(100vw - 24px);max-width:none;max-height:calc(100dvh - 28px);padding:16px;border-radius:9px;overscroll-behavior:contain}.dialog.trace-dialog,.dialog.rules-dialog{width:calc(100vw - 16px)}.dialog h2{font-size:20px;margin-top:0}.dialog-actions{position:sticky;bottom:-16px;margin:16px -16px -16px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));display:flex;justify-content:flex-end;gap:9px;background:var(--panel2);border-top:1px solid var(--line)}.dialog-actions button{min-width:92px;min-height:42px}.trace-output{max-height:58dvh;padding:10px;font-size:11px}.field input,.field select,.field textarea{font-size:16px;min-height:44px}.field textarea{min-height:88px}.firewall-check{min-height:46px}.toast{left:12px;right:12px;top:auto;bottom:calc(78px + env(safe-area-inset-bottom));max-width:none}.theme-switch{display:grid;width:100%}.theme-switch button{min-width:0}.config-actions{display:grid;grid-template-columns:1fr 1fr}.drop-zone{min-height:136px}.import-summary.show{grid-template-columns:1fr}.import-note{grid-column:auto}.login{min-height:100dvh;height:auto;padding:18px}.login form{width:100%;max-width:360px;padding:22px}.login input{font-size:16px}.pill{max-width:100%;overflow-wrap:anywhere}.content>.panel:first-child{margin-top:0}
 .chart-pair{grid-template-columns:1fr;gap:0}.chart-panel-head{display:block}.bandwidth-live{justify-content:flex-start;margin:-4px 0 8px}.bandwidth-interface{text-align:left}.chart-legend{justify-content:flex-start}
 .sort-strip,.sort-strip.grid-sort{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.sort-strip-label{grid-column:1/-1}.sort-strip button{min-height:36px}
 .chart-svg{height:auto}.chart-label{font-size:11px}.chart-axis-title{font-size:12px}
@@ -1466,7 +1676,7 @@ const authToken=()=>localStorage.getItem('nft_manager_token')||'';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
 function savedSort(storageKey,allowed){try{let value=JSON.parse(localStorage.getItem(storageKey)||'{}');if(allowed.includes(value.key)&&['asc','desc'].includes(value.direction))return value}catch(e){}return {key:'',direction:''}}
-let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let savedTheme=localStorage.getItem('nft_manager_theme')||'system';if(!['light','dark','system'].includes(savedTheme))savedTheme='system';let savedRuleSort=savedSort('nft_manager_rule_sort',['upload','download','total','connectivity']),savedTargetSort=savedSort('nft_manager_target_sort',['upload','download','total','latency']);document.documentElement.dataset.theme=savedTheme;let state={view:savedView,data:null,edit:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',theme:savedTheme,targetLatency:{},ruleConnectivity:{},ruleRates:{},ruleSort:savedRuleSort,targetSort:savedTargetSort,autoProbeView:'',publicTitle:'nft-manager',dashboardPollBusy:false,dashboardPollSeconds:0,dashboardPollTimer:null,bandwidthLiveBusy:false,bandwidthLiveTimer:null,ruleRateBusy:false,ruleRateTimer:null};
+let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let savedTheme=localStorage.getItem('nft_manager_theme')||'system';if(!['light','dark','system'].includes(savedTheme))savedTheme='system';let savedRuleSort=savedSort('nft_manager_rule_sort',['upload','download','total','connectivity']),savedTargetSort=savedSort('nft_manager_target_sort',['upload','download','total','latency']);document.documentElement.dataset.theme=savedTheme;let state={view:savedView,data:null,edit:null,importConfig:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',theme:savedTheme,targetLatency:{},ruleConnectivity:{},ruleRates:{},ruleSort:savedRuleSort,targetSort:savedTargetSort,autoProbeView:'',publicTitle:'nft-manager',dashboardPollBusy:false,dashboardPollSeconds:0,dashboardPollTimer:null,bandwidthLiveBusy:false,bandwidthLiveTimer:null,ruleRateBusy:false,ruleRateTimer:null};
 const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
@@ -1507,7 +1717,7 @@ function render(){let d=state.data;if(state.view==='dash'){let b=d.bandwidth||{}
  if(state.view==='rules'){let next=state.ruleView==='flat'?'grid':'flat',label=state.ruleView==='flat'?'平铺':'方块',icon=state.ruleView==='flat'?'☷':'▦';return shell(`<div class=page-with-fabs>${rulesTable(false)}${fabStack([fabButton(icon,label,`setRuleView('${next}')`,false,`切换为${next==='grid'?'方块':'平铺'}视图`),fabButton('⌁','连通性',`checkRuleConnectivity(this)`,false,'检查全部转发连通性'),fabButton('+','新增转发',`openRule()`,true),fabButton('↺','默认排序',`resetListSort('rule')`,false,'清除转发列表排序')])}</div>`)}
  if(state.view==='targets')return shell(`<div class=page-with-fabs><div class=panel><h2>主机管理</h2>${targetsTable()}</div>${fabStack([fabButton('◷','延迟检测',`checkTargetLatency(this)`),fabButton('+','新增主机',`openTarget()`,true),fabButton('↺','默认排序',`resetListSort('target')`,false,'清除主机列表排序')])}</div>`);
  if(state.view==='firewall')return shell(`<div class=page-with-fabs><div class=panel><h2>防火墙管理</h2><p class=muted>默认拒绝未列出的入站连接，始终保留当前 SSH 端口与 Web 面板 5555/tcp。</p>${firewallTable()}</div>${fabStack([fabButton('↻','同步端口',`syncFirewall(this)`),fabButton('+','开放端口',`openFirewall()`,true)])}</div>`);
- return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><div class=field style="max-width:520px"><label>首页轮询间隔（秒）</label><div class=actions><input id=dashboardPollSeconds type=number min=2 max=300 step=1 value="${Number(d.settings?.dashboardPollSeconds||10)}"><button class=primary onclick="savePollInterval(this)">保存间隔</button></div><p class=muted>控制流量、规则等完整首页数据刷新，范围 2-300 秒；带宽速率在首页可见时固定每秒刷新。</p></div><div class=field><label>显示模式</label><div class=theme-switch><button class="${state.theme==='light'?'active':''}" onclick="setTheme('light')">日间</button><button class="${state.theme==='dark'?'active':''}" onclick="setTheme('dark')">夜间</button><button class="${state.theme==='system'?'active':''}" onclick="setTheme('system')">跟随系统</button></div></div><p>Web 面板地址：<span class=pill>${esc(location.origin)}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
+ return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><div class=field style="max-width:520px"><label>首页轮询间隔（秒）</label><div class=actions><input id=dashboardPollSeconds type=number min=2 max=300 step=1 value="${Number(d.settings?.dashboardPollSeconds||10)}"><button class=primary onclick="savePollInterval(this)">保存间隔</button></div><p class=muted>控制流量、规则等完整首页数据刷新，范围 2-300 秒；带宽速率在首页可见时固定每秒刷新。</p></div><div class=field><label>显示模式</label><div class=theme-switch><button class="${state.theme==='light'?'active':''}" onclick="setTheme('light')">日间</button><button class="${state.theme==='dark'?'active':''}" onclick="setTheme('dark')">夜间</button><button class="${state.theme==='system'?'active':''}" onclick="setTheme('system')">跟随系统</button></div></div><div class=config-transfer><h3>配置迁移</h3><p class=muted>导出全部主机与端口转发；导入时追加到现有配置，并自动同步转发端口防火墙。</p><div class=config-actions><button onclick="exportConfig(this)">导出配置</button><button class=primary onclick="openConfigImport()">导入配置</button></div></div><p>Web 面板地址：<span class=pill>${esc(location.origin)}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
 function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
 function setTheme(theme){if(!['light','dark','system'].includes(theme))return;state.theme=theme;localStorage.setItem('nft_manager_theme',theme);document.documentElement.dataset.theme=theme;render();toast('显示模式已切换','success')}
 function ruleName(r){return r.alias||`${r.targetAlias||r.ip}:${r.lport}`}
@@ -1555,6 +1765,10 @@ async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api
 function delTarget(t){confirmDialog('删除主机','确认删除该主机？存在转发规则时将阻止删除。',async()=>{await api('/api/targets/delete',{method:'POST',body:JSON.stringify({ip:t.ip}),timeout:30000});await load()})}
 async function savePanelTitle(btn){await runAction(btn,async()=>{await api('/api/settings',{method:'POST',body:JSON.stringify({panelTitle:document.getElementById('panelTitle').value})});await load();toast('顶部标题已保存','success')})}
 async function savePollInterval(btn){await runAction(btn,async()=>{let value=Number(document.getElementById('dashboardPollSeconds').value);if(!Number.isInteger(value)||value<2||value>300)throw new Error('首页轮询间隔必须在 2-300 秒之间');await api('/api/settings',{method:'POST',body:JSON.stringify({dashboardPollSeconds:value})});await load();toast(`首页轮询间隔已设为 ${value} 秒`,'success')})}
+async function exportConfig(btn){await runAction(btn,async()=>{let headers={},token=authToken();if(token)headers.Authorization='Bearer '+token;let response=await fetch('/api/config/export',{credentials:'same-origin',headers});if(!response.ok){let error=await response.json().catch(()=>({}));let e=new Error(error.error||'导出配置失败');e.status=response.status;throw e}let blob=await response.blob(),match=(response.headers.get('Content-Disposition')||'').match(/filename="([^"]+)"/),filename=match?match[1]:'nft-manager-config.nftm',url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=filename;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('配置文件已导出','success')})}
+function openConfigImport(){state.importConfig=null;let layer=modal(`<h2>导入配置</h2><p class=dialog-copy>配置将追加到当前 VPS，现有主机和转发不会被覆盖。</p><input id=configFile type=file accept=".nftm,application/x-nft-manager-config" hidden><div class=drop-zone role=button tabindex=0><div><strong data-drop-title>选择或拖入 .nftm 配置文件</strong><small data-drop-detail>点击打开电脑文件选择器，最大 5 MB</small></div></div><div class=import-summary aria-live=polite><div><span class=muted>文件大小</span><b data-import-size>-</b></div><div><span class=muted>主机 IP</span><b data-import-targets>-</b></div><div><span class=muted>转发规则</span><b data-import-rules>-</b></div><div class=import-note data-import-note></div></div><div class=dialog-actions><button class=ghost data-cancel>取消</button><button class=primary data-confirm disabled>确认导入</button></div>`),input=layer.querySelector('#configFile'),drop=layer.querySelector('.drop-zone');let choose=()=>{input.value='';input.click()};drop.addEventListener('click',choose);drop.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();choose()}});input.addEventListener('change',()=>inspectConfigFile(input.files?.[0],layer));for(let name of ['dragenter','dragover'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.add('dragging')});for(let name of ['dragleave','drop'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.remove('dragging')});drop.addEventListener('drop',e=>inspectConfigFile(e.dataTransfer?.files?.[0],layer));layer.querySelector('[data-cancel]').onclick=()=>{state.importConfig=null;layer.remove()};layer.querySelector('[data-confirm]').onclick=e=>confirmConfigImport(e.currentTarget,layer)}
+async function inspectConfigFile(file,layer){if(!file||!layer?.isConnected)return;clearModalError();state.importConfig=null;let confirm=layer.querySelector('[data-confirm]'),drop=layer.querySelector('.drop-zone'),title=layer.querySelector('[data-drop-title]'),detail=layer.querySelector('[data-drop-detail]'),summary=layer.querySelector('.import-summary');confirm.disabled=true;summary.classList.remove('show');drop.classList.remove('ready');try{if(!file.name.toLowerCase().endsWith('.nftm'))throw new Error('请选择 .nftm 配置文件');if(file.size>5*1024*1024)throw new Error('配置文件不能超过 5 MB');title.textContent=file.name;detail.textContent='正在解析配置...';let content=await file.text(),preview=await api('/api/config/import/preview',{method:'POST',body:JSON.stringify({content}),timeout:15000});if(!layer.isConnected)return;state.importConfig={name:file.name,size:file.size,content,preview};layer.querySelector('[data-import-size]').textContent=fmt(file.size);layer.querySelector('[data-import-targets]').textContent=preview.targetCount;layer.querySelector('[data-import-rules]').textContent=preview.ruleCount;let notes=[`预计新增 ${preview.addTargetCount} 台主机、${preview.addRuleCount} 条转发`];if(preview.skippedRuleCount)notes.push(`${preview.skippedRuleCount} 条入口端口冲突将跳过${preview.skippedPorts?.length?'（'+preview.skippedPorts.join(', ')+'）':''}`);if(preview.renamedHostCount)notes.push(`${preview.renamedHostCount} 个重名主机将自动改名`);layer.querySelector('[data-import-note]').textContent=notes.join('；');summary.classList.add('show');drop.classList.add('ready');detail.textContent='解析完成，确认后才会写入当前 VPS';confirm.disabled=false}catch(e){detail.textContent='文件解析失败，请重新选择';setModalError(msg(e));if(e.status===401){layer.remove();expireSession()}}}
+async function confirmConfigImport(btn,layer){if(!state.importConfig)return;await runAction(btn,async()=>{let result=await api('/api/config/import',{method:'POST',body:JSON.stringify({content:state.importConfig.content}),timeout:60000});state.importConfig=null;layer.remove();await load();let text=`已新增 ${result.addedTargets} 台主机、${result.addedRules} 条转发`;if(result.skippedRules)text+=`，跳过 ${result.skippedRules} 条冲突规则`;toast(text,'success')})}
 function openPassword(){modal(`<h2>修改密码</h2><div class=field><label>旧密码</label><input id=oldp type=password></div><div class=field><label>新密码</label><input id=newp type=password></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="chgPwd(this)">保存</button></div>`)}
 async function chgPwd(btn){await runAction(btn,async()=>{await api('/api/password',{method:'POST',body:JSON.stringify({oldPassword:document.getElementById('oldp').value,newPassword:document.getElementById('newp').value})});document.querySelector('.modal').remove();expireSession();toast('密码已修改，请使用新密码重新登录','success')})}
 async function boot(){try{let publicSettings=await api('/api/public-settings');state.publicTitle=publicSettings.panelTitle||'nft-manager';document.title=state.publicTitle}catch(e){}if(authToken()){loading();load()}else login()}
@@ -1582,7 +1796,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def body(self):
         n = int(self.headers.get("Content-Length", "0"))
+        if n > MAX_CONFIG_BYTES + 1024 * 1024:
+            raise ValueError("请求内容过大")
         return json.loads(self.rfile.read(n) or b"{}")
+
+    def send_download(self, data, filename):
+        raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-nft-manager-config; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def authed(self):
         auth = self.headers.get("Authorization", "")
@@ -1618,6 +1843,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(rule_rate_snapshot())
             return
+        if path == "/api/config/export":
+            if not self.require():
+                return
+            filename = time.strftime("nft-manager-%Y%m%d-%H%M%S.nftm", time.localtime())
+            self.send_download(exported_config(), filename)
+            return
         raw = HTML.replace("__WEB_PANEL_VERSION__", WEB_PANEL_VERSION).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1648,6 +1879,12 @@ class Handler(BaseHTTPRequestHandler):
                 set_password(data.get("oldPassword", ""), data.get("newPassword", ""))
             elif path == "/api/settings":
                 save_settings(data)
+            elif path == "/api/config/import/preview":
+                self.send_json(preview_config_import(data.get("content")))
+                return
+            elif path == "/api/config/import":
+                self.send_json(import_config(data.get("content")))
+                return
             elif path == "/api/targets/save":
                 targets = read_targets()
                 alias, ip, old = clean_label(data.get("alias")), data.get("ip", ""), data.get("oldIp")
