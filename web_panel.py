@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -41,7 +42,7 @@ MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 MAX_CONFIG_BYTES = 5 * 1024 * 1024
 MAX_CONFIG_RULES = 10000
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.35"
+WEB_PANEL_VERSION = "3.36"
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 BANDWIDTH_LOCK = threading.Lock()
@@ -288,6 +289,67 @@ def read_firewall_ports():
         if valid_port(port):
             ports.append({"port": port, "protocol": protocol, "label": clean_label(parts[2] if len(parts) > 2 else "")})
     return ports
+
+
+def terminal_text_width(value):
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in str(value))
+
+
+def terminal_pad(value, width):
+    value = str(value)
+    return value + " " * max(0, width - terminal_text_width(value))
+
+
+def firewall_port_display(item):
+    label = clean_label(item.get("label", "")) or "未命名"
+    if label.startswith("SSH 保底"):
+        priority, source = 0, "系统保护"
+    elif label.startswith("Web 面板保底"):
+        priority, source = 1, "系统保护"
+    elif label == "转发端口":
+        priority, source = 3, "转发同步"
+    else:
+        priority, source = 2, "手动添加"
+    protocol = {"tcp": "TCP", "udp": "UDP", "tcp+udp": "TCP/UDP"}.get(
+        item.get("protocol"), str(item.get("protocol", "-")).upper()
+    )
+    return {
+        "port": int(item["port"]),
+        "protocol": protocol,
+        "purpose": label,
+        "source": source,
+        "priority": priority,
+    }
+
+
+def firewall_ports_table(ports, enabled):
+    items = sorted(
+        (firewall_port_display(item) for item in ports),
+        key=lambda item: (item["priority"], item["port"], item["protocol"]),
+    )
+    lines = [
+        "================ 已开放端口 ================",
+        f"防火墙状态：{'已启用' if enabled else '未启用'}",
+        "",
+    ]
+    if not items:
+        lines.extend(["暂无已开放端口。", "============================================"])
+        return "\n".join(lines)
+
+    headers = ("序号", "端口", "协议", "用途", "来源")
+    rows = [
+        (str(index), str(item["port"]), item["protocol"], item["purpose"], item["source"])
+        for index, item in enumerate(items, 1)
+    ]
+    widths = [
+        max(terminal_text_width(row[column]) for row in [headers, *rows])
+        for column in range(len(headers))
+    ]
+    lines.append("  ".join(terminal_pad(value, widths[index]) for index, value in enumerate(headers)))
+    lines.append("  ".join("-" * width for width in widths))
+    lines.extend("  ".join(terminal_pad(value, widths[index]) for index, value in enumerate(row)) for row in rows)
+    lines.extend(["", f"共开放 {len(items)} 个端口", "============================================"])
+    return "\n".join(lines)
 
 
 def normalize_firewall_ports(ports):
@@ -1965,7 +2027,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
     migration_ok = migrate_legacy_data()
     if "--firewall-list" in sys.argv:
-        print(json.dumps({"ports": read_firewall_ports(), "enabled": os.path.exists(FIREWALL_CONF)}, ensure_ascii=False))
+        print(firewall_ports_table(read_firewall_ports(), os.path.exists(FIREWALL_CONF)))
         raise SystemExit(0)
     if "--firewall-add" in sys.argv:
         index = sys.argv.index("--firewall-add")
