@@ -31,6 +31,7 @@ STATS_LOCK_FILE = os.path.join(CONF_DIR, ".web-stats.lock")
 HISTORY_FILE = os.path.join(CONF_DIR, "web-history.json")
 BANDWIDTH_DB = os.path.join(CONF_DIR, "web-bandwidth.db")
 SETTINGS_FILE = os.path.join(CONF_DIR, "web-settings.json")
+UPDATE_STATUS_FILE = os.path.join(CONF_DIR, "web-update-status.json")
 FIREWALL_CONF = os.path.join(CONF_DIR, "firewall.conf")
 FIREWALL_PORTS_FILE = os.path.join(CONF_DIR, "firewall-ports.db")
 FIREWALL_SSH_PORT_FILE = os.path.join(CONF_DIR, "firewall-ssh-port")
@@ -42,7 +43,8 @@ MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 MAX_CONFIG_BYTES = 5 * 1024 * 1024
 MAX_CONFIG_RULES = 10000
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.36"
+WEB_PANEL_VERSION = "3.37"
+MANAGER_SCRIPT = os.environ.get("NFT_MANAGER_SCRIPT", "/opt/nft-manager/nft.sh")
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 BANDWIDTH_LOCK = threading.Lock()
@@ -417,6 +419,109 @@ def atomic_write(path, content):
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+
+
+def parse_update_check_output(output):
+    values = {}
+    for line in command_output(output).splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in ("current", "remote", "available", "status", "source"):
+            values[key] = value.strip()
+    current = values.get("current", "")
+    remote = values.get("remote", "")
+    if not re.fullmatch(r"[0-9A-Za-z._-]{1,32}", current):
+        raise RuntimeError("本地版本信息无效")
+    if remote and not re.fullmatch(r"[0-9A-Za-z._-]{1,32}", remote):
+        raise RuntimeError("远程版本信息无效")
+    return {
+        "currentVersion": current,
+        "remoteVersion": remote,
+        "available": values.get("available") == "true",
+        "status": values.get("status", "检查失败"),
+        "source": values.get("source", ""),
+        "panelVersion": WEB_PANEL_VERSION,
+    }
+
+
+def check_online_update():
+    if not os.path.isfile(MANAGER_SCRIPT) or not os.access(MANAGER_SCRIPT, os.X_OK):
+        raise RuntimeError("未找到已安装的 nft-manager 更新脚本")
+    result = run([MANAGER_SCRIPT, "--web-update-check"], timeout=60)
+    update = parse_update_check_output(result.stdout)
+    if result.returncode != 0:
+        raise RuntimeError(update["status"] or command_output(result.stderr).strip() or "在线更新检查失败")
+    return update
+
+
+def write_online_update_status(payload):
+    atomic_write(UPDATE_STATUS_FILE, json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def read_online_update_status():
+    status = {
+        "state": "idle",
+        "stage": "idle",
+        "message": "尚未开始升级。",
+        "currentVersion": WEB_PANEL_VERSION,
+        "targetVersion": "",
+        "updatedAt": 0,
+    }
+    if os.path.exists(UPDATE_STATUS_FILE):
+        try:
+            saved = json.load(open(UPDATE_STATUS_FILE, encoding="utf-8"))
+            if isinstance(saved, dict):
+                status.update({key: saved[key] for key in status if key in saved})
+        except (OSError, TypeError, ValueError):
+            pass
+    status["panelVersion"] = WEB_PANEL_VERSION
+    return status
+
+
+def start_online_update():
+    status = read_online_update_status()
+    if status["state"] in ("queued", "running") and time.time() - int(status.get("updatedAt") or 0) < 15 * 60:
+        raise RuntimeError("已有在线升级任务正在运行")
+    update = check_online_update()
+    if not update["available"]:
+        raise RuntimeError("当前已是最新版本")
+    target = update["remoteVersion"]
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        raise RuntimeError("系统缺少 systemd-run，无法安全地在后台升级")
+    queued = {
+        "state": "queued",
+        "stage": "queued",
+        "message": f"已确认升级到 v{target}，正在启动后台任务...",
+        "currentVersion": update["currentVersion"],
+        "targetVersion": target,
+        "updatedAt": int(time.time()),
+    }
+    write_online_update_status(queued)
+    unit = f"nft-manager-web-update-{int(time.time())}-{secrets.token_hex(3)}"
+    result = run(
+        [
+            systemd_run,
+            f"--unit={unit}",
+            "--collect",
+            "--no-block",
+            "--property=Type=oneshot",
+            "--",
+            MANAGER_SCRIPT,
+            "--web-update-run",
+            target,
+        ],
+        timeout=10,
+    )
+    if result.returncode != 0:
+        queued.update({
+            "state": "error",
+            "stage": "error",
+            "message": command_output(result.stderr).strip() or "后台升级任务启动失败",
+            "updatedAt": int(time.time()),
+        })
+        write_online_update_status(queued)
+        raise RuntimeError(queued["message"])
+    return {**queued, "unit": unit}
 
 
 def firewall_ports_text(ports):
@@ -953,13 +1058,21 @@ def parse_rules():
         lport = int(m.group(1))
         if lport in seen_lports:
             continue
-        rules.append({"lport": lport, "ip": m.group(2), "dport": int(m.group(3)), "alias": "", "desc": "", "statsMode": "total", "enabled": True})
+        ip, dport = m.group(2), int(m.group(3))
+        if not (valid_port(lport) and valid_ip(ip) and valid_port(dport)):
+            continue
+        rules.append({"lport": lport, "ip": ip, "dport": dport, "alias": "", "desc": "", "statsMode": "total", "enabled": True})
         seen_lports.add(lport)
     return rules
 
 
 def write_rules_file(path, rules):
     lip = local_ip()
+    if not valid_ip(lip):
+        raise RuntimeError("无法获取有效的本机 IPv4 地址")
+    for rule in rules:
+        if not (valid_port(rule.get("lport")) and valid_ip(str(rule.get("ip", ""))) and valid_port(rule.get("dport"))):
+            raise ValueError("转发规则包含无效的端口或 IP，已拒绝写入")
     with open(path, "w", encoding="utf-8") as f:
         f.write("#!/usr/sbin/nft -f\n\n")
         f.write("# WEB_META|4\n\n")
@@ -997,11 +1110,31 @@ def write_rules_file(path, rules):
         f.write("    }\n}\n")
 
 
+def validate_rules_file(path):
+    text = open(path, encoding="utf-8", errors="strict").read()
+    validation_table = f"{TABLE_NAME}_check_{secrets.token_hex(4)}"
+    pattern = rf"(?m)^(\s*table\s+ip\s+){re.escape(TABLE_NAME)}(\s*\{{)"
+    validation_text, replacements = re.subn(pattern, rf"\g<1>{validation_table}\g<2>", text, count=1)
+    if replacements != 1:
+        raise RuntimeError("nft 配置缺少有效的 table 定义")
+    validation_file = f"{path}.check.{secrets.token_hex(8)}"
+    try:
+        with open(validation_file, "w", encoding="utf-8") as output:
+            output.write(validation_text)
+        return run_nft(["-c", "-f", validation_file], timeout=15)
+    finally:
+        if os.path.exists(validation_file):
+            os.unlink(validation_file)
+
+
 def write_rules(rules):
     ensure_dirs()
     temp_file = f"{CONF_FILE}.tmp.{secrets.token_hex(8)}"
     try:
         write_rules_file(temp_file, rules)
+        check = validate_rules_file(temp_file)
+        if check.returncode != 0:
+            raise RuntimeError(check.stderr.strip() or "nft 规则语法校验失败，原配置未改动")
         os.replace(temp_file, CONF_FILE)
     finally:
         if os.path.exists(temp_file):
@@ -1020,6 +1153,19 @@ def reload_rules():
         raise RuntimeError(res.stderr.strip() or "nft 规则加载失败")
 
 
+def rules_file_needs_repair(text):
+    local_ip_lines = re.findall(r"(?m)^\s*define\s+LOCAL_IP\s*=\s*([^\s#]+)\s*$", text)
+    if len(local_ip_lines) != 1 or not valid_ip(local_ip_lines[0]):
+        return True
+    if "WEB_META|4" not in text or 'comment "META_COUNTER_UPLOAD|' not in text:
+        return True
+    try:
+        check = validate_rules_file(CONF_FILE)
+        return check.returncode != 0
+    except (OSError, UnicodeError, RuntimeError):
+        return True
+
+
 def migrate_legacy_data():
     ensure_dirs()
     rules = parse_rules()
@@ -1035,7 +1181,7 @@ def migrate_legacy_data():
     if changed_targets:
         write_targets(targets)
 
-    if not os.path.exists(CONF_FILE) or not rules:
+    if not os.path.exists(CONF_FILE):
         return True
 
     try:
@@ -1043,22 +1189,35 @@ def migrate_legacy_data():
     except OSError:
         return False
 
-    needs_migration = "WEB_META|4" not in text or 'comment "META_COUNTER_UPLOAD|' not in text
+    needs_migration = rules_file_needs_repair(text)
     if not needs_migration:
         return True
 
     original_text = text
+    local_ip_lines = re.findall(r"(?m)^\s*define\s+LOCAL_IP\s*=\s*([^\s#]+)\s*$", text)
+    original_polluted = len(local_ip_lines) != 1 or not valid_ip(local_ip_lines[0])
+    if not original_polluted:
+        try:
+            original_check = validate_rules_file(CONF_FILE)
+            original_polluted = original_check.returncode != 0
+        except (OSError, UnicodeError, RuntimeError):
+            original_polluted = True
     temp_file = f"{CONF_FILE}.migrate.{secrets.token_hex(8)}"
+    replaced = False
     try:
         write_rules_file(temp_file, rules)
-        check = run_nft(["-c", "-f", temp_file], timeout=15)
+        check = validate_rules_file(temp_file)
         if check.returncode != 0:
             print(f"nft-manager: 旧规则迁移校验失败，已保留原配置：{check.stderr.strip()}")
             return False
         os.replace(temp_file, CONF_FILE)
+        replaced = True
         reload_rules()
         return True
     except Exception as e:
+        if original_polluted and replaced:
+            print(f"nft-manager: 已修复受污染的规则文件，但重新加载失败，未恢复污染配置：{e}")
+            return False
         restore_file = f"{CONF_FILE}.restore.{secrets.token_hex(8)}"
         try:
             with open(restore_file, "w", encoding="utf-8") as f:
@@ -1723,6 +1882,7 @@ button,input,select,textarea{font:inherit}button{cursor:pointer;border:0;border-
 .content{padding:18px 24px 40px}.page-with-fabs{min-height:calc(100vh - 112px);padding-bottom:190px}.cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.card h3{font-size:14px;margin:0 0 14px}.big{font-size:25px;font-weight:800}.bar{height:5px;background:linear-gradient(90deg,var(--blue),#b54cff);border-radius:10px;margin-top:14px}.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.panel h2{margin:0 0 14px;font-size:22px}.chart-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.chart-pair>.panel{min-width:0}.chart-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.bandwidth-live{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px 12px;font-size:12px;font-weight:700}.bandwidth-live .download{color:var(--bandwidth-download)}.bandwidth-live .upload{color:var(--bandwidth-upload)}.bandwidth-interface{width:100%;color:var(--muted);font-weight:500;text-align:right}.chart-legend{display:flex;justify-content:flex-end;gap:14px;margin:-4px 2px 4px;color:var(--muted);font-size:12px}.chart-legend span{display:inline-flex;align-items:center;gap:6px}.chart-legend i{width:16px;height:3px;border-radius:3px}.chart-legend .download i{background:var(--bandwidth-download)}.chart-legend .upload i{background:var(--bandwidth-upload)}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}.rule-table-wrap{border:1px solid var(--line);border-radius:8px;overflow:auto}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #2a2d35;padding:10px;text-align:left}.table tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.pill{display:inline-flex;gap:6px;background:#11351f;color:#68f0a4;border-radius:5px;padding:4px 8px;font-weight:700}.status{color:var(--muted)}.status.on{color:var(--green);font-weight:700}.metric.upload{color:#46a6ff}.metric.download{color:#20d98a}.metric.total{color:#b779ff}.actions{display:flex;align-items:center;gap:8px}.actions .switch{margin-right:12px}.actions button{padding:6px 10px;margin:0}.hidden{display:none!important}.view-switch{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}.view-switch button{border-radius:0;background:#17181c;padding:7px 11px}.view-switch button.active{background:#1d4d8a}.switch{position:relative;display:inline-flex;width:38px;height:22px;vertical-align:middle;flex:none}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;inset:0;background:#4a252a;border-radius:22px}.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}.switch input:checked+.slider{background:#16855b}.switch input:checked+.slider:before{transform:translateX(16px)}.rule-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}.rule-card{border:1px solid var(--line);background:#111318;padding:14px;border-radius:8px}.rule-card.disabled{opacity:.6}.rule-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.rule-card h3{font-size:15px;margin:0 0 8px}.rule-card .route{color:#cdd4e0;margin:7px 0}.rule-card .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid #2a2d35;padding-top:10px;margin-top:10px}.rule-card .metrics span{font-size:12px}.rule-card .actions{margin-top:14px}.chart-wrap{position:relative;touch-action:pan-y}.chart-svg{display:block;width:100%;height:300px}.chart-grid{stroke:var(--line);stroke-dasharray:3 4}.chart-axis{stroke:var(--muted);stroke-width:1.4}.chart-line{fill:none;stroke:var(--traffic-line);stroke-width:3}.chart-line.bandwidth-download{stroke:var(--bandwidth-download);stroke-width:2.5}.chart-line.bandwidth-upload{stroke:var(--bandwidth-upload);stroke-width:2.5}.chart-fill{fill:var(--traffic-fill)}.chart-label{fill:var(--muted);font-size:11px}.chart-axis-title{fill:var(--text);font-size:12px;font-weight:700}.chart-hover-guide{display:none;stroke:var(--muted);stroke-width:1;stroke-dasharray:4 3;pointer-events:none}.chart-hover-dot{display:none;stroke:var(--panel);stroke-width:3;pointer-events:none}.chart-hover-dot.traffic{fill:var(--traffic-line)}.chart-hover-dot.download{fill:var(--bandwidth-download)}.chart-hover-dot.upload{fill:var(--bandwidth-upload)}.chart-tooltip{position:absolute;z-index:3;display:none;min-width:150px;max-width:230px;padding:9px 11px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);box-shadow:0 10px 26px rgba(0,0,0,.28);font-size:12px;line-height:1.55;pointer-events:none}.chart-tooltip.show{display:block}.chart-tooltip-time{margin-bottom:3px;color:var(--muted);font-weight:700}.chart-tooltip-row{display:flex;justify-content:space-between;gap:16px;white-space:nowrap}.chart-tooltip-row b{font-variant-numeric:tabular-nums}.chart-tooltip-row.traffic b{color:var(--traffic-line)}.chart-tooltip-row.download b{color:var(--bandwidth-download)}.chart-tooltip-row.upload b{color:var(--bandwidth-upload)}.fab-stack{position:fixed;z-index:7;right:24px;bottom:24px;display:flex;flex-direction:column;align-items:flex-end;gap:10px}.fab{min-width:112px;height:46px;padding:0 15px;border:1px solid rgba(105,173,255,.45);border-radius:23px;background:rgba(17,40,70,.94);color:#eaf3ff;display:flex;align-items:center;justify-content:flex-start;gap:9px;box-shadow:0 10px 28px rgba(0,0,0,.3);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.fab:hover{background:#164b83}.fab.primary{border-color:rgba(8,119,255,.72);background:var(--blue)}.fab-icon{display:grid;place-items:center;width:20px;height:20px;font-size:18px;font-weight:800;line-height:1}.fab-label{font-size:13px;font-weight:700;white-space:nowrap}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;z-index:20}.dialog{width:min(720px,92vw);max-height:88vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:20px}.dialog.trace-dialog{width:min(980px,95vw)}.dialog.rules-dialog{width:min(1240px,96vw)}.dialog-copy{margin:0 0 22px;color:#d7dde8}.dialog-actions{display:flex;align-items:center;justify-content:flex-end;gap:14px;margin-top:18px}.trace-output{margin:12px 0 18px;max-height:62vh;overflow:auto;padding:14px;border:1px solid var(--line);border-radius:6px;background:#222b2e;color:#e3dac5;white-space:pre-wrap;tab-size:4;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.trace-output a{color:#68c8d6;text-decoration:underline;text-underline-offset:2px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:12px}.field label{display:block;color:#cbd1dc;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:#101217;color:#fff}.firewall-check{display:flex!important;align-items:center;gap:9px;padding:11px 12px;border:1px solid #356aa0;border-radius:6px;background:rgba(8,119,255,.1);color:#dbeafe!important;cursor:pointer}.firewall-check input{width:16px!important;height:16px;margin:0;accent-color:var(--blue)}.error-box{display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(255,90,102,.55);border-radius:6px;background:rgba(255,90,102,.12);color:#ff9aa3}.error-box.show{display:block}.toast{position:fixed;right:22px;top:18px;z-index:30;max-width:min(460px,calc(100vw - 44px));padding:12px 14px;border:1px solid rgba(255,90,102,.55);border-radius:8px;background:#2a1116;color:#ffd7dc;box-shadow:0 12px 30px rgba(0,0,0,.35)}.count-button{padding:2px 8px;background:rgba(8,119,255,.14);color:#69adff;border:1px solid rgba(8,119,255,.35)}.tags{min-height:42px;border:1px solid var(--line);background:#101217;border-radius:6px;padding:5px;display:flex;gap:6px;flex-wrap:wrap}.tag{background:#e9eef8;color:#243040;border-radius:4px;padding:4px 8px}.tag button{background:transparent;color:#667085;padding:0 0 0 6px}.tag-input{min-width:120px;flex:1;border:0!important;background:transparent!important;padding:5px!important}.preview{background:#101217;border:1px solid var(--line);border-radius:6px;padding:10px;max-height:160px;overflow:auto;color:#d7dde8}.chart{height:260px;border:1px dashed #3c414d;border-radius:8px;background:linear-gradient(180deg,rgba(128,76,255,.18),transparent)}.live-rate{display:inline-flex;align-items:center;gap:10px;white-space:nowrap;font-weight:700;font-variant-numeric:tabular-nums}.live-rate .upload{color:var(--upload)}.live-rate .download{color:var(--download)}.live-rate-slot{min-width:150px}.rule-card .live-rate-slot{display:block;min-width:0;margin-top:9px}.mobile-rate-cell,.mobile-rate-card{display:none!important}.probe-pill{display:inline-flex;align-items:center;gap:6px;min-width:96px;padding:4px 9px;border-radius:999px;background:rgba(142,150,163,.14);color:#aeb5c0;white-space:nowrap}.probe-pill i{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 0 currentColor;animation:probe-pulse 1.8s infinite}.probe-pill b{font-variant-numeric:tabular-nums}.probe-pill.good{background:rgba(29,219,120,.14);color:#58e69d}.probe-pill.warn{background:rgba(255,205,65,.15);color:#ffd262}.probe-pill.slow{background:rgba(255,159,26,.16);color:#ffae43}.probe-pill.bad{background:rgba(255,90,102,.16);color:#ff8791}.probe-pill.off{background:rgba(142,150,163,.12);color:#9aa2ae}.probe-pill.pending i{animation:none}@keyframes probe-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 0 4px transparent}}
 button,button.ghost{background:var(--button-bg);color:var(--button-text)}button.primary,button.danger{color:#fff}.login input{background:var(--surface);color:var(--text)}.side{background:var(--sidebar);border-color:var(--line-soft)}.nav button{color:var(--nav-text)}.top{border-color:var(--line-soft)}.table th,.table td{border-color:var(--line-soft)}.view-switch button{background:var(--panel)}.rule-card{background:var(--surface)}.rule-card .route{color:var(--text)}.rule-card .metrics{border-color:var(--line-soft)}.pill{background:var(--pill-bg);color:var(--pill-text)}.metric.upload{color:var(--upload)}.metric.download{color:var(--download)}.metric.total{color:var(--total)}.trace-output{background:var(--trace-bg);color:var(--trace-text)}.dialog-copy{color:var(--text)}.field label{color:var(--text)}.field input,.field select,.field textarea{background:var(--surface2);color:var(--text)}.firewall-check{color:var(--text)!important}.tags,.preview{background:var(--surface2);color:var(--text)}.toast{display:flex;align-items:center;gap:10px;border:1px solid var(--line);background:var(--panel2);color:var(--text);box-shadow:0 14px 36px rgba(0,0,0,.22);animation:toast-in .2s ease-out}.toast-icon{display:grid;place-items:center;flex:none;width:24px;height:24px;border-radius:50%;background:rgba(8,119,255,.14);color:#3996ff;font-weight:800}.toast.success .toast-icon{background:rgba(29,219,120,.14);color:var(--green)}.toast.error .toast-icon{background:rgba(255,90,102,.14);color:var(--danger)}.toast.success{border-color:rgba(29,160,98,.42)}.toast.error{border-color:rgba(226,63,77,.48)}@keyframes toast-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}.theme-switch{display:inline-grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}.theme-switch button{min-width:92px;background:transparent;color:var(--muted)}.theme-switch button.active{background:var(--blue);color:#fff}.config-transfer{margin-top:24px;padding-top:20px;border-top:1px solid var(--line-soft)}.config-transfer h3{margin:0 0 6px;font-size:16px}.config-actions{display:flex;gap:10px;margin-top:12px}.drop-zone{min-height:150px;border:2px dashed var(--line);border-radius:8px;background:var(--surface);display:grid;place-items:center;padding:22px;text-align:center;cursor:pointer;transition:border-color .16s,background .16s}.drop-zone:hover,.drop-zone.dragging{border-color:var(--blue);background:rgba(8,119,255,.08)}.drop-zone.ready{border-style:solid;border-color:var(--green)}.drop-zone strong{display:block;margin-bottom:6px;font-size:16px}.drop-zone small{color:var(--muted)}.import-summary{display:none;margin-top:14px;padding:13px;border:1px solid var(--line);border-radius:7px;background:var(--surface)}.import-summary.show{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.import-summary div{padding:8px}.import-summary b{display:block;margin-top:3px;font-size:18px}.import-note{grid-column:1/-1;color:var(--muted)}
+.update-section{margin-top:24px;padding:18px;border:1px solid var(--line-soft);border-radius:8px;background:var(--surface)}.update-section-head{display:flex;align-items:center;justify-content:space-between;gap:18px}.update-section h3{margin:0 0 5px;font-size:16px}.update-section p{margin:0}.update-version{font-variant-numeric:tabular-nums}.update-dialog{width:min(520px,92vw);overflow:hidden}.update-dialog h2{margin:0 0 8px}.update-dialog .dialog-copy{margin-bottom:16px}.update-progress{height:8px;overflow:hidden;border-radius:5px;background:var(--line-soft)}.update-progress span{display:block;width:38%;height:100%;border-radius:inherit;background:var(--blue);animation:update-progress 1.35s ease-in-out infinite}.update-progress.complete span{width:100%;animation:none;background:var(--green)}.update-progress.error span{width:100%;animation:none;background:var(--danger)}.update-stage{min-height:22px;margin:13px 0 4px;font-weight:700}.update-hint{display:block;color:var(--muted)}.update-dialog .dialog-actions{display:none}.update-dialog.error .dialog-actions{display:flex}@keyframes update-progress{0%{transform:translateX(-105%)}100%{transform:translateX(270%)}}@media(prefers-reduced-motion:reduce){.update-progress span{width:100%;animation:none}}
 .chart-svg{height:auto}
 .sort-head{display:inline-flex;align-items:center;gap:5px;padding:2px 0;border-radius:0;background:transparent!important;color:inherit!important;font-weight:inherit}.sort-head:hover,.sort-head.active{color:var(--nav-active-text)!important}.sort-arrow{display:inline-block;min-width:10px;color:var(--muted);font-size:11px}.sort-head.active .sort-arrow{color:currentColor}.sort-strip{display:none;align-items:center;gap:7px;margin:0 0 12px;padding:8px;border:1px solid var(--line-soft);border-radius:7px;background:var(--surface)}.sort-strip.grid-sort{display:flex}.sort-strip-label{margin:0 3px;color:var(--muted);font-size:12px}.sort-strip button{padding:6px 9px;background:transparent;color:var(--muted);border:1px solid transparent}.sort-strip button.active{background:var(--nav-active-bg);color:var(--nav-active-text);border-color:var(--line)}
 @media(max-width:1100px) and (min-width:761px){.cards{grid-template-columns:repeat(2,minmax(160px,1fr))}}
@@ -1731,6 +1891,7 @@ body{font-size:14px;overflow-x:hidden}.app{display:block;min-height:100dvh}.side
 .chart-pair{grid-template-columns:1fr;gap:0}.chart-panel-head{display:block}.bandwidth-live{justify-content:flex-start;margin:-4px 0 8px}.bandwidth-interface{text-align:left}.chart-legend{justify-content:flex-start}
 .sort-strip,.sort-strip.grid-sort{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.sort-strip-label{grid-column:1/-1}.sort-strip button{min-height:36px}
 .chart-svg{height:auto}.chart-label{font-size:11px}.chart-axis-title{font-size:12px}
+.update-section{padding:14px}.update-section-head{display:grid;grid-template-columns:1fr;gap:14px}.update-section-head button{width:100%;min-height:44px}.update-dialog{width:calc(100vw - 24px)}.update-dialog .dialog-actions{position:static;margin:18px 0 0;padding:0;border:0;background:transparent}.update-dialog .dialog-actions button{width:100%}
 }
 </style></head><body><div id="root"></div><script>
 const appRoot=document.getElementById('root');
@@ -1738,19 +1899,20 @@ const authToken=()=>localStorage.getItem('nft_manager_token')||'';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 window.addEventListener('error',e=>{if(appRoot&&!appRoot.innerHTML)appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>前端加载失败</p><p>${e.message}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`});
 function savedSort(storageKey,allowed){try{let value=JSON.parse(localStorage.getItem(storageKey)||'{}');if(allowed.includes(value.key)&&['asc','desc'].includes(value.direction))return value}catch(e){}return {key:'',direction:''}}
-let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let savedTheme=localStorage.getItem('nft_manager_theme')||'system';if(!['light','dark','system'].includes(savedTheme))savedTheme='system';let savedRuleSort=savedSort('nft_manager_rule_sort',['upload','download','total','connectivity']),savedTargetSort=savedSort('nft_manager_target_sort',['upload','download','total','latency']);document.documentElement.dataset.theme=savedTheme;let state={view:savedView,data:null,edit:null,importConfig:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',theme:savedTheme,targetLatency:{},ruleConnectivity:{},ruleRates:{},ruleSort:savedRuleSort,targetSort:savedTargetSort,autoProbeView:'',publicTitle:'nft-manager',dashboardPollBusy:false,dashboardPollSeconds:0,dashboardPollTimer:null,bandwidthLiveBusy:false,bandwidthLiveTimer:null,ruleRateBusy:false,ruleRateTimer:null};
+let savedView=localStorage.getItem('nft_manager_view')||'dash';if(!['dash','rules','targets','firewall','settings'].includes(savedView))savedView='dash';let savedTheme=localStorage.getItem('nft_manager_theme')||'system';if(!['light','dark','system'].includes(savedTheme))savedTheme='system';let savedRuleSort=savedSort('nft_manager_rule_sort',['upload','download','total','connectivity']),savedTargetSort=savedSort('nft_manager_target_sort',['upload','download','total','latency']);document.documentElement.dataset.theme=savedTheme;let state={view:savedView,data:null,edit:null,importConfig:null,ruleView:localStorage.getItem('nft_manager_rule_view')||'flat',theme:savedTheme,targetLatency:{},ruleConnectivity:{},ruleRates:{},ruleSort:savedRuleSort,targetSort:savedTargetSort,autoProbeView:'',publicTitle:'nft-manager',dashboardPollBusy:false,dashboardPollSeconds:0,dashboardPollTimer:null,bandwidthLiveBusy:false,bandwidthLiveTimer:null,ruleRateBusy:false,ruleRateTimer:null,updateMonitor:false,updateTimer:null};
 const api=(p,o={})=>{let {timeout=12000,...request}=o,headers={'Content-Type':'application/json',...(request.headers||{})};let token=authToken();if(token)headers.Authorization='Bearer '+token;let ctl=new AbortController();let timer=setTimeout(()=>ctl.abort(),timeout);return fetch(p,{credentials:'same-origin',...request,headers,signal:ctl.signal}).then(async r=>{let j=await r.json().catch(()=>({}));if(!r.ok){let e=new Error(j.error||'请求失败');e.status=r.status;throw e}return j}).catch(e=>{if(e.name==='AbortError')throw new Error('请求超时，请检查 Web 服务或 nftables 状态');throw e}).finally(()=>clearTimeout(timer))};
 const fmt=b=>b>1073741824?(b/1073741824).toFixed(2)+' GB':b>1048576?(b/1048576).toFixed(2)+' MB':b>1024?(b/1024).toFixed(1)+' KB':b+' B';
 const msg=e=>e?.message||String(e||'操作失败');
 function toast(text,type='info'){document.querySelectorAll('.toast').forEach(x=>x.remove());let icon=type==='success'?'✓':type==='error'?'!':'i';document.body.insertAdjacentHTML('beforeend',`<div class="toast ${type}" role=status><span class=toast-icon>${icon}</span><span>${esc(text)}</span></div>`);setTimeout(()=>document.querySelector('.toast')?.remove(),4000)}
-function setModalError(text){let box=document.querySelector('.modal .error-box');if(box){box.textContent=text;box.classList.add('show')}else toast(text,'error')}
-function clearModalError(){let box=document.querySelector('.modal .error-box');if(box){box.textContent='';box.classList.remove('show')}}
-function expireSession(){localStorage.removeItem('nft_manager_token');state.data=null;if(state.dashboardPollTimer)clearInterval(state.dashboardPollTimer);if(state.bandwidthLiveTimer)clearInterval(state.bandwidthLiveTimer);if(state.ruleRateTimer)clearInterval(state.ruleRateTimer);state.dashboardPollTimer=null;state.bandwidthLiveTimer=null;state.ruleRateTimer=null;login()}
-async function runAction(btn,fn){let old=btn?.textContent;if(btn){btn.disabled=true;btn.textContent='处理中...'}try{await fn()}catch(e){if(e.status===401)expireSession();else setModalError(msg(e))}finally{if(btn){btn.disabled=false;btn.textContent=old}}}
+function modalErrorBox(scope){return scope?.querySelector?.('.error-box')||null}
+function setModalError(text,scope){let box=modalErrorBox(scope);if(box){box.textContent=text;box.classList.add('show')}else toast(text,'error')}
+function clearModalError(scope){let box=modalErrorBox(scope);if(box){box.textContent='';box.classList.remove('show')}}
+function expireSession(){localStorage.removeItem('nft_manager_token');state.data=null;if(state.dashboardPollTimer)clearInterval(state.dashboardPollTimer);if(state.bandwidthLiveTimer)clearInterval(state.bandwidthLiveTimer);if(state.ruleRateTimer)clearInterval(state.ruleRateTimer);if(state.updateTimer)clearTimeout(state.updateTimer);state.dashboardPollTimer=null;state.bandwidthLiveTimer=null;state.ruleRateTimer=null;state.updateTimer=null;state.updateMonitor=false;login()}
+async function runAction(btn,fn){let old=btn?.textContent,scope=btn?.closest?.('.modal');if(btn){btn.disabled=true;btn.textContent='处理中...'}clearModalError(scope);try{await fn()}catch(e){if(e.status===401)expireSession();else setModalError(msg(e),scope)}finally{if(btn){btn.disabled=false;btn.textContent=old}}}
 function loading(){appRoot.innerHTML=`<div class=login><form><h2>${esc(state.publicTitle)}</h2><p class=muted>正在加载...</p></form></div>`}
 function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>${esc(state.publicTitle)}</h2><p class=muted>默认账号 admin / admin</p><input name=u value=admin placeholder=账号><input name=p type=password value=admin placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err),'error')}finally{btn.disabled=false;btn.textContent=old}}
-async function load(){try{state.data=await api('/api/state');document.title=state.data.settings?.panelTitle||'nft-manager';syncDashboardPoll();render();syncBandwidthLive();syncRuleRates();autoProbeCurrentView()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
+async function load(){try{state.data=await api('/api/state');document.title=state.data.settings?.panelTitle||'nft-manager';syncDashboardPoll();render();syncBandwidthLive();syncRuleRates();autoProbeCurrentView();resumeOnlineUpdate()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){if(state.view!==v)state.autoProbeView='';state.view=v;localStorage.setItem('nft_manager_view',v);render();syncBandwidthLive();syncRuleRates();autoProbeCurrentView();if(v==='dash')pollDashboard()}
 function shell(content){let n=[['dash','仪表板','⌂'],['rules','转发管理','⇄'],['targets','主机管理','▣'],['firewall','防火墙','◫'],['settings','设置','⚙']].map(x=>`<button class="${state.view==x[0]?'active':''}" onclick="nav('${x[0]}')"><span class=nav-icon aria-hidden=true>${x[2]}</span><span>${x[1]}</span></button>`).join(''),title=esc(state.data.settings?.panelTitle||'nft-manager');appRoot.innerHTML=`<div class=app><aside class=side><div class=brand>${title}</div><div class=ver>v__WEB_PANEL_VERSION__</div><div class=nav>${n}</div><div class=foot>Powered by nft-manager</div></aside><main class=main><div class=top><span class=mobile-brand>${title}</span><span class=user>admin ▾</span></div><div class=content>${content}</div></main></div>`}
 function hourText(stamp){return String(new Date(stamp*1000).getHours()).padStart(2,'0')+':00'}
@@ -1779,7 +1941,7 @@ function render(){let d=state.data;if(state.view==='dash'){let b=d.bandwidth||{}
  if(state.view==='rules'){let next=state.ruleView==='flat'?'grid':'flat',label=state.ruleView==='flat'?'平铺':'方块',icon=state.ruleView==='flat'?'☷':'▦';return shell(`<div class=page-with-fabs>${rulesTable(false)}${fabStack([fabButton(icon,label,`setRuleView('${next}')`,false,`切换为${next==='grid'?'方块':'平铺'}视图`),fabButton('⌁','连通性',`checkRuleConnectivity(this)`,false,'检查全部转发连通性'),fabButton('+','新增转发',`openRule()`,true),fabButton('↺','默认排序',`resetListSort('rule')`,false,'清除转发列表排序')])}</div>`)}
  if(state.view==='targets')return shell(`<div class=page-with-fabs><div class=panel><h2>主机管理</h2>${targetsTable()}</div>${fabStack([fabButton('◷','延迟检测',`checkTargetLatency(this)`),fabButton('+','新增主机',`openTarget()`,true),fabButton('↺','默认排序',`resetListSort('target')`,false,'清除主机列表排序')])}</div>`);
  if(state.view==='firewall')return shell(`<div class=page-with-fabs><div class=panel><h2>防火墙管理</h2><p class=muted>默认拒绝未列出的入站连接，始终保留当前 SSH 端口与 Web 面板 5555/tcp。</p>${firewallTable()}</div>${fabStack([fabButton('↻','同步端口',`syncFirewall(this)`),fabButton('+','开放端口',`openFirewall()`,true)])}</div>`);
- return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><div class=field style="max-width:520px"><label>首页轮询间隔（秒）</label><div class=actions><input id=dashboardPollSeconds type=number min=2 max=300 step=1 value="${Number(d.settings?.dashboardPollSeconds||10)}"><button class=primary onclick="savePollInterval(this)">保存间隔</button></div><p class=muted>控制流量、规则等完整首页数据刷新，范围 2-300 秒；带宽速率在首页可见时固定每秒刷新。</p></div><div class=field><label>显示模式</label><div class=theme-switch><button class="${state.theme==='light'?'active':''}" onclick="setTheme('light')">日间</button><button class="${state.theme==='dark'?'active':''}" onclick="setTheme('dark')">夜间</button><button class="${state.theme==='system'?'active':''}" onclick="setTheme('system')">跟随系统</button></div></div><div class=config-transfer><h3>配置迁移</h3><p class=muted>导出全部主机与端口转发；导入时追加到现有配置，并自动同步转发端口防火墙。</p><div class=config-actions><button onclick="exportConfig(this)">导出配置</button><button class=primary onclick="openConfigImport()">导入配置</button></div></div><p>Web 面板地址：<span class=pill>${esc(location.origin)}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
+ return shell(`<div class=panel><h2>系统设置</h2><div class=field style="max-width:520px"><label>顶部标题</label><div class=actions><input id=panelTitle maxlength=64 value="${esc(d.settings?.panelTitle||'nft-manager')}"><button class=primary onclick="savePanelTitle(this)">保存标题</button></div></div><div class=field style="max-width:520px"><label>首页轮询间隔（秒）</label><div class=actions><input id=dashboardPollSeconds type=number min=2 max=300 step=1 value="${Number(d.settings?.dashboardPollSeconds||10)}"><button class=primary onclick="savePollInterval(this)">保存间隔</button></div><p class=muted>控制流量、规则等完整首页数据刷新，范围 2-300 秒；带宽速率在首页可见时固定每秒刷新。</p></div><div class=field><label>显示模式</label><div class=theme-switch><button class="${state.theme==='light'?'active':''}" onclick="setTheme('light')">日间</button><button class="${state.theme==='dark'?'active':''}" onclick="setTheme('dark')">夜间</button><button class="${state.theme==='system'?'active':''}" onclick="setTheme('system')">跟随系统</button></div></div><section class=update-section><div class=update-section-head><div><h3>在线更新</h3><p class=muted>当前版本 <span class=update-version>v__WEB_PANEL_VERSION__</span>，升级期间 Web 服务会短暂重启。</p></div><button class=primary onclick="checkOnlineUpdate(this)">检查更新</button></div></section><div class=config-transfer><h3>配置迁移</h3><p class=muted>导出全部主机与端口转发；导入时追加到现有配置，并自动同步转发端口防火墙。</p><div class=config-actions><button onclick="exportConfig(this)">导出配置</button><button class=primary onclick="openConfigImport()">导入配置</button></div></div><p>Web 面板地址：<span class=pill>${esc(location.origin)}</span></p><p>默认端口：5555</p><button onclick="openPassword()">修改密码</button> <button class=danger onclick="showInfo('完整卸载','请在 SSH 菜单执行完整卸载')">完整卸载</button></div>`)}
 function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
 function setTheme(theme){if(!['light','dark','system'].includes(theme))return;state.theme=theme;localStorage.setItem('nft_manager_theme',theme);document.documentElement.dataset.theme=theme;render();toast('显示模式已切换','success')}
 function ruleName(r){return r.alias||`${r.targetAlias||r.ip}:${r.lport}`}
@@ -1806,7 +1968,7 @@ function targetsTable(){let summary={};state.data.rules.forEach(r=>{let s=summar
 function openTargetRules(t){let rules=state.data.rules.filter(r=>r.ip===t.ip),layer=modal(`<h2>${esc(t.alias)} 的转发规则</h2><p class=dialog-copy>${esc(t.ip)}，共 ${rules.length} 条</p>${rulesTable(false,rules)}<div class=dialog-actions style="margin-top:18px"><button class=primary data-close>关闭</button></div>`);layer.classList.add('target-rules-layer');layer.querySelector('.dialog').classList.add('rules-dialog');layer.querySelector('[data-close]').onclick=()=>layer.remove()}
 function firewallTable(){let ports=state.data.firewall?.ports||[],baseline=state.data.firewall?.baselinePorts||[],rows=ports.map(p=>{let locked=baseline.includes(p.port);return `<tr><td data-label="端口">${p.port}</td><td data-label="协议">${p.protocol}</td><td data-label="来源/说明">${p.label||'-'}</td><td data-label="操作" class=actions>${locked?'<span class=muted>保底端口</span>':`<button class=danger onclick="delFirewall(${p.port},'${p.protocol}')">关闭</button>`}</td></tr>`}).join('');return `<div class=rule-table-wrap><table class=table><thead><tr><th>端口</th><th>协议</th><th>来源/说明</th><th>操作</th></tr></thead><tbody>${rows||'<tr><td colspan=4 class=muted>防火墙尚未初始化</td></tr>'}</tbody></table></div>`}
 function openFirewall(){modal(`<h2>开放端口</h2><div class=grid><div class=field><label>端口</label><input id=fwPort placeholder="例如：8080"></div><div class=field><label>协议</label><select id=fwProtocol><option value=tcp+udp>TCP + UDP</option><option value=tcp>TCP</option><option value=udp>UDP</option></select></div></div><div class=field><label>说明</label><input id=fwLabel value="手动开放"></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="saveFirewall(this)">开放</button></div>`)}
-async function saveFirewall(btn){await runAction(btn,async()=>{await api('/api/firewall/add',{method:'POST',body:JSON.stringify({port:document.getElementById('fwPort').value,protocol:document.getElementById('fwProtocol').value,label:document.getElementById('fwLabel').value}),timeout:30000});document.querySelector('.modal').remove();await load()})}
+async function saveFirewall(btn){await runAction(btn,async()=>{await api('/api/firewall/add',{method:'POST',body:JSON.stringify({port:document.getElementById('fwPort').value,protocol:document.getElementById('fwProtocol').value,label:document.getElementById('fwLabel').value}),timeout:30000});btn.closest('.modal')?.remove();await load()})}
 function delFirewall(port,protocol){confirmDialog('关闭端口',`确认关闭 ${port}/${protocol}？`,async()=>{await api('/api/firewall/delete',{method:'POST',body:JSON.stringify({port,protocol}),timeout:30000});await load()})}
 async function syncFirewall(btn){await runAction(btn,async()=>{await api('/api/firewall/sync',{method:'POST',body:'{}',timeout:30000});await load();toast('已同步现有转发端口','success')})}
 async function checkTargetLatency(btn,quiet=false){await runAction(btn,async()=>{let result=await api('/api/targets/latency',{method:'POST',body:'{}',timeout:60000});state.targetLatency=result.results||{};render();if(!quiet)toast('延迟检测完成','success')})}
@@ -1814,25 +1976,31 @@ async function checkRuleConnectivity(btn,quiet=false){await runAction(btn,async(
 function autoProbeCurrentView(){if(!state.data||state.autoProbeView===state.view)return;if(state.view==='dash'){state.autoProbeView='dash';checkRuleConnectivity(null,true)}else if(state.view==='targets'){state.autoProbeView='targets';checkTargetLatency(null,true)}else if(state.view==='rules'){state.autoProbeView='rules';checkRuleConnectivity(null,true)}}
 function ansiToHtml(text){let colors={30:'#111827',31:'#ff7b86',32:'#8bd49c',33:'#e6c27a',34:'#82b1ff',35:'#f38ac2',36:'#70d6e5',37:'#f1eadb',90:'#8a9499',91:'#ff8f9a',92:'#a4e5ae',93:'#f4d68f',94:'#9bc1ff',95:'#f5a5cf',96:'#91e2ed',97:'#ffffff'},fg='',bold=false,out='',last=0,re=/\x1b\[([0-9;]*)m/g,esc=s=>s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),safe=s=>{let p=0,result='',urls=/https?:\/\/[^\s<>"']+/g,m;while((m=urls.exec(s))){result+=esc(s.slice(p,m.index));let url=esc(m[0]);result+=`<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;p=urls.lastIndex}return result+esc(s.slice(p))},paint=s=>{if(!s)return;let style=[fg&&`color:${fg}`,bold&&'font-weight:700'].filter(Boolean).join(';'),content=safe(s);out+=style?`<span style="${style}">${content}</span>`:content},match;while((match=re.exec(text))){paint(text.slice(last,match.index));let codes=(match[1]||'0').split(';').map(Number);for(let i=0;i<codes.length;i++){let c=codes[i];if(c===0){fg='';bold=false}else if(c===1)bold=true;else if(c===22)bold=false;else if(c===39)fg='';else if(colors[c])fg=colors[c];else if(c===38&&codes[i+1]===2&&codes.length>=i+4){fg=`rgb(${codes[i+2]},${codes[i+3]},${codes[i+4]})`;i+=4}else if(c===38&&codes[i+1]===5&&codes.length>=i+2){let n=codes[i+2],v=n<16?(colors[[30,31,32,33,34,35,36,37,90,91,92,93,94,95,96,97][n]]||'#f1eadb'):n>=232?`rgb(${8+(n-232)*10},${8+(n-232)*10},${8+(n-232)*10})`:`rgb(${Math.floor((n-16)/36)*51},${Math.floor((n-16)%36/6)*51},${(n-16)%6*51})`;fg=v;i+=2}}last=re.lastIndex}paint(text.slice(last));return out}
 function traceTarget(t){let layer=modal(`<h2>NextTrace 路由</h2><p class=dialog-copy data-trace-target></p><pre class=trace-output><code>正在从本机执行 nexttrace，请稍候...</code></pre><div class=dialog-actions><button class=primary data-close>关闭</button></div>`),code=layer.querySelector('code');layer.querySelector('.dialog').classList.add('trace-dialog');layer.querySelector('[data-trace-target]').textContent=`目标主机：${t.alias} (${t.ip})`;layer.querySelector('[data-close]').addEventListener('click',()=>layer.remove());api('/api/targets/trace',{method:'POST',body:JSON.stringify({ip:t.ip}),timeout:125000}).then(r=>{code.innerHTML=ansiToHtml((r.output||'NextTrace 未返回输出。').replace(/\r\n?/g,'\n'))}).catch(e=>{if(e.status===401){layer.remove();expireSession();return}code.textContent=`路由执行失败：${msg(e)}`})}
-function modal(html){document.body.insertAdjacentHTML('beforeend',`<div class=modal><div class=dialog><div class=error-box></div>${html}</div></div>`);let layer=document.body.lastElementChild;layer.addEventListener('click',e=>{if(e.target===layer)layer.remove()});return layer}
+function modal(html){document.body.insertAdjacentHTML('beforeend',`<div class=modal><div class=dialog><div class=error-box></div>${html}</div></div>`);let layer=document.body.lastElementChild;layer.addEventListener('click',e=>{if(e.target===layer&&layer.dataset.locked!=='true')layer.remove()});return layer}
 function showInfo(title,text){let layer=modal(`<h2>${title}</h2><p class=dialog-copy>${text}</p><div class=dialog-actions><button class=primary data-confirm>确定</button></div>`);layer.querySelector('[data-confirm]').addEventListener('click',()=>layer.remove())}
 function confirmDialog(title,text,action){let layer=modal(`<h2>${title}</h2><p class=dialog-copy>${text}</p><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>确定</button></div>`),cancel=layer.querySelector('[data-cancel]'),confirmBtn=layer.querySelector('[data-confirm]');cancel.addEventListener('click',()=>layer.remove());confirmBtn.addEventListener('click',async()=>{let old=confirmBtn.textContent;confirmBtn.disabled=true;confirmBtn.textContent='处理中...';try{await action();layer.remove()}catch(e){if(e.status===401){layer.remove();expireSession()}else toast(msg(e),'error')}finally{confirmBtn.disabled=false;confirmBtn.textContent=old}})}
-document.addEventListener('keydown',e=>{let layers=document.querySelectorAll('.modal'),layer=layers[layers.length-1];if(!layer)return;if(e.key==='Escape'){e.preventDefault();layer.remove();return}if(e.key==='Enter'&&!e.shiftKey&&e.target.tagName!=='TEXTAREA'){let button=layer.querySelector('[data-confirm],button.primary');if(button&&!button.disabled){e.preventDefault();button.click()}}})
+document.addEventListener('keydown',e=>{let layers=document.querySelectorAll('.modal'),layer=layers[layers.length-1];if(!layer)return;if(layer.dataset.locked==='true'){if(e.key==='Escape'||e.key==='Enter')e.preventDefault();return}if(e.key==='Escape'){e.preventDefault();layer.remove();return}if(e.key==='Enter'&&!e.shiftKey&&e.target.tagName!=='TEXTAREA'){let button=layer.querySelector('[data-confirm],button.primary');if(button&&!button.disabled){e.preventDefault();button.click()}}})
 function parsePorts(value){let ports=value.trim().split(/[ ,]+/).filter(Boolean);if(!ports.length)throw new Error('请至少输入一个入口端口');let seen=new Set;for(let port of ports){if(!/^[0-9]+$/.test(port)||Number(port)<1||Number(port)>65535)throw new Error(`端口无效: ${port}；仅支持单个端口，请用空格或英文逗号分隔`);if(seen.has(port))throw new Error(`端口重复: ${port}`);seen.add(port)}return ports}
 function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,stats=r?.statsMode||'total',opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join(''),firewallOption=r?'':`<div class=field><label class=firewall-check><input id=openFirewall type=checkbox checked>同时开放此端口</label></div>`;modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>统计口径</label><select id=statsMode><option value=upload ${stats==='upload'?'selected':''}>上传流量</option><option value=download ${stats==='download'?'selected':''}>下载流量</option><option value=total ${stats==='total'?'selected':''}>上传 + 下载总计</option></select></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div>${firewallOption}<div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="saveRule(this)">保存</button></div>`)}
 async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),open=document.getElementById('openFirewall'),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value,openFirewall:open?open.checked:true};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});btn.closest('.modal')?.remove();document.querySelector('.target-rules-layer')?.remove();await load()})}
 function delRules(lports){let layer=modal(`<h2>删除转发</h2><p class=dialog-copy>确认删除该端口转发？</p><label class=firewall-check><input id=closeFirewall type=checkbox checked>删除后同时关闭此端口</label><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>删除</button></div>`);layer.querySelector('[data-cancel]').onclick=()=>layer.remove();layer.querySelector('[data-confirm]').onclick=async e=>{await runAction(e.currentTarget,async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports,closeFirewall:layer.querySelector('#closeFirewall').checked}),timeout:30000});layer.remove();document.querySelector('.target-rules-layer')?.remove();await load()})}}
 function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP</label><input id=tip value="${t?.ip||''}"></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
-async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});document.querySelector('.modal').remove();await load()})}
+async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});btn.closest('.modal')?.remove();await load()})}
 function delTarget(t){confirmDialog('删除主机','确认删除该主机？存在转发规则时将阻止删除。',async()=>{await api('/api/targets/delete',{method:'POST',body:JSON.stringify({ip:t.ip}),timeout:30000});await load()})}
 async function savePanelTitle(btn){await runAction(btn,async()=>{await api('/api/settings',{method:'POST',body:JSON.stringify({panelTitle:document.getElementById('panelTitle').value})});await load();toast('顶部标题已保存','success')})}
 async function savePollInterval(btn){await runAction(btn,async()=>{let value=Number(document.getElementById('dashboardPollSeconds').value);if(!Number.isInteger(value)||value<2||value>300)throw new Error('首页轮询间隔必须在 2-300 秒之间');await api('/api/settings',{method:'POST',body:JSON.stringify({dashboardPollSeconds:value})});await load();toast(`首页轮询间隔已设为 ${value} 秒`,'success')})}
+async function checkOnlineUpdate(btn){await runAction(btn,async()=>{let update=await api('/api/update/check',{method:'POST',body:'{}',timeout:65000});if(!update.available){showInfo('检查更新',`当前版本 v${update.currentVersion}，已经是最新版本。`);return}confirmDialog('发现新版本',`当前版本 v${update.currentVersion}，可升级到 v${update.remoteVersion}。升级会短暂重启 Web 服务，确认现在升级？`,async()=>{let started=await api('/api/update/start',{method:'POST',body:'{}',timeout:65000});showOnlineUpdateProgress(started)})})}
+function updateStageText(status){let labels={queued:'正在启动后台升级任务...',checking:'正在核对更新源与版本...',downloading:'正在下载并校验新版脚本...',installing:`正在安装 v${status.targetVersion||''}...`,restarting:'正在重启 Web 服务，等待重新连接...',complete:'升级完成，正在刷新页面...',error:'在线升级未完成'};return status.message||labels[status.stage]||'正在处理在线升级...'}
+function applyOnlineUpdateStatus(layer,status){if(status.currentVersion)layer.dataset.current=status.currentVersion;if(status.targetVersion)layer.dataset.target=status.targetVersion;let progress=layer.querySelector('.update-progress'),stage=layer.querySelector('[data-update-stage]'),version=layer.querySelector('[data-update-version]'),hint=layer.querySelector('[data-update-hint]'),current=status.currentVersion||layer.dataset.current||'__WEB_PANEL_VERSION__',target=status.targetVersion||layer.dataset.target||'检测中';progress.classList.toggle('complete',status.state==='complete');progress.classList.toggle('error',status.state==='error');stage.textContent=updateStageText({...status,targetVersion:target});version.textContent=`v${current} → v${target}`;hint.textContent=status.state==='error'?'可关闭窗口后重试，现有转发配置不会被清除。':'升级期间请保持此页面打开，服务恢复后将自动刷新。'}
+function showOnlineUpdateProgress(initial={}){document.querySelector('.update-monitor-layer')?.remove();if(state.updateTimer)clearTimeout(state.updateTimer);state.updateMonitor=true;let layer=modal(`<h2>正在在线升级</h2><p class=dialog-copy data-update-version>正在确认版本...</p><div class=update-progress aria-hidden=true><span></span></div><p class=update-stage data-update-stage aria-live=polite>正在启动后台升级任务...</p><small class=update-hint data-update-hint>升级期间请保持此页面打开，服务恢复后将自动刷新。</small><div class=dialog-actions><button class=primary data-close>关闭</button></div>`);layer.classList.add('update-monitor-layer');layer.dataset.locked='true';layer.dataset.started=String(Date.now());layer.querySelector('.dialog').classList.add('update-dialog');layer.querySelector('[data-close]').onclick=()=>{state.updateMonitor=false;layer.remove()};applyOnlineUpdateStatus(layer,initial);pollOnlineUpdate(layer)}
+async function pollOnlineUpdate(layer){if(!layer?.isConnected||!state.updateMonitor)return;try{let status=await api('/api/update/status',{timeout:5000});if(!layer.isConnected)return;applyOnlineUpdateStatus(layer,status);if(status.state==='complete'&&(!status.targetVersion||status.panelVersion===status.targetVersion)){state.updateMonitor=false;state.updateTimer=setTimeout(()=>location.reload(),1100);return}if(status.state==='error'){state.updateMonitor=false;layer.dataset.locked='false';layer.querySelector('.dialog').classList.add('error');return}}catch(e){if(!layer.isConnected)return;applyOnlineUpdateStatus(layer,{state:'running',stage:'restarting',currentVersion:'__WEB_PANEL_VERSION__',targetVersion:'',message:'Web 服务正在重启，等待重新连接...'});if(Date.now()-Number(layer.dataset.started)>10*60*1000){state.updateMonitor=false;layer.dataset.locked='false';layer.querySelector('.dialog').classList.add('error');applyOnlineUpdateStatus(layer,{state:'error',stage:'error',message:'等待 Web 服务恢复超时，请稍后刷新页面检查。'});return}}state.updateTimer=setTimeout(()=>pollOnlineUpdate(layer),1500)}
+async function resumeOnlineUpdate(){if(state.updateMonitor||!authToken())return;try{let status=await api('/api/update/status',{timeout:4000});if(['queued','running'].includes(status.state))showOnlineUpdateProgress(status)}catch(e){}}
 async function exportConfig(btn){await runAction(btn,async()=>{let headers={},token=authToken();if(token)headers.Authorization='Bearer '+token;let response=await fetch('/api/config/export',{credentials:'same-origin',headers});if(!response.ok){let error=await response.json().catch(()=>({}));let e=new Error(error.error||'导出配置失败');e.status=response.status;throw e}let blob=await response.blob(),match=(response.headers.get('Content-Disposition')||'').match(/filename="([^"]+)"/),filename=match?match[1]:'nft-manager-config.nftm',url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=filename;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('配置文件已导出','success')})}
 function openConfigImport(){state.importConfig=null;let layer=modal(`<h2>导入配置</h2><p class=dialog-copy>配置将追加到当前 VPS，现有主机和转发不会被覆盖。</p><input id=configFile type=file accept=".nftm,application/x-nft-manager-config" hidden><div class=drop-zone role=button tabindex=0><div><strong data-drop-title>选择或拖入 .nftm 配置文件</strong><small data-drop-detail>点击打开电脑文件选择器，最大 5 MB</small></div></div><div class=import-summary aria-live=polite><div><span class=muted>文件大小</span><b data-import-size>-</b></div><div><span class=muted>主机 IP</span><b data-import-targets>-</b></div><div><span class=muted>转发规则</span><b data-import-rules>-</b></div><div class=import-note data-import-note></div></div><div class=dialog-actions><button class=ghost data-cancel>取消</button><button class=primary data-confirm disabled>确认导入</button></div>`),input=layer.querySelector('#configFile'),drop=layer.querySelector('.drop-zone');let choose=()=>{input.value='';input.click()};drop.addEventListener('click',choose);drop.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();choose()}});input.addEventListener('change',()=>inspectConfigFile(input.files?.[0],layer));for(let name of ['dragenter','dragover'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.add('dragging')});for(let name of ['dragleave','drop'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.remove('dragging')});drop.addEventListener('drop',e=>inspectConfigFile(e.dataTransfer?.files?.[0],layer));layer.querySelector('[data-cancel]').onclick=()=>{state.importConfig=null;layer.remove()};layer.querySelector('[data-confirm]').onclick=e=>confirmConfigImport(e.currentTarget,layer)}
 async function inspectConfigFile(file,layer){if(!file||!layer?.isConnected)return;clearModalError();state.importConfig=null;let confirm=layer.querySelector('[data-confirm]'),drop=layer.querySelector('.drop-zone'),title=layer.querySelector('[data-drop-title]'),detail=layer.querySelector('[data-drop-detail]'),summary=layer.querySelector('.import-summary');confirm.disabled=true;summary.classList.remove('show');drop.classList.remove('ready');try{if(!file.name.toLowerCase().endsWith('.nftm'))throw new Error('请选择 .nftm 配置文件');if(file.size>5*1024*1024)throw new Error('配置文件不能超过 5 MB');title.textContent=file.name;detail.textContent='正在解析配置...';let content=await file.text(),preview=await api('/api/config/import/preview',{method:'POST',body:JSON.stringify({content}),timeout:15000});if(!layer.isConnected)return;state.importConfig={name:file.name,size:file.size,content,preview};layer.querySelector('[data-import-size]').textContent=fmt(file.size);layer.querySelector('[data-import-targets]').textContent=preview.targetCount;layer.querySelector('[data-import-rules]').textContent=preview.ruleCount;let notes=[`预计新增 ${preview.addTargetCount} 台主机、${preview.addRuleCount} 条转发`];if(preview.skippedRuleCount)notes.push(`${preview.skippedRuleCount} 条入口端口冲突将跳过${preview.skippedPorts?.length?'（'+preview.skippedPorts.join(', ')+'）':''}`);if(preview.renamedHostCount)notes.push(`${preview.renamedHostCount} 个重名主机将自动改名`);layer.querySelector('[data-import-note]').textContent=notes.join('；');summary.classList.add('show');drop.classList.add('ready');detail.textContent='解析完成，确认后才会写入当前 VPS';confirm.disabled=false}catch(e){detail.textContent='文件解析失败，请重新选择';setModalError(msg(e));if(e.status===401){layer.remove();expireSession()}}}
 async function confirmConfigImport(btn,layer){if(!state.importConfig)return;await runAction(btn,async()=>{let result=await api('/api/config/import',{method:'POST',body:JSON.stringify({content:state.importConfig.content}),timeout:60000});state.importConfig=null;layer.remove();await load();let text=`已新增 ${result.addedTargets} 台主机、${result.addedRules} 条转发`;if(result.skippedRules)text+=`，跳过 ${result.skippedRules} 条冲突规则`;toast(text,'success')})}
 function openPassword(){modal(`<h2>修改密码</h2><div class=field><label>旧密码</label><input id=oldp type=password></div><div class=field><label>新密码</label><input id=newp type=password></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="chgPwd(this)">保存</button></div>`)}
-async function chgPwd(btn){await runAction(btn,async()=>{await api('/api/password',{method:'POST',body:JSON.stringify({oldPassword:document.getElementById('oldp').value,newPassword:document.getElementById('newp').value})});document.querySelector('.modal').remove();expireSession();toast('密码已修改，请使用新密码重新登录','success')})}
+async function chgPwd(btn){await runAction(btn,async()=>{await api('/api/password',{method:'POST',body:JSON.stringify({oldPassword:document.getElementById('oldp').value,newPassword:document.getElementById('newp').value})});btn.closest('.modal')?.remove();expireSession();toast('密码已修改，请使用新密码重新登录','success')})}
 async function boot(){try{let publicSettings=await api('/api/public-settings');state.publicTitle=publicSettings.panelTitle||'nft-manager';document.title=state.publicTitle}catch(e){}if(authToken()){loading();load()}else login()}
 function mergeBandwidthLive(live){let previous=state.data?.bandwidth||{},history=[...(previous.history||[])];if(live.point){history=history.filter(item=>Number(item.bucketTimestamp??item.timestamp)!==Number(live.point.bucketTimestamp));history.push(live.point);history.sort((a,b)=>Number(a.timestamp)-Number(b.timestamp))}state.data.bandwidth={...previous,...live,history}}
 async function pollBandwidthLive(){if(!state.data||!authToken()||state.view!=='dash'||document.hidden||state.bandwidthLiveBusy)return;state.bandwidthLiveBusy=true;try{let live=await api('/api/bandwidth/live',{timeout:4000});mergeBandwidthLive(live);let download=document.getElementById('bandwidthLiveDownload'),upload=document.getElementById('bandwidthLiveUpload'),networkInterface=document.getElementById('bandwidthLiveInterface'),chart=document.getElementById('bandwidthLiveChart');if(download)download.textContent=`下载 ${fmtBandwidth(live.downloadMbps)}`;if(upload)upload.textContent=`上传 ${fmtBandwidth(live.uploadMbps)}`;if(networkInterface)networkInterface.textContent=live.available?live.interface:'未检测到出口网卡';if(chart)chart.innerHTML=bandwidthChart()}catch(e){if(e.status===401)expireSession()}finally{state.bandwidthLiveBusy=false}}
@@ -1852,6 +2020,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -1905,6 +2074,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(rule_rate_snapshot())
             return
+        if path == "/api/update/status":
+            if not self.require():
+                return
+            self.send_json(read_online_update_status())
+            return
         if path == "/api/config/export":
             if not self.require():
                 return
@@ -1914,6 +2088,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = HTML.replace("__WEB_PANEL_VERSION__", WEB_PANEL_VERSION).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -1941,6 +2116,12 @@ class Handler(BaseHTTPRequestHandler):
                 set_password(data.get("oldPassword", ""), data.get("newPassword", ""))
             elif path == "/api/settings":
                 save_settings(data)
+            elif path == "/api/update/check":
+                self.send_json(check_online_update())
+                return
+            elif path == "/api/update/start":
+                self.send_json(start_online_update())
+                return
             elif path == "/api/config/import/preview":
                 self.send_json(preview_config_import(data.get("content")))
                 return

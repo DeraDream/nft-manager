@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v3.36
+# nftables 端口转发管理工具 v3.37
 # 交互式管理 DNAT 端口转发规则
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.36"
-WEB_PANEL_VERSION="3.36"
+SCRIPT_VERSION="3.37"
+WEB_PANEL_VERSION="3.37"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -54,6 +54,8 @@ UPDATE_CHECKED=false
 UPDATE_AVAILABLE=false
 UPDATE_REMOTE_VERSION=""
 UPDATE_STATUS_TEXT="未检查"
+WEB_UPDATE_STATUS_FILE="${CONF_DIR}/web-update-status.json"
+WEB_UPDATE_TARGET_VERSION=""
 
 clear_update_cache() {
     if [[ -n "${UPDATE_CACHE_FILE:-}" ]]; then
@@ -137,21 +139,31 @@ validate_ip() {
 
 # ============== 自动获取本机 IP ==============
 get_local_ip() {
-    local ip
+    local output candidate
     # 优先取默认路由出口的 IP（最准确：这就是发包时实际使用的源 IP）
-    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1) || true
-    if [[ -n "$ip" ]]; then
-        echo "$ip"
-        return
+    output=$(command ip -4 route get 1.1.1.1 2>/dev/null || true)
+    candidate=$(printf '%s\n' "$output" | awk '{for (i=1; i<NF; i++) if ($i == "src") {print $(i+1); exit}}')
+    if validate_ip "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
     fi
     # 回退：取第一个非 lo 接口的 IP
-    ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1) || true
-    if [[ -n "$ip" ]]; then
-        echo "$ip"
-        return
-    fi
-    # 最终回退
-    hostname -I 2>/dev/null | awk '{print $1}' || true
+    output=$(command ip -4 addr show scope global 2>/dev/null || true)
+    while IFS= read -r candidate; do
+        if validate_ip "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(printf '%s\n' "$output" | awk '$1 == "inet" {sub(/\/.*/, "", $2); print $2}')
+    # 最终回退也只接受一个经过验证的 IPv4，绝不透传命令的其他输出。
+    output=$(command hostname -I 2>/dev/null || true)
+    for candidate in $output; do
+        if validate_ip "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # ============== 发行版检测 ==============
@@ -739,15 +751,24 @@ load_rules() {
 
 write_conf_file() {
     local local_ip
-    local_ip=$(get_local_ip)
+    local_ip=$(get_local_ip || true)
 
-    if [[ -z "$local_ip" ]]; then
+    if ! validate_ip "$local_ip"; then
         err "无法获取本机 IP 地址，请检查网络配置。"
         return 1
     fi
 
     # 先写入临时文件，成功后原子替换，避免写到一半断电导致配置损坏
     local tmp_file="${CONF_FILE}.tmp.$$"
+
+    local rule lport dip dport alias
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport dip dport alias <<< "$rule"
+        if ! validate_port "$lport" || ! validate_ip "$dip" || ! validate_port "$dport"; then
+            err "转发规则包含无效的端口或 IP，已拒绝写入配置。"
+            return 1
+        fi
+    done
 
     cat > "${tmp_file}" <<EOF
 #!/usr/sbin/nft -f
@@ -763,7 +784,6 @@ table ip ${TABLE_NAME} {
         type nat hook prerouting priority -100; policy accept;
 EOF
 
-    local rule lport dip dport alias
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport dip dport alias <<< "$rule"
         alias=$(clean_label "$alias")
@@ -817,6 +837,25 @@ EOF
     }
 }
 EOF
+
+    if ! nft_available; then
+        err "nftables 不可用，无法校验新配置，已保留原配置。"
+        rm -f "${tmp_file}" 2>/dev/null || true
+        return 1
+    fi
+    local check_output check_file="${tmp_file}.check"
+    if ! sed "0,/^table ip ${TABLE_NAME} {/s//table ip ${TABLE_NAME}_check_$$ {/" "${tmp_file}" > "${check_file}"; then
+        err "无法生成配置校验副本，已保留原配置。"
+        rm -f "${tmp_file}" "${check_file}" 2>/dev/null || true
+        return 1
+    fi
+    if ! check_output=$("$NFT_BIN" -c -f "${check_file}" 2>&1); then
+        err "新配置语法校验失败，已保留原配置。"
+        [[ -n "$check_output" ]] && err "$check_output"
+        rm -f "${tmp_file}" "${check_file}" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "${check_file}" 2>/dev/null || true
 
     # 原子替换
     mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null || {
@@ -1144,13 +1183,71 @@ check_update_status() {
     fi
 }
 
+write_web_update_status() {
+    local state="$1" stage="$2" message="$3" current_version="${4:-$SCRIPT_VERSION}"
+    [[ -n "${WEB_UPDATE_STATUS_FILE:-}" ]] || return 0
+    mkdir -p "$(dirname "$WEB_UPDATE_STATUS_FILE")" 2>/dev/null || return 1
+    python3 - "$WEB_UPDATE_STATUS_FILE" "$state" "$stage" "$message" "$current_version" "${WEB_UPDATE_TARGET_VERSION:-}" <<'PY'
+import json
+import os
+import sys
+import time
+
+path, state, stage, message, current_version, target_version = sys.argv[1:]
+payload = {
+    "state": state,
+    "stage": stage,
+    "message": message,
+    "currentVersion": current_version,
+    "targetVersion": target_version,
+    "updatedAt": int(time.time()),
+}
+temp = f"{path}.tmp.{os.getpid()}"
+with open(temp, "w", encoding="utf-8") as output:
+    json.dump(payload, output, ensure_ascii=False)
+    output.write("\n")
+os.replace(temp, path)
+PY
+}
+
+web_update_progress() {
+    [[ -n "${NFT_MANAGER_WEB_UPDATE:-}" ]] || return 0
+    write_web_update_status "running" "$1" "$2" "${3:-$SCRIPT_VERSION}" || true
+}
+
+web_update_check_output() {
+    check_update_status force
+    printf 'current=%s\n' "$SCRIPT_VERSION"
+    printf 'remote=%s\n' "$UPDATE_REMOTE_VERSION"
+    printf 'available=%s\n' "$UPDATE_AVAILABLE"
+    printf 'status=%s\n' "$UPDATE_STATUS_TEXT"
+    printf 'source=%s\n' "$UPDATE_URL"
+    [[ "$UPDATE_STATUS_TEXT" != "检查失败" && "$UPDATE_STATUS_TEXT" != "未配置更新源" && "$UPDATE_STATUS_TEXT" != "远程版本无效" ]]
+}
+
+do_web_update() {
+    check_root
+    export NFT_MANAGER_WEB_UPDATE=1
+    WEB_UPDATE_TARGET_VERSION="${1:-}"
+    write_web_update_status "running" "checking" "正在核对更新源与版本..." || return 1
+    if do_update; then
+        write_web_update_status "complete" "complete" "升级完成，Web 服务已恢复。" "${WEB_UPDATE_TARGET_VERSION:-$SCRIPT_VERSION}" || true
+        return 0
+    else
+        local code=$?
+        write_web_update_status "error" "error" "在线升级未完成，请检查更新源或系统服务日志。" "$SCRIPT_VERSION" || true
+        return "$code"
+    fi
+}
+
 do_update() {
     echo ""
+    web_update_progress "checking" "正在核对更新源与版本..."
     UPDATE_URL=$(load_update_url)
     if [[ -z "$UPDATE_URL" ]]; then
         warn "未配置更新源，无法在线更新。"
         warn "请将 GitHub raw 地址写入 ${UPDATE_URL_FILE}，或运行前设置环境变量 NFT_FORWARD_UPDATE_URL。"
-        return
+        return 1
     fi
 
     info "当前版本: v${SCRIPT_VERSION}"
@@ -1162,12 +1259,13 @@ do_update() {
         UPDATE_CACHE_FILE=""
     else
         clear_update_cache
+        web_update_progress "downloading" "正在下载并校验新版脚本..."
         tmp_file=$(mktemp 2>/dev/null || echo "/tmp/nft-forward-update.$$") || true
         if ! download_update_script "$tmp_file" 30 2; then
             rm -f "$tmp_file" 2>/dev/null || true
             UPDATE_STATUS_TEXT="检查失败"
             err "下载更新失败，已重试 GitHub Raw、GitHub API 和 jsDelivr。"
-            return
+            return 1
         fi
     fi
 
@@ -1175,13 +1273,13 @@ do_update() {
     if [[ -z "$remote_version" ]]; then
         rm -f "$tmp_file" 2>/dev/null || true
         err "远程脚本没有有效版本号，已取消更新。"
-        return
+        return 1
     fi
 
     if ! bash -n "$tmp_file"; then
         rm -f "$tmp_file" 2>/dev/null || true
         err "远程脚本语法检查失败，已取消更新。"
-        return
+        return 1
     fi
 
     UPDATE_CHECKED=true
@@ -1190,18 +1288,20 @@ do_update() {
     if version_gt "$remote_version" "$SCRIPT_VERSION"; then
         UPDATE_AVAILABLE=true
         UPDATE_STATUS_TEXT="可升级到 v${remote_version}"
+        WEB_UPDATE_TARGET_VERSION="$remote_version"
+        web_update_progress "installing" "正在安装 v${remote_version}..."
         info "发现新版本: v${remote_version}"
     elif [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
         UPDATE_AVAILABLE=false
         UPDATE_STATUS_TEXT="已是最新"
         info "当前已是最新版本，未执行更新。"
         rm -f "$tmp_file" 2>/dev/null || true
-        return
+        return 2
     else
         info "远程版本: v${remote_version}"
         warn "远程版本低于当前版本，已取消更新。"
         rm -f "$tmp_file" 2>/dev/null || true
-        return
+        return 1
     fi
 
     if manager_installed || [[ "$SCRIPT_PATH" == "$SCRIPT_INSTALL_FILE" ]]; then
@@ -1213,13 +1313,13 @@ do_update() {
     mkdir -p "$(dirname "$install_target")" 2>/dev/null || {
         rm -f "$tmp_file" 2>/dev/null || true
         err "无法创建安装目录: $(dirname "$install_target")"
-        return
+        return 1
     }
 
     install -m 755 "$tmp_file" "$install_target" 2>/dev/null || {
         rm -f "$tmp_file" 2>/dev/null || true
         err "写入新版脚本失败。"
-        return
+        return 1
     }
     rm -f "$tmp_file" 2>/dev/null || true
 
@@ -1229,9 +1329,10 @@ do_update() {
 exec "${SCRIPT_INSTALL_FILE}" "\$@"
 EOF
         chmod +x "${GLOBAL_CMD}" 2>/dev/null || true
+        web_update_progress "restarting" "正在同步 Web 面板并重启服务..."
         if ! NFT_MANAGER_WEB_PANEL_URL="$(load_web_panel_url)" "${SCRIPT_INSTALL_FILE}" --post-update; then
             err "运行时同步未完整完成，请检查服务状态后重试更新。"
-            return
+            return 1
         fi
     fi
 
@@ -1241,6 +1342,9 @@ EOF
         info "已同步更新 Web 面板并重启相关服务。"
     fi
     log_action "更新脚本: ${SCRIPT_VERSION} -> ${remote_version}"
+    if [[ -n "${NFT_MANAGER_WEB_UPDATE:-}" ]]; then
+        return 0
+    fi
     exit 0
 }
 
@@ -1971,7 +2075,7 @@ do_uninstall_manager() {
     rm -f "${FIREWALL_CONF}" "${FIREWALL_PORTS_FILE}" "${FIREWALL_SSH_PORT_FILE}" 2>/dev/null || true
     rm -f "${UPDATE_URL_FILE}" 2>/dev/null || true
     rm -f "${WEB_AUTH_FILE}" 2>/dev/null || true
-    rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" "${CONF_DIR}/web-bandwidth.db" "${CONF_DIR}/web-bandwidth.db-wal" "${CONF_DIR}/web-bandwidth.db-shm" "${CONF_DIR}/web-settings.json" "${CONF_DIR}/.web-stats.lock" 2>/dev/null || true
+    rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" "${CONF_DIR}/web-bandwidth.db" "${CONF_DIR}/web-bandwidth.db-wal" "${CONF_DIR}/web-bandwidth.db-shm" "${CONF_DIR}/web-settings.json" "${WEB_UPDATE_STATUS_FILE}" "${CONF_DIR}/.web-stats.lock" 2>/dev/null || true
     rm -f "${CONF_DIR}"/*.conf.bak.* 2>/dev/null || true
     rm -rf "${CONF_DIR}/backups" 2>/dev/null || true
     rmdir "${CONF_DIR}" 2>/dev/null || true
@@ -2890,6 +2994,17 @@ fi
 if [[ "${1:-}" == "--nexttrace-update" ]]; then
     check_root
     update_nexttrace_online
+    exit $?
+fi
+
+if [[ "${1:-}" == "--web-update-check" ]]; then
+    check_root
+    web_update_check_output
+    exit $?
+fi
+
+if [[ "${1:-}" == "--web-update-run" ]]; then
+    do_web_update "${2:-}"
     exit $?
 fi
 
