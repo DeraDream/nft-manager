@@ -5,8 +5,8 @@
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.38"
-WEB_PANEL_VERSION="3.38"
+SCRIPT_VERSION="3.39"
+WEB_PANEL_VERSION="3.39"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
