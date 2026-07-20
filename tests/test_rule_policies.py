@@ -52,6 +52,16 @@ class RulePolicyTests(unittest.TestCase):
         )
         self.assertEqual(policy["expiresAt"], stamp(2026, 4, 15))
 
+    def test_single_connectivity_check_accepts_numeric_string_port(self):
+        with mock.patch.object(panel, "parse_rules", return_value=[dict(self.rule)]), \
+             mock.patch.object(panel, "tcp_connect_target", return_value={"reachable": True, "latency": 8.5}):
+            result = panel.rule_connectivity_checks("21001")
+        self.assertEqual(result["21001"], {"reachable": True, "latency": 8.5})
+
+    def test_single_connectivity_check_rejects_non_numeric_port(self):
+        with self.assertRaisesRegex(ValueError, "转发端口无效"):
+            panel.rule_connectivity_checks("21001x")
+
     def test_month_end_anchor_returns_to_day_31(self):
         policy = panel.default_rule_policy(self.rule, now=stamp(2026, 1, 31))
         policy.update({"quotaEnabled": True, "resetAnchorDay": 31, "resetHour": 10, "resetMinute": 0})
