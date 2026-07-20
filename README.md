@@ -21,6 +21,8 @@
 - 新增转发默认同步放行入口端口，删除转发默认同步关闭入口端口，SSH 和 Web 均可取消该操作
 - Web 面板支持一次添加多个单端口
 - Web 面板支持持久化上传、下载、总计流量统计、24 小时趋势和规则开关
+- 每条转发可设置长期或限时有效期，以及按上传、下载或双向总计计算的月度流量配额；额度耗尽后自动暂停并在下个周期恢复，最终到期后保留规则但不再自动恢复
+- 已有规则升级后默认保持长期有效且不限流量，可随时在编辑转发中补充到期时间、额度和重置日期
 - 端口在最近 20 秒内产生转发流量时标记为活跃，后台每 10 秒采样一次规则计数器
 - 首页和转发管理页为活跃端口显示每秒更新的实时上传、下载速率
 - 系统设置支持导出 `.nftm` 配置并在其他 VPS 追加导入主机与转发规则，导入后自动同步转发端口防火墙
@@ -142,7 +144,9 @@ Web 面板包含：
 - 与入口端口一致
 - 指定出口起始端口
 
-选择出口起始端口时，多个入口端口会按输入顺序依次映射到连续的出口端口。Web 面板使用 nftables counter 统计流量，活跃状态根据流量计数是否增长判断。内核计数每 30 秒结算到 `/etc/nftables.d/web-stats.json`，规则重载、Web 服务重启和正常关机前也会结算，累计流量不会因 nftables 计数器归零而清空。
+选择出口起始端口时，多个入口端口会按输入顺序依次映射到连续的出口端口。Web 面板使用 nftables counter 统计流量，活跃状态根据流量计数是否增长判断。内核计数每 10 秒结算到 `/etc/nftables.d/web-stats.json`，规则重载、Web 服务重启和正常关机前也会结算，累计流量不会因 nftables 计数器归零而清空。
+
+端口策略按北京时间计算。按月设置有效期时，例如 `1 月 15 日 + 3 个月` 将在 `4 月 15 日` 到期；每月重置日遇到没有对应日期的月份时使用该月最后一天，后续月份仍恢复原重置日。策略保存在 `/etc/nftables.d/rule-policies.json`，配额重置只移动本周期基准，不会清空历史累计流量。
 
 默认账号密码为：
 
@@ -239,6 +243,7 @@ sudo NFT_FORWARD_UPDATE_URL='https://raw.githubusercontent.com/DeraDream/nft-man
 /etc/nftables.d/web-stats.json
 /etc/nftables.d/web-history.json
 /etc/nftables.d/web-settings.json
+/etc/nftables.d/rule-policies.json
 /etc/sysctl.d/99-nft-forward.conf
 /var/log/nft-forward.log
 ```

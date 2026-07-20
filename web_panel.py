@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import base64
+import calendar
 import concurrent.futures
 import fcntl
 import hashlib
@@ -19,8 +20,14 @@ import threading
 import time
 import unicodedata
 from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 CONF_DIR = os.environ.get("NFT_MANAGER_CONF_DIR", "/etc/nftables.d")
 CONF_FILE = os.path.join(CONF_DIR, "port-forward.conf")
@@ -31,6 +38,7 @@ STATS_LOCK_FILE = os.path.join(CONF_DIR, ".web-stats.lock")
 HISTORY_FILE = os.path.join(CONF_DIR, "web-history.json")
 BANDWIDTH_DB = os.path.join(CONF_DIR, "web-bandwidth.db")
 SETTINGS_FILE = os.path.join(CONF_DIR, "web-settings.json")
+POLICIES_FILE = os.path.join(CONF_DIR, "rule-policies.json")
 UPDATE_STATUS_FILE = os.path.join(CONF_DIR, "web-update-status.json")
 FIREWALL_CONF = os.path.join(CONF_DIR, "firewall.conf")
 FIREWALL_PORTS_FILE = os.path.join(CONF_DIR, "firewall-ports.db")
@@ -43,13 +51,14 @@ MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 MAX_CONFIG_BYTES = 5 * 1024 * 1024
 MAX_CONFIG_RULES = 10000
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.39"
+WEB_PANEL_VERSION = "3.40"
 MANAGER_SCRIPT = os.environ.get("NFT_MANAGER_SCRIPT", "/opt/nft-manager/nft.sh")
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 BANDWIDTH_LOCK = threading.Lock()
 RULE_RATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
+POLICY_LOCK = threading.RLock()
 BANDWIDTH_STATE = {
     "interface": "",
     "timestamp": 0.0,
@@ -74,6 +83,8 @@ BANDWIDTH_BUCKET_SECONDS = 60
 BANDWIDTH_SCHEMA_VERSION = "3"
 DEFAULT_PANEL_TITLE = "nft-manager"
 DEFAULT_DASHBOARD_POLL_SECONDS = 10
+POLICY_TIMEZONE = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone(timedelta(hours=8))
+POLICY_SCHEMA_VERSION = 1
 
 
 def resolve_nft_bin():
@@ -645,14 +656,24 @@ def remove_firewall_port(port, protocol=None):
     baseline_ports = {item["port"] for item in firewall_baseline_ports()}
     if port in baseline_ports:
         raise ValueError(f"保底端口 {port} 不允许关闭")
+    removed_forward_port = False
     with FIREWALL_LOCK:
         current = read_firewall_ports()
+        removed_forward_port = any(
+            item["port"] == port
+            and item.get("label") == "转发端口"
+            and (not protocol or item["protocol"] == normalize_firewall_protocol(protocol))
+            for item in current
+        )
         if protocol:
             protocol = normalize_firewall_protocol(protocol)
             current = [item for item in current if not (item["port"] == port and item["protocol"] == protocol)]
         else:
             current = [item for item in current if item["port"] != port]
-        return apply_firewall_ports(current)
+        result = apply_firewall_ports(current)
+    if removed_forward_port:
+        set_rule_firewall_management(port, False)
+    return result
 
 
 def remove_forward_firewall_ports(ports):
@@ -660,6 +681,26 @@ def remove_forward_firewall_ports(ports):
         wanted = {int(port) for port in ports if int(port) not in (22, PORT)}
         current = [item for item in read_firewall_ports() if not (item["port"] in wanted and item["label"] == "转发端口")]
         return apply_firewall_ports(current)
+
+
+def sync_policy_firewall(open_ports, close_ports):
+    open_ports = {int(port) for port in open_ports}
+    close_ports = {int(port) for port in close_ports if int(port) not in (22, PORT)}
+    if not open_ports and not close_ports:
+        return
+    with FIREWALL_LOCK:
+        original = read_firewall_ports()
+        current = [
+            item for item in original
+            if not (item["port"] in close_ports and item["label"] == "转发端口")
+        ]
+        existing = {(item["port"], item["protocol"]) for item in current}
+        for port in sorted(open_ports):
+            if (port, "tcp+udp") not in existing:
+                current.append({"port": port, "protocol": "tcp+udp", "label": "转发端口"})
+                existing.add((port, "tcp+udp"))
+        if current != original:
+            apply_firewall_ports(current)
 
 
 def set_firewall_ssh_port(port):
@@ -706,6 +747,275 @@ def clean_label(s):
 
 def ensure_dirs():
     os.makedirs(CONF_DIR, exist_ok=True)
+
+
+def policy_now():
+    return int(time.time())
+
+
+def policy_datetime(timestamp=None):
+    return datetime.fromtimestamp(timestamp if timestamp is not None else time.time(), POLICY_TIMEZONE)
+
+
+def add_calendar_months(value, months, anchor_day=None):
+    months = int(months)
+    month_index = value.year * 12 + value.month - 1 + months
+    year, month_zero = divmod(month_index, 12)
+    month = month_zero + 1
+    day = min(int(anchor_day or value.day), calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def parse_policy_datetime(value, field_name):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        timestamp = int(value)
+    else:
+        text = str(value or "").strip()
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            raise ValueError(f"{field_name}格式无效")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=POLICY_TIMEZONE)
+        timestamp = int(parsed.timestamp())
+    if timestamp <= 0:
+        raise ValueError(f"{field_name}无效")
+    return timestamp
+
+
+def rule_counter_key(rule):
+    return f"{rule['lport']}|{rule['ip']}|{rule['dport']}"
+
+
+def counter_bytes(counter):
+    normalized = normalize_counter(counter)
+    return {
+        "upload": normalized["upload"]["bytes"],
+        "download": normalized["download"]["bytes"],
+    }
+
+
+def forward_firewall_ports():
+    return {
+        item["port"]
+        for item in read_firewall_ports()
+        if item.get("protocol") == "tcp+udp" and item.get("label") == "转发端口"
+    }
+
+
+def default_rule_policy(rule, now=None, managed_ports=None):
+    now = int(now or policy_now())
+    if managed_ports is None:
+        managed_ports = forward_firewall_ports()
+    return {
+        "desiredEnabled": bool(rule.get("enabled", True)),
+        "lifetimeMode": "permanent",
+        "expiresAt": 0,
+        "quotaEnabled": False,
+        "quotaBytes": 0,
+        "quotaMode": "total",
+        "resetMode": "anniversary",
+        "resetAnchorDay": policy_datetime(now).day,
+        "resetHour": policy_datetime(now).hour,
+        "resetMinute": policy_datetime(now).minute,
+        "nextResetAt": 0,
+        "periodStartedAt": now,
+        "baselineUpload": 0,
+        "baselineDownload": 0,
+        "manageFirewall": int(rule["lport"]) in managed_ports,
+    }
+
+
+def normalize_rule_policy(value, rule, now=None, managed_ports=None):
+    base = default_rule_policy(rule, now=now, managed_ports=managed_ports)
+    if not isinstance(value, dict):
+        return base
+    base["desiredEnabled"] = bool(value.get("desiredEnabled", base["desiredEnabled"]))
+    base["lifetimeMode"] = value.get("lifetimeMode") if value.get("lifetimeMode") in ("permanent", "limited") else "permanent"
+    base["expiresAt"] = nonnegative_int(value.get("expiresAt")) if base["lifetimeMode"] == "limited" else 0
+    base["quotaEnabled"] = bool(value.get("quotaEnabled", False))
+    base["quotaBytes"] = nonnegative_int(value.get("quotaBytes")) if base["quotaEnabled"] else 0
+    base["quotaMode"] = value.get("quotaMode") if value.get("quotaMode") in ("upload", "download", "total") else "total"
+    base["resetMode"] = value.get("resetMode") if value.get("resetMode") in ("anniversary", "custom") else "anniversary"
+    base["resetAnchorDay"] = max(1, min(31, nonnegative_int(value.get("resetAnchorDay")) or base["resetAnchorDay"]))
+    base["resetHour"] = max(0, min(23, nonnegative_int(value.get("resetHour"))))
+    base["resetMinute"] = max(0, min(59, nonnegative_int(value.get("resetMinute"))))
+    base["nextResetAt"] = nonnegative_int(value.get("nextResetAt")) if base["quotaEnabled"] else 0
+    base["periodStartedAt"] = nonnegative_int(value.get("periodStartedAt")) or base["periodStartedAt"]
+    base["baselineUpload"] = int(value.get("baselineUpload", 0) or 0)
+    base["baselineDownload"] = int(value.get("baselineDownload", 0) or 0)
+    base["manageFirewall"] = bool(value.get("manageFirewall", base["manageFirewall"]))
+    return base
+
+
+def load_policy_document():
+    if not os.path.exists(POLICIES_FILE):
+        return {"version": POLICY_SCHEMA_VERSION, "policies": {}}
+    try:
+        with open(POLICIES_FILE, encoding="utf-8") as source:
+            payload = json.load(source)
+    except Exception:
+        return {"version": POLICY_SCHEMA_VERSION, "policies": {}}
+    policies = payload.get("policies", {}) if isinstance(payload, dict) else {}
+    return {"version": POLICY_SCHEMA_VERSION, "policies": policies if isinstance(policies, dict) else {}}
+
+
+def save_rule_policies(policies):
+    payload = {"version": POLICY_SCHEMA_VERSION, "updatedAt": policy_now(), "policies": policies}
+    atomic_write(POLICIES_FILE, json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def read_rule_policies(rules, persist_migration=True, now=None):
+    now = int(now or policy_now())
+    managed_ports = forward_firewall_ports()
+    document = load_policy_document()
+    stored = document["policies"]
+    policies = {}
+    changed = False
+    for rule in rules:
+        key = str(rule["lport"])
+        policies[key] = normalize_rule_policy(stored.get(key), rule, now=now, managed_ports=managed_ports)
+        if key not in stored or stored.get(key) != policies[key]:
+            changed = True
+    if set(stored) != set(policies):
+        changed = True
+    if changed and persist_migration:
+        save_rule_policies(policies)
+    return policies
+
+
+def set_rule_firewall_management(lport, managed):
+    rules = parse_rules()
+    if not any(rule["lport"] == int(lport) for rule in rules):
+        return
+    with POLICY_LOCK:
+        policies = read_rule_policies(rules)
+        policies[str(int(lport))]["manageFirewall"] = bool(managed)
+        save_rule_policies(policies)
+
+
+def policy_period_usage(policy, counter):
+    totals = counter_bytes(counter)
+    upload = max(0, totals["upload"] - int(policy.get("baselineUpload", 0)))
+    download = max(0, totals["download"] - int(policy.get("baselineDownload", 0)))
+    mode = policy.get("quotaMode", "total")
+    selected = upload if mode == "upload" else download if mode == "download" else upload + download
+    return {"upload": upload, "download": download, "total": upload + download, "selected": selected}
+
+
+def next_monthly_reset(timestamp, policy):
+    current = policy_datetime(timestamp)
+    anchor_day = max(1, min(31, int(policy.get("resetAnchorDay", current.day))))
+    next_value = add_calendar_months(current, 1, anchor_day=anchor_day)
+    return int(next_value.replace(
+        hour=int(policy.get("resetHour", 0)),
+        minute=int(policy.get("resetMinute", 0)),
+        second=0,
+        microsecond=0,
+    ).timestamp())
+
+
+def advance_policy_reset(policy, now, counter):
+    if not policy.get("quotaEnabled") or not policy.get("nextResetAt") or policy["nextResetAt"] > now:
+        return False
+    reset_at = int(policy["nextResetAt"])
+    while reset_at <= now:
+        policy["periodStartedAt"] = reset_at
+        reset_at = next_monthly_reset(reset_at, policy)
+    totals = counter_bytes(counter)
+    policy["baselineUpload"] = totals["upload"]
+    policy["baselineDownload"] = totals["download"]
+    if policy.get("lifetimeMode") == "limited" and reset_at >= int(policy.get("expiresAt", 0)):
+        reset_at = 0
+    policy["nextResetAt"] = reset_at
+    return True
+
+
+def rule_policy_status(policy, counter, now=None):
+    now = int(now or policy_now())
+    usage = policy_period_usage(policy, counter)
+    if policy.get("lifetimeMode") == "limited" and int(policy.get("expiresAt", 0)) <= now:
+        status = "expired"
+    elif not policy.get("desiredEnabled", True):
+        status = "manual_off"
+    elif policy.get("quotaEnabled") and usage["selected"] >= int(policy.get("quotaBytes", 0)):
+        status = "quota_exhausted"
+    else:
+        status = "running"
+    return status, usage
+
+
+def policy_payload(payload, rule, old_policy=None, counter=None, now=None):
+    now = int(now or policy_now())
+    current_dt = policy_datetime(now)
+    policy = normalize_rule_policy(old_policy, rule, now=now) if old_policy else default_rule_policy(rule, now=now)
+    policy["lifetimeMode"] = payload.get("lifetimeMode", "permanent")
+    if policy["lifetimeMode"] not in ("permanent", "limited"):
+        raise ValueError("有效期类型无效")
+    if policy["lifetimeMode"] == "limited":
+        expiry_mode = payload.get("expiryMode", "months")
+        if expiry_mode == "months":
+            try:
+                months = int(payload.get("durationMonths", 0))
+            except (TypeError, ValueError):
+                raise ValueError("有效月数必须是整数")
+            if not 1 <= months <= 120:
+                raise ValueError("有效月数必须在 1-120 之间")
+            policy["expiresAt"] = int(add_calendar_months(current_dt, months).timestamp())
+        elif expiry_mode == "custom":
+            policy["expiresAt"] = parse_policy_datetime(payload.get("expiresAt"), "到期时间")
+        else:
+            raise ValueError("到期计算方式无效")
+        if policy["expiresAt"] <= now:
+            raise ValueError("到期时间必须晚于当前时间")
+    else:
+        policy["expiresAt"] = 0
+
+    quota_was_enabled = bool(policy.get("quotaEnabled"))
+    policy["quotaEnabled"] = bool(payload.get("quotaEnabled", False))
+    totals = counter_bytes(counter or {})
+    if not policy["quotaEnabled"]:
+        policy.update({"quotaBytes": 0, "nextResetAt": 0, "baselineUpload": 0, "baselineDownload": 0})
+        return policy
+    try:
+        quota_gb = float(payload.get("quotaGb", 0))
+    except (TypeError, ValueError):
+        raise ValueError("流量额度必须是数字")
+    if not 0.01 <= quota_gb <= 1024 * 1024:
+        raise ValueError("每周期流量必须在 0.01-1048576 GB 之间")
+    policy["quotaBytes"] = int(quota_gb * 1024 ** 3)
+    policy["quotaMode"] = payload.get("quotaMode", "total")
+    if policy["quotaMode"] not in ("upload", "download", "total"):
+        raise ValueError("流量配额统计口径无效")
+    reset_mode = payload.get("resetMode", "anniversary")
+    if reset_mode not in ("anniversary", "custom"):
+        raise ValueError("流量重置方式无效")
+    policy["resetMode"] = reset_mode
+    reset_changed = reset_mode != (old_policy or {}).get("resetMode")
+    if reset_mode == "anniversary":
+        if not quota_was_enabled or reset_changed or not policy.get("nextResetAt") or bool(payload.get("resetPeriodNow", False)):
+            policy["resetAnchorDay"] = current_dt.day
+            policy["resetHour"] = current_dt.hour
+            policy["resetMinute"] = current_dt.minute
+            policy["nextResetAt"] = int(add_calendar_months(current_dt, 1).replace(second=0, microsecond=0).timestamp())
+    else:
+        next_reset = parse_policy_datetime(payload.get("nextResetAt"), "下次重置时间")
+        if next_reset <= now:
+            raise ValueError("下次重置时间必须晚于当前时间")
+        reset_dt = policy_datetime(next_reset)
+        policy["nextResetAt"] = next_reset
+        policy["resetAnchorDay"] = reset_dt.day
+        policy["resetHour"] = reset_dt.hour
+        policy["resetMinute"] = reset_dt.minute
+    if policy["lifetimeMode"] == "limited" and policy["nextResetAt"] >= policy["expiresAt"]:
+        if reset_mode == "custom":
+            raise ValueError("下次重置时间必须早于到期时间")
+        policy["nextResetAt"] = 0
+    if not quota_was_enabled or bool(payload.get("resetPeriodNow", False)):
+        policy["periodStartedAt"] = now
+        policy["baselineUpload"] = totals["upload"]
+        policy["baselineDownload"] = totals["download"]
+    return policy
 
 
 @contextmanager
@@ -857,7 +1167,7 @@ def normalized_config_payload(content):
         raise ValueError("配置文件不是有效的 nft-manager 配置")
     if not isinstance(payload, dict) or payload.get("format") != "nft-manager-config":
         raise ValueError("配置文件格式不正确")
-    if payload.get("schemaVersion") != 1:
+    if payload.get("schemaVersion") not in (1, 2):
         raise ValueError("暂不支持该配置文件版本")
 
     raw_targets = payload.get("targets", [])
@@ -909,7 +1219,7 @@ def normalized_config_payload(content):
         enabled = item.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError("配置文件包含无效规则开关状态")
-        rules.append({
+        rule = {
             "lport": lport,
             "ip": ip,
             "dport": dport,
@@ -917,7 +1227,16 @@ def normalized_config_payload(content):
             "desc": clean_label(item.get("desc")),
             "statsMode": stats_mode,
             "enabled": enabled,
-        })
+        }
+        if payload.get("schemaVersion") == 2 and isinstance(item.get("policy"), dict):
+            policy = normalize_rule_policy(item["policy"], rule, managed_ports=set())
+            policy["manageFirewall"] = True
+            policy["periodStartedAt"] = policy_now()
+            policy["baselineUpload"] = 0
+            policy["baselineDownload"] = 0
+            rule["_policy"] = policy
+            rule["enabled"] = rule_policy_status(policy, {})[0] == "running"
+        rules.append(rule)
     return {"targets": targets, "rules": rules}
 
 
@@ -929,13 +1248,19 @@ def exported_config():
         if rule["ip"] not in known_ips:
             targets.append({"alias": rule["ip"], "ip": rule["ip"]})
             known_ips.add(rule["ip"])
+    policies = read_rule_policies(rules)
+    exported_rules = []
+    for rule in rules:
+        item = dict(rule)
+        item["policy"] = policies[str(rule["lport"])]
+        exported_rules.append(item)
     return {
         "format": "nft-manager-config",
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "exportedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sourceVersion": WEB_PANEL_VERSION,
         "targets": targets,
-        "rules": rules,
+        "rules": exported_rules,
     }
 
 
@@ -1012,11 +1337,18 @@ def import_config(content):
         merged_rules = old_rules + plan["rules"]
         targets_changed = bool(plan["targets"])
         rules_changed = bool(plan["rules"])
+        old_policies = read_rule_policies(old_rules)
+        merged_policies = dict(old_policies)
+        for rule in plan["rules"]:
+            policy = rule.pop("_policy", None) or default_rule_policy(rule)
+            policy["manageFirewall"] = True
+            merged_policies[str(rule["lport"])] = policy
         try:
             if targets_changed:
                 write_targets(merged_targets)
             if rules_changed:
                 write_rules(merged_rules)
+                save_rule_policies(merged_policies)
                 reload_rules()
                 sync_imported_firewall_ports(plan["rules"])
         except Exception:
@@ -1024,6 +1356,7 @@ def import_config(content):
                 write_targets(old_targets)
             if rules_changed:
                 write_rules(old_rules)
+                save_rule_policies(old_policies)
                 try:
                     reload_rules()
                 except Exception:
@@ -1721,6 +2054,48 @@ def nft_counters():
         return result, hourly_history(delta_total)
 
 
+def enforce_rule_policies(counters=None, now=None):
+    now = int(now or policy_now())
+    rules = parse_rules()
+    original_rules = [dict(rule) for rule in rules]
+    if counters is None:
+        counters, _ = nft_counters()
+    with POLICY_LOCK:
+        policies = read_rule_policies(rules, now=now)
+        policies_changed = False
+        rules_changed = False
+        open_ports = set()
+        close_ports = set()
+        for rule in rules:
+            key = str(rule["lport"])
+            policy = policies[key]
+            counter = counters.get(rule_counter_key(rule), {})
+            if advance_policy_reset(policy, now, counter):
+                policies_changed = True
+            status, _ = rule_policy_status(policy, counter, now=now)
+            effective = status == "running"
+            if bool(rule.get("enabled", True)) != effective:
+                rule["enabled"] = effective
+                rules_changed = True
+            if policy.get("manageFirewall"):
+                (open_ports if effective else close_ports).add(rule["lport"])
+        if policies_changed:
+            save_rule_policies(policies)
+        if rules_changed:
+            try:
+                write_rules(rules)
+                reload_rules()
+            except Exception:
+                write_rules(original_rules)
+                try:
+                    reload_rules()
+                except Exception:
+                    pass
+                raise
+        sync_policy_firewall(open_ports, close_ports)
+    return rules, policies
+
+
 def parse_port_tokens(tokens):
     ports = []
     seen = set()
@@ -1783,13 +2158,28 @@ def add_rules(payload):
     open_firewall = payload.get("openFirewall", True)
     if isinstance(open_firewall, str):
         open_firewall = open_firewall.lower() not in ("0", "false", "no")
+    with POLICY_LOCK:
+        old_policies = read_rule_policies(existing)
+        new_policies = dict(old_policies)
+        now = policy_now()
+        for rule in new_rules:
+            policy = policy_payload(payload, rule, now=now)
+            policy["manageFirewall"] = bool(open_firewall)
+            status, _ = rule_policy_status(policy, {}, now=now)
+            rule["enabled"] = status == "running"
+            new_policies[str(rule["lport"])] = policy
     try:
         write_rules(existing + new_rules)
+        save_rule_policies(new_policies)
         reload_rules()
         if open_firewall:
-            add_forward_firewall_ports([rule["lport"] for rule in new_rules])
+            sync_policy_firewall(
+                [rule["lport"] for rule in new_rules if rule.get("enabled")],
+                [rule["lport"] for rule in new_rules if not rule.get("enabled")],
+            )
     except Exception:
         write_rules(existing)
+        save_rule_policies(old_policies)
         try:
             reload_rules()
         except Exception:
@@ -1802,23 +2192,47 @@ def update_rule(payload):
     old_lport = int(payload.get("oldLport", 0))
     rules = parse_rules()
     old_rule = next((r for r in rules if r["lport"] == old_lport), None)
+    if not old_rule:
+        raise ValueError("未找到要编辑的转发规则")
     rest = [r for r in rules if r["lport"] != old_lport]
     new_rules = expand_forward(payload)
     if len(new_rules) != 1:
         raise ValueError("编辑时只能保存为单条规则")
     if any(r["lport"] == new_rules[0]["lport"] for r in rest):
         raise ValueError("入口端口已存在")
-    if old_rule:
-        new_rules[0]["enabled"] = old_rule.get("enabled", True)
+    counters, _ = nft_counters()
+    with POLICY_LOCK:
+        old_policies = read_rule_policies(rules)
+        old_policy = old_policies.get(str(old_lport)) if old_rule else None
+        old_counter = counters.get(rule_counter_key(old_rule), {}) if old_rule else {}
+        old_usage = policy_period_usage(old_policy, old_counter) if old_policy else {"upload": 0, "download": 0}
+        policy = policy_payload(payload, new_rules[0], old_policy=old_policy, counter=old_counter)
+        identity_changed = bool(old_rule and rule_counter_key(old_rule) != rule_counter_key(new_rules[0]))
+        if identity_changed and policy.get("quotaEnabled"):
+            if old_policy and old_policy.get("quotaEnabled") and not payload.get("resetPeriodNow"):
+                policy["baselineUpload"] = -old_usage["upload"]
+                policy["baselineDownload"] = -old_usage["download"]
+            else:
+                policy["baselineUpload"] = 0
+                policy["baselineDownload"] = 0
+        status_counter = old_counter if old_rule and not identity_changed else {}
+        status, _ = rule_policy_status(policy, status_counter, now=policy_now())
+        new_rules[0]["enabled"] = status == "running"
+        new_policies = dict(old_policies)
+        new_policies.pop(str(old_lport), None)
+        new_policies[str(new_rules[0]["lport"])] = policy
     try:
         write_rules(rest + new_rules)
+        save_rule_policies(new_policies)
         reload_rules()
-        if old_rule and old_rule["lport"] != new_rules[0]["lport"]:
-            add_forward_firewall_ports([new_rules[0]["lport"]])
-            if old_rule["lport"] not in (22, PORT):
-                remove_forward_firewall_ports([old_rule["lport"]])
+        close_ports = [old_rule["lport"]] if old_rule and old_rule["lport"] != new_rules[0]["lport"] and old_policy and old_policy.get("manageFirewall") else []
+        open_ports = [new_rules[0]["lport"]] if policy.get("manageFirewall") and new_rules[0].get("enabled") else []
+        if policy.get("manageFirewall") and not new_rules[0].get("enabled"):
+            close_ports.append(new_rules[0]["lport"])
+        sync_policy_firewall(open_ports, close_ports)
     except Exception:
         write_rules(rules)
+        save_rule_policies(old_policies)
         try:
             reload_rules()
         except Exception:
@@ -1832,13 +2246,18 @@ def delete_rules(payload):
     close_firewall = payload.get("closeFirewall", True)
     if isinstance(close_firewall, str):
         close_firewall = close_firewall.lower() not in ("0", "false", "no")
+    with POLICY_LOCK:
+        old_policies = read_rule_policies(existing)
+        new_policies = {key: value for key, value in old_policies.items() if int(key) not in ports}
     try:
         write_rules([r for r in existing if r["lport"] not in ports])
+        save_rule_policies(new_policies)
         reload_rules()
         if close_firewall:
             remove_forward_firewall_ports(ports)
     except Exception:
         write_rules(existing)
+        save_rule_policies(old_policies)
         try:
             reload_rules()
         except Exception:
@@ -1852,31 +2271,77 @@ def toggle_rule(payload):
     rules = parse_rules()
     for rule in rules:
         if rule["lport"] == lport:
-            rule["enabled"] = enabled
-            write_rules(rules)
-            reload_rules()
+            counters, _ = nft_counters()
+            with POLICY_LOCK:
+                policies = read_rule_policies(rules)
+                policies[str(lport)]["desiredEnabled"] = enabled
+                save_rule_policies(policies)
+            enforce_rule_policies(counters=counters)
             return
     raise ValueError("未找到转发规则")
 
 
+def reset_rule_period(payload):
+    lport = int(payload.get("lport", 0))
+    rules = parse_rules()
+    rule = next((item for item in rules if item["lport"] == lport), None)
+    if not rule:
+        raise ValueError("未找到转发规则")
+    counters, _ = nft_counters()
+    with POLICY_LOCK:
+        policies = read_rule_policies(rules)
+        policy = policies[str(lport)]
+        if not policy.get("quotaEnabled"):
+            raise ValueError("该规则未启用流量配额")
+        totals = counter_bytes(counters.get(rule_counter_key(rule), {}))
+        now = policy_now()
+        current_dt = policy_datetime(now)
+        policy["periodStartedAt"] = now
+        policy["baselineUpload"] = totals["upload"]
+        policy["baselineDownload"] = totals["download"]
+        policy["resetMode"] = "anniversary"
+        policy["resetAnchorDay"] = current_dt.day
+        policy["resetHour"] = current_dt.hour
+        policy["resetMinute"] = current_dt.minute
+        policy["nextResetAt"] = next_monthly_reset(now, policy)
+        save_rule_policies(policies)
+    enforce_rule_policies(counters=counters)
+
+
 def dashboard():
     targets = read_targets()
-    rules = parse_rules()
     counters, history = nft_counters()
+    rules, policies = enforce_rule_policies(counters=counters)
     enriched = []
     total_bytes = 0
     active = 0
     aliases = {t["ip"]: t["alias"] for t in targets}
     for r in rules:
-        key = f"{r['lport']}|{r['ip']}|{r['dport']}"
+        key = rule_counter_key(r)
         c = counters.get(key, {"upload": {"packets": 0, "bytes": 0}, "download": {"packets": 0, "bytes": 0}, "active": False})
         upload_bytes, download_bytes = c["upload"]["bytes"], c["download"]["bytes"]
         both_bytes = upload_bytes + download_bytes
         selected = r.get("statsMode", "total")
         selected_bytes = upload_bytes if selected == "upload" else download_bytes if selected == "download" else both_bytes
         total_bytes += both_bytes
-        active += 1 if c.get("active") else 0
-        enriched.append({**r, "targetAlias": aliases.get(r["ip"], ""), "uploadBytes": upload_bytes, "downloadBytes": download_bytes, "totalBytes": both_bytes, "bytes": selected_bytes, "active": c["active"]})
+        policy = policies[str(r["lport"])]
+        policy_status, period_usage = rule_policy_status(policy, c)
+        active += 1 if r.get("enabled") and c.get("active") else 0
+        enriched.append({
+            **r,
+            **policy,
+            "targetAlias": aliases.get(r["ip"], ""),
+            "uploadBytes": upload_bytes,
+            "downloadBytes": download_bytes,
+            "totalBytes": both_bytes,
+            "bytes": selected_bytes,
+            "active": bool(r.get("enabled") and c["active"]),
+            "policyStatus": policy_status,
+            "periodUploadBytes": period_usage["upload"],
+            "periodDownloadBytes": period_usage["download"],
+            "periodTotalBytes": period_usage["total"],
+            "periodUsageBytes": period_usage["selected"],
+        })
     return {"targets": targets, "rules": enriched, "history": history, "bandwidth": bandwidth_status(include_history=True), "settings": read_settings(), "firewall": {"ports": read_firewall_ports(), "baselinePorts": [item["port"] for item in firewall_baseline_ports()], "enabled": os.path.exists(FIREWALL_CONF)}, "stats": {"totalBytes": total_bytes, "ruleCount": len(rules), "targetCount": len(targets), "activeCount": active, "localIp": local_ip(), "port": PORT}}
 
 
@@ -1898,6 +2363,7 @@ button,button.ghost{background:var(--button-bg);color:var(--button-text)}button.
 .chart-svg{height:auto}
 .probe-button{justify-content:center;border:0;font:inherit}.probe-button:hover{filter:brightness(1.12)}.probe-button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 .sort-head{display:inline-flex;align-items:center;gap:5px;padding:2px 0;border-radius:0;background:transparent!important;color:inherit!important;font-weight:inherit}.sort-head:hover,.sort-head.active{color:var(--nav-active-text)!important}.sort-arrow{display:inline-block;min-width:10px;color:var(--muted);font-size:11px}.sort-head.active .sort-arrow{color:currentColor}.sort-strip{display:none;align-items:center;gap:7px;margin:0 0 12px;padding:8px;border:1px solid var(--line-soft);border-radius:7px;background:var(--surface)}.sort-strip.grid-sort{display:flex}.sort-strip-label{margin:0 3px;color:var(--muted);font-size:12px}.sort-strip button{padding:6px 9px;background:transparent;color:var(--muted);border:1px solid transparent}.sort-strip button.active{background:var(--nav-active-bg);color:var(--nav-active-text);border-color:var(--line)}
+.policy-section{margin:18px 0 2px;padding:16px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}.policy-section h3{margin:0 0 14px;font-size:16px}.policy-toggle{display:flex!important;align-items:center;justify-content:space-between;gap:16px;padding:11px 12px;border:1px solid var(--line);border-radius:7px;background:var(--surface2);cursor:pointer}.policy-toggle input{width:18px!important;height:18px;margin:0;accent-color:var(--blue)}.policy-preview{margin-top:12px;padding:11px 12px;border-left:3px solid var(--blue);border-radius:5px;background:rgba(8,119,255,.08);color:var(--muted);font-size:12px;line-height:1.65}.policy-summary{min-width:190px;font-size:12px;line-height:1.55}.policy-summary-row{display:flex;justify-content:space-between;gap:10px}.policy-summary-row span:first-child{color:var(--muted)}.quota-progress{height:5px;margin:5px 0 4px;overflow:hidden;border-radius:4px;background:var(--line-soft)}.quota-progress i{display:block;height:100%;border-radius:inherit;background:var(--traffic-line)}.quota-progress.exhausted i{background:var(--danger)}.policy-badge{display:inline-flex;align-items:center;gap:5px;padding:4px 8px;border-radius:999px;background:rgba(29,219,120,.14);color:#58e69d;font-size:12px;font-weight:700;white-space:nowrap}.policy-badge.manual_off{background:rgba(142,150,163,.14);color:var(--muted)}.policy-badge.quota_exhausted{background:rgba(255,159,26,.16);color:#ffae43}.policy-badge.expired{background:rgba(255,90,102,.16);color:#ff8791}.policy-badge i{width:6px;height:6px;border-radius:50%;background:currentColor}.rule-card .policy-summary{min-width:0;margin-top:10px;padding-top:10px;border-top:1px solid var(--line-soft)}
 @media(min-width:761px){.page-with-fabs{padding-bottom:0}.page-with-fabs>.fab-stack{position:static;flex-direction:row;align-items:center;justify-content:flex-end;margin-bottom:14px}.table th,.table td{text-align:center;vertical-align:middle}.table td.actions{justify-content:center}}
 @media(max-width:1100px) and (min-width:761px){.cards{grid-template-columns:repeat(2,minmax(160px,1fr))}}
 @media(max-width:760px){
@@ -1906,6 +2372,7 @@ body{font-size:14px;overflow-x:hidden}.app{display:block;min-height:100dvh}.side
 .sort-strip,.sort-strip.grid-sort{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.sort-strip-label{grid-column:1/-1}.sort-strip button{min-height:36px}
 .chart-svg{height:auto}.chart-label{font-size:11px}.chart-axis-title{font-size:12px}
 .update-section{padding:14px}.update-section-head{display:grid;grid-template-columns:1fr;gap:14px}.update-section-head button{width:100%;min-height:44px}.update-dialog{width:calc(100vw - 24px)}.update-dialog .dialog-actions{position:static;margin:18px 0 0;padding:0;border:0;background:transparent}.update-dialog .dialog-actions button{width:100%}
+.policy-section{padding:13px;margin-top:14px}.policy-summary{min-width:0}.policy-summary-row{gap:8px}.policy-toggle{min-height:46px}.rule-card .policy-badge{margin-top:4px}
 }
 </style></head><body><div id="root"></div><script>
 const appRoot=document.getElementById('root');
@@ -1924,7 +2391,7 @@ function clearModalError(scope){let box=modalErrorBox(scope);if(box){box.textCon
 function expireSession(){localStorage.removeItem('nft_manager_token');state.data=null;if(state.dashboardPollTimer)clearInterval(state.dashboardPollTimer);if(state.bandwidthLiveTimer)clearInterval(state.bandwidthLiveTimer);if(state.ruleRateTimer)clearInterval(state.ruleRateTimer);if(state.updateTimer)clearTimeout(state.updateTimer);state.dashboardPollTimer=null;state.bandwidthLiveTimer=null;state.ruleRateTimer=null;state.updateTimer=null;state.updateMonitor=false;login()}
 async function runAction(btn,fn){let old=btn?.textContent,scope=btn?.closest?.('.modal');if(btn){btn.disabled=true;btn.textContent='处理中...'}clearModalError(scope);try{await fn()}catch(e){if(e.status===401)expireSession();else setModalError(msg(e),scope)}finally{if(btn){btn.disabled=false;btn.textContent=old}}}
 function loading(){appRoot.innerHTML=`<div class=login><form><h2>${esc(state.publicTitle)}</h2><p class=muted>正在加载...</p></form></div>`}
-function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>${esc(state.publicTitle)}</h2><p class=muted>默认账号 admin / admin</p><input name=u value=admin placeholder=账号><input name=p type=password value=admin placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
+function login(){appRoot.innerHTML=`<div class=login><form onsubmit="doLogin(event)"><h2>${esc(state.publicTitle)}</h2><p class=muted>请输入管理员账号和密码</p><input name=u autocomplete=username placeholder=账号 autofocus><input name=p type=password autocomplete=current-password placeholder=密码><button class=primary style="width:100%">登录</button></form></div>`}
 async function doLogin(e){e.preventDefault();let btn=e.submitter;let old=btn.textContent;btn.disabled=true;btn.textContent='登录中...';try{let res=await api('/api/login',{method:'POST',body:JSON.stringify({username:e.target.u.value,password:e.target.p.value})});if(res.token)localStorage.setItem('nft_manager_token',res.token);loading();load()}catch(err){toast(msg(err),'error')}finally{btn.disabled=false;btn.textContent=old}}
 async function load(){try{state.data=await api('/api/state');document.title=state.data.settings?.panelTitle||'nft-manager';syncDashboardPoll();render();syncBandwidthLive();syncRuleRates();autoProbeCurrentView();resumeOnlineUpdate()}catch(e){if(e.status===401)expireSession();else appRoot.innerHTML=`<div class=login><form><h2>nft-manager</h2><p class=muted>加载失败</p><p>${msg(e)}</p><button type=button onclick="location.reload()" class=primary style="width:100%">刷新</button></form></div>`}}
 function nav(v){if(state.view!==v)state.autoProbeView='';state.view=v;localStorage.setItem('nft_manager_view',v);render();syncBandwidthLive();syncRuleRates();autoProbeCurrentView();if(v==='dash')pollDashboard()}
@@ -1959,8 +2426,13 @@ function render(){let d=state.data;if(state.view==='dash'){let b=d.bandwidth||{}
 function setRuleView(view){state.ruleView=view;localStorage.setItem('nft_manager_rule_view',view);render()}
 function setTheme(theme){if(!['light','dark','system'].includes(theme))return;state.theme=theme;localStorage.setItem('nft_manager_theme',theme);document.documentElement.dataset.theme=theme;render();toast('显示模式已切换','success')}
 function ruleName(r){return r.alias||`${r.targetAlias||r.ip}:${r.lport}`}
-function ruleSwitch(r){return `<label class=switch title="${r.enabled?'关闭转发':'开启转发'}"><input type=checkbox ${r.enabled?'checked':''} onchange="toggleRule(${r.lport},this.checked)"><span class=slider></span></label>`}
-function ruleActions(r){return `<button onclick='openRule(${JSON.stringify(r)})'>编辑</button><button class=danger onclick="delRules([${r.lport}])">删除</button>`}
+function policyDate(stamp){if(!stamp)return'-';return new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(Number(stamp)*1000)).replaceAll('/','-')}
+function dateInputValue(stamp){if(!stamp)return'';let parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(Number(stamp)*1000)),get=type=>parts.find(x=>x.type===type)?.value||'';return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}`}
+function policyStateText(r,active=ruleIsActive(r)){if(r.policyStatus==='expired')return'已到期';if(r.policyStatus==='quota_exhausted')return'流量已用尽';if(r.policyStatus==='manual_off')return'手动关闭';return active?'活跃':'空闲'}
+function policyBadge(r,active=ruleIsActive(r)){let kind=r.policyStatus==='running'?(active?'running':'manual_off'):r.policyStatus,text=policyStateText(r,active);return `<span class="policy-badge ${kind}"><i></i>${text}</span>`}
+function rulePolicySummary(r){let limited=r.lifetimeMode==='limited',quota=!!r.quotaEnabled,percent=quota&&r.quotaBytes?Math.min(100,Math.max(0,r.periodUsageBytes/r.quotaBytes*100)):0,quotaText=quota?`${fmt(r.periodUsageBytes)} / ${fmt(r.quotaBytes)}`:'不限流量';return `<div class=policy-summary>${quota?`<div class="quota-progress ${r.policyStatus==='quota_exhausted'?'exhausted':''}"><i style="width:${percent}%"></i></div>`:''}<div class=policy-summary-row><span>本期额度</span><b>${quotaText}</b></div><div class=policy-summary-row><span>有效期</span><b>${limited?policyDate(r.expiresAt):'长期'}</b></div>${quota?`<div class=policy-summary-row><span>下次重置</span><b>${policyDate(r.nextResetAt)}</b></div>`:''}</div>`}
+function ruleSwitch(r){let desired=r.desiredEnabled!==false;return `<label class=switch title="${desired?'手动关闭转发':'开启转发'}"><input type=checkbox ${desired?'checked':''} onchange="toggleRule(${r.lport},this.checked)"><span class=slider></span></label>`}
+function ruleActions(r){return `<button onclick='openRule(${JSON.stringify(r)})'>编辑</button>${r.quotaEnabled?`<button onclick="resetRulePeriod(${r.lport})">重置流量</button>`:''}<button class=danger onclick="delRules([${r.lport}])">删除</button>`}
 function listSort(kind){return kind==='rule'?state.ruleSort:state.targetSort}
 function sortStorageKey(kind){return kind==='rule'?'nft_manager_rule_sort':'nft_manager_target_sort'}
 function setListSort(kind,key){let sort=listSort(kind);if(sort.key===key)sort.direction=sort.direction==='asc'?'desc':'asc';else{sort.key=key;sort.direction='asc'}localStorage.setItem(sortStorageKey(kind),JSON.stringify(sort));render()}
@@ -1977,7 +2449,12 @@ function ruleRate(r){return state.ruleRates[ruleKey(r)]||null}
 function ruleIsActive(r){let rate=ruleRate(r);return rate&&typeof rate.active==='boolean'?rate.active:!!r.active}
 function fmtRate(value){return `${fmt(Math.max(0,Math.round(Number(value)||0)))}/s`}
 function liveRateMarkup(r,active=ruleIsActive(r)){if(!r.enabled||!active)return '<span class=muted>-</span>';let rate=ruleRate(r)||{};return `<span class=live-rate><span class=upload title="实时上传速率">↑ ${fmtRate(rate.uploadBps)}</span><span class=download title="实时下载速率">↓ ${fmtRate(rate.downloadBps)}</span></span>`}
-function rulesTable(limit,sourceRules=null){let sortable=!limit&&!sourceRules,rules=(sourceRules||state.data.rules).slice();if(sortable)rules=sortRules(rules);rules=rules.slice(0,limit?8:9999);let controls=sortable?sortStrip('rule',[['upload','上传'],['download','下载'],['total','总计'],['connectivity','连通性']],state.ruleView==='grid'):'';if(sortable&&state.ruleView==='grid'){let cards=rules.map(r=>{let active=ruleIsActive(r);return `<article class="rule-card ${r.enabled?'':'disabled'}"><div class=rule-card-top><h3>${ruleName(r)}</h3>${ruleSwitch(r)}</div><div class=muted>${r.targetAlias||'-'} / ${r.ip}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div><p class="status ${active?'on':''}" data-rule-status="${r.lport}">状态：${r.enabled?(active?'活跃':'空闲'):'已关闭'}</p><div class="live-rate-slot mobile-rate-card" data-rule-rate="${r.lport}">${liveRateMarkup(r,active)}</div>${probePill(state.ruleConnectivity[r.lport],'连通性')}<div class=actions>${ruleActions(r)}</div><div class="live-rate-slot desktop-rate-card" data-rule-rate="${r.lport}">${liveRateMarkup(r,active)}</div></article>`}).join('');return `${controls}<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}let rows=rules.map(r=>{let active=ruleIsActive(r);return `<tr><td data-label="目标主机">${r.targetAlias||'-'}<br><span class=muted>${r.ip}</span></td><td data-label="别名">${ruleName(r)}</td><td data-label="入口">${r.lport}</td><td data-label="出口">${r.dport}</td><td data-label="上传" class="metric upload">${fmt(r.uploadBytes)}</td><td data-label="下载" class="metric download">${fmt(r.downloadBytes)}</td><td data-label="总计" class="metric total">${fmt(r.totalBytes)}</td><td data-label="实时" class="live-rate-slot mobile-rate-cell" data-rule-rate="${r.lport}">${liveRateMarkup(r,active)}</td><td data-label="统计口径">${r.statsMode==='upload'?'上传':r.statsMode==='download'?'下载':'总计'}</td><td data-label="连通性">${probePill(state.ruleConnectivity[r.lport],'连通性')}</td><td data-label="状态" class="status ${active?'on':''}" data-rule-status="${r.lport}">${r.enabled?(active?'活跃':'空闲'):'关闭'}</td><td data-label="操作" class=actions>${ruleSwitch(r)}${ruleActions(r)}</td><td data-label="实时" class="live-rate-slot desktop-rate-cell" data-rule-rate="${r.lport}">${liveRateMarkup(r,active)}</td></tr>`}).join(''),upload=sortable?sortButton('rule','upload','上传'):'上传',download=sortable?sortButton('rule','download','下载'):'下载',total=sortable?sortButton('rule','total','总计'):'总计',connectivity=sortable?sortButton('rule','connectivity','连通性'):'连通性';return `${controls}<div class=rule-table-wrap><table class=table><thead><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">${upload}</th><th class="metric download">${download}</th><th class="metric total">${total}</th><th>统计口径</th><th>${connectivity}</th><th>状态</th><th>操作</th><th>实时</th></tr></thead><tbody>${rows||'<tr><td colspan=12 class=muted>暂无转发</td></tr>'}</tbody></table></div>`}
+function rulesTable(limit,sourceRules=null){
+ let sortable=!limit&&!sourceRules,rules=(sourceRules||state.data.rules).slice();if(sortable)rules=sortRules(rules);rules=rules.slice(0,limit?8:9999);let controls=sortable?sortStrip('rule',[['upload','上传'],['download','下载'],['total','总计'],['connectivity','连通性']],state.ruleView==='grid'):'';
+ if(sortable&&state.ruleView==='grid'){let cards=rules.map(r=>{let active=ruleIsActive(r);return `<article class="rule-card ${r.enabled?'':'disabled'}"><div class=rule-card-top><h3>${esc(ruleName(r))}</h3>${ruleSwitch(r)}</div><div class=muted>${esc(r.targetAlias||'-')} / ${esc(r.ip)}</div><div class=route>${r.lport} → ${r.dport}</div><div class=metrics><span class="metric upload">上传<br>${fmt(r.uploadBytes)}</span><span class="metric download">下载<br>${fmt(r.downloadBytes)}</span><span class="metric total">总计<br>${fmt(r.totalBytes)}</span></div>${rulePolicySummary(r)}<p data-rule-status="${r.lport}">${policyBadge(r,active)}</p><div class="live-rate-slot mobile-rate-card" data-rule-rate="${r.lport}">${liveRateMarkup(r,active)}</div>${probePill(state.ruleConnectivity[r.lport],'连通性')}<div class=actions>${ruleActions(r)}</div><div class="live-rate-slot desktop-rate-card" data-rule-rate="${r.lport}">${liveRateMarkup(r,active)}</div></article>`}).join('');return `${controls}<div class=rule-grid>${cards||'<span class=muted>暂无转发</span>'}</div>`}
+ let rows=rules.map(r=>{let active=ruleIsActive(r);return `<tr><td data-label="目标主机">${esc(r.targetAlias||'-')}<br><span class=muted>${esc(r.ip)}</span></td><td data-label="别名">${esc(ruleName(r))}</td><td data-label="入口">${r.lport}</td><td data-label="出口">${r.dport}</td><td data-label="上传" class="metric upload">${fmt(r.uploadBytes)}</td><td data-label="下载" class="metric download">${fmt(r.downloadBytes)}</td><td data-label="总计" class="metric total">${fmt(r.totalBytes)}</td><td data-label="实时" class="live-rate-slot mobile-rate-cell" data-rule-rate="${r.lport}">${liveRateMarkup(r,active)}</td><td data-label="策略">${rulePolicySummary(r)}</td><td data-label="连通性">${probePill(state.ruleConnectivity[r.lport],'连通性')}</td><td data-label="状态" data-rule-status="${r.lport}">${policyBadge(r,active)}</td><td data-label="操作" class=actions>${ruleSwitch(r)}${ruleActions(r)}</td><td data-label="实时" class="live-rate-slot desktop-rate-cell" data-rule-rate="${r.lport}">${liveRateMarkup(r,active)}</td></tr>`}).join(''),upload=sortable?sortButton('rule','upload','上传'):'上传',download=sortable?sortButton('rule','download','下载'):'下载',total=sortable?sortButton('rule','total','总计'):'总计',connectivity=sortable?sortButton('rule','connectivity','连通性'):'连通性';
+ return `${controls}<div class=rule-table-wrap><table class=table><thead><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">${upload}</th><th class="metric download">${download}</th><th class="metric total">${total}</th><th>策略</th><th>${connectivity}</th><th>状态</th><th>操作</th><th>实时</th></tr></thead><tbody>${rows||'<tr><td colspan=12 class=muted>暂无转发</td></tr>'}</tbody></table></div>`
+}
 async function toggleRule(lport,enabled){try{await api('/api/rules/toggle',{method:'POST',body:JSON.stringify({lport,enabled}),timeout:30000});document.querySelector('.target-rules-layer')?.remove();await load()}catch(e){toast(msg(e),'error');await load()}}
 function targetsTable(){let summary={};state.data.rules.forEach(r=>{let s=summary[r.ip]||(summary[r.ip]={count:0,upload:0,download:0,total:0});s.count++;s.upload+=r.uploadBytes||0;s.download+=r.downloadBytes||0;s.total+=r.totalBytes||0});let items=state.data.targets.map(target=>({target,summary:summary[target.ip]||{count:0,upload:0,download:0,total:0}}));items=stableNumericSort(items,state.targetSort,(item,key)=>key==='upload'?item.summary.upload:key==='download'?item.summary.download:key==='total'?item.summary.total:probeSortValue(state.targetLatency[item.target.ip]));let rows=items.map(item=>{let t=item.target,s=item.summary;return `<tr><td data-label="别名">${t.alias}</td><td data-label="IP">${t.ip}</td><td data-label="规则数">${s.count?`<button class=count-button onclick='openTargetRules(${JSON.stringify(t)})'>${s.count}</button>`:'0'}</td><td data-label="上传" class="metric upload">${fmt(s.upload)}</td><td data-label="下载" class="metric download">${fmt(s.download)}</td><td data-label="总计" class="metric total">${fmt(s.total)}</td><td data-label="延迟">${probePill(state.targetLatency[t.ip],'延迟')}</td><td data-label="操作" class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`}).join(''),controls=sortStrip('target',[['upload','上传'],['download','下载'],['total','总计'],['latency','延迟']]),latency=sortButton('target','latency','延迟'),upload=sortButton('target','upload','上传'),download=sortButton('target','download','下载'),total=sortButton('target','total','总计');return `${controls}<div class=rule-table-wrap><table class=table><thead><tr><th>别名</th><th>IP</th><th>规则数</th><th class="metric upload">${upload}</th><th class="metric download">${download}</th><th class="metric total">${total}</th><th>${latency}</th><th>操作</th></tr></thead><tbody>${rows||'<tr><td colspan=8 class=muted>暂无主机</td></tr>'}</tbody></table></div>`}
 function openTargetRules(t){let rules=state.data.rules.filter(r=>r.ip===t.ip),layer=modal(`<h2>${esc(t.alias)} 的转发规则</h2><p class=dialog-copy>${esc(t.ip)}，共 ${rules.length} 条</p>${rulesTable(false,rules)}<div class=dialog-actions style="margin-top:18px"><button class=primary data-close>关闭</button></div>`);layer.classList.add('target-rules-layer');layer.querySelector('.dialog').classList.add('rules-dialog');layer.querySelector('[data-close]').onclick=()=>layer.remove()}
@@ -1996,8 +2473,18 @@ function showInfo(title,text){let layer=modal(`<h2>${title}</h2><p class=dialog-
 function confirmDialog(title,text,action){let layer=modal(`<h2>${title}</h2><p class=dialog-copy>${text}</p><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>确定</button></div>`),cancel=layer.querySelector('[data-cancel]'),confirmBtn=layer.querySelector('[data-confirm]');cancel.addEventListener('click',()=>layer.remove());confirmBtn.addEventListener('click',async()=>{let old=confirmBtn.textContent;confirmBtn.disabled=true;confirmBtn.textContent='处理中...';try{await action();layer.remove()}catch(e){if(e.status===401){layer.remove();expireSession()}else toast(msg(e),'error')}finally{confirmBtn.disabled=false;confirmBtn.textContent=old}})}
 document.addEventListener('keydown',e=>{let layers=document.querySelectorAll('.modal'),layer=layers[layers.length-1];if(!layer)return;if(layer.dataset.locked==='true'){if(e.key==='Escape'||e.key==='Enter')e.preventDefault();return}if(e.key==='Escape'){e.preventDefault();layer.remove();return}if(e.key==='Enter'&&!e.shiftKey&&e.target.tagName!=='TEXTAREA'){let button=layer.querySelector('[data-confirm],button.primary');if(button&&!button.disabled){e.preventDefault();button.click()}}})
 function parsePorts(value){let ports=value.trim().split(/[ ,]+/).filter(Boolean);if(!ports.length)throw new Error('请至少输入一个入口端口');let seen=new Set;for(let port of ports){if(!/^[0-9]+$/.test(port)||Number(port)<1||Number(port)>65535)throw new Error(`端口无效: ${port}；仅支持单个端口，请用空格或英文逗号分隔`);if(seen.has(port))throw new Error(`端口重复: ${port}`);seen.add(port)}return ports}
-function openRule(r=null){state.edit=r;let custom=r&&r.lport!==r.dport,stats=r?.statsMode||'total',opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${t.alias} / ${t.ip}</option>`).join(''),firewallOption=r?'':`<div class=field><label class=firewall-check><input id=openFirewall type=checkbox checked>同时开放此端口</label></div>`;modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${r?.alias||''}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>统计口径</label><select id=statsMode><option value=upload ${stats==='upload'?'selected':''}>上传流量</option><option value=download ${stats==='download'?'selected':''}>下载流量</option><option value=total ${stats==='total'?'selected':''}>上传 + 下载总计</option></select></div><div class=field><label>描述</label><textarea id=desc>${r?.desc||''}</textarea></div>${firewallOption}<div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="saveRule(this)">保存</button></div>`)}
-async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),open=document.getElementById('openFirewall'),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value,openFirewall:open?open.checked:true};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});btn.closest('.modal')?.remove();document.querySelector('.target-rules-layer')?.remove();await load()})}
+function openRule(r=null){
+ state.edit=r;let custom=r&&r.lport!==r.dport,stats=r?.statsMode||'total',limited=r?.lifetimeMode==='limited',quota=!!r?.quotaEnabled,expiryMode=r?'custom':'months',resetMode=r?.resetMode||'anniversary',quotaGb=r?.quotaBytes?(r.quotaBytes/1073741824).toFixed(2).replace(/\.00$/,''):'100',opts=state.data.targets.map(t=>`<option value="${t.ip}" ${r&&r.ip===t.ip?'selected':''}>${esc(t.alias)} / ${esc(t.ip)}</option>`).join(''),firewallOption=r?'':`<div class=field><label class=firewall-check><input id=openFirewall type=checkbox checked>同时开放此端口</label></div>`;
+ let layer=modal(`<h2>${r?'编辑转发':'新增转发'}</h2><div class=grid><div class=field><label>目标主机</label><select id=ip>${opts}</select></div><div class=field><label>转发别名</label><input id=alias value="${esc(r?.alias||'')}"></div></div><div class=field><label>入口端口</label><input id=ports value="${r?.lport||''}" placeholder="例如：80 443,10000"></div><div class=grid><div class=field><label>出口映射</label><select id=mode onchange="document.getElementById('outBox').classList.toggle('hidden',this.value==='same')"><option value=same ${!custom?'selected':''}>与入口端口一致</option><option value=start ${custom?'selected':''}>指定出口起始端口</option></select></div><div class="field ${custom?'':'hidden'}" id=outBox><label>出口起始端口</label><input id=out value="${custom?r.dport:''}" placeholder="多端口将按输入顺序递增"></div></div><div class=field><label>统计口径</label><select id=statsMode><option value=upload ${stats==='upload'?'selected':''}>上传流量</option><option value=download ${stats==='download'?'selected':''}>下载流量</option><option value=total ${stats==='total'?'selected':''}>上传 + 下载总计</option></select></div><div class=field><label>描述</label><textarea id=desc>${esc(r?.desc||'')}</textarea></div>${firewallOption}
+ <section class=policy-section><h3>端口策略</h3><div class=grid><div class=field><label>有效期</label><select id=lifetimeMode onchange="syncPolicyForm()"><option value=permanent ${!limited?'selected':''}>长期有效</option><option value=limited ${limited?'selected':''}>设置有效期</option></select></div><div class="field ${limited?'':'hidden'}" id=expiryModeBox><label>到期计算方式</label><select id=expiryMode onchange="syncPolicyForm()"><option value=months ${expiryMode==='months'?'selected':''}>按月计算</option><option value=custom ${expiryMode==='custom'?'selected':''}>自定义日期</option></select></div></div><div class="grid ${limited?'':'hidden'}" id=expiryFields><div class="field ${expiryMode==='months'?'':'hidden'}" id=durationBox><label>有效月数</label><input id=durationMonths type=number min=1 max=120 step=1 value=1 oninput="syncPolicyForm()"></div><div class="field ${expiryMode==='custom'?'':'hidden'}" id=expiresBox><label>到期时间（北京时间）</label><input id=expiresAt type=datetime-local value="${dateInputValue(r?.expiresAt)}" onchange="syncPolicyForm()"></div></div>
+ <div class=field><label class=policy-toggle><span><b>流量配额</b><br><small class=muted>达到额度后暂停，下个周期自动恢复</small></span><input id=quotaEnabled type=checkbox ${quota?'checked':''} onchange="syncPolicyForm()"></label></div><div id=quotaFields class="${quota?'':'hidden'}"><div class=grid><div class=field><label>每周期额度（GB）</label><input id=quotaGb type=number min=.01 step=.01 value="${quotaGb}" oninput="syncPolicyForm()"></div><div class=field><label>配额统计口径</label><select id=quotaMode onchange="syncPolicyForm()"><option value=total ${r?.quotaMode!=='upload'&&r?.quotaMode!=='download'?'selected':''}>上传 + 下载总计</option><option value=upload ${r?.quotaMode==='upload'?'selected':''}>仅上传</option><option value=download ${r?.quotaMode==='download'?'selected':''}>仅下载</option></select></div></div><div class=grid><div class=field><label>重置方式</label><select id=resetMode onchange="syncPolicyForm()"><option value=anniversary ${resetMode==='anniversary'?'selected':''}>随创建日每月重置</option><option value=custom ${resetMode==='custom'?'selected':''}>自定义下次重置时间</option></select></div><div class="field ${resetMode==='custom'?'':'hidden'}" id=nextResetBox><label>下次重置时间（北京时间）</label><input id=nextResetAt type=datetime-local value="${dateInputValue(r?.nextResetAt)}" onchange="syncPolicyForm()"></div></div>${r&&quota?`<label class=firewall-check><input id=resetPeriodNow type=checkbox>保存后立即开始新周期，并将本周期用量归零</label>`:''}</div><div class=policy-preview id=policyPreview></div></section>
+ <div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="saveRule(this)">保存</button></div>`);syncPolicyForm(layer)
+}
+function previewMonthDate(months){let d=new Date;d.setMonth(d.getMonth()+Number(months||0));return new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(d).replaceAll('/','-')}
+function syncPolicyForm(scope=document){let lifetime=scope.querySelector('#lifetimeMode')?.value||'permanent',limited=lifetime==='limited',expiry=scope.querySelector('#expiryMode')?.value||'months',quota=!!scope.querySelector('#quotaEnabled')?.checked,reset=scope.querySelector('#resetMode')?.value||'anniversary';scope.querySelector('#expiryModeBox')?.classList.toggle('hidden',!limited);scope.querySelector('#expiryFields')?.classList.toggle('hidden',!limited);scope.querySelector('#durationBox')?.classList.toggle('hidden',!limited||expiry!=='months');scope.querySelector('#expiresBox')?.classList.toggle('hidden',!limited||expiry!=='custom');scope.querySelector('#quotaFields')?.classList.toggle('hidden',!quota);scope.querySelector('#nextResetBox')?.classList.toggle('hidden',!quota||reset!=='custom');let preview=scope.querySelector('#policyPreview');if(!preview)return;let expiryText=!limited?'长期有效':expiry==='months'?`${scope.querySelector('#durationMonths')?.value||1} 个月，预计 ${previewMonthDate(scope.querySelector('#durationMonths')?.value||1)} 到期`:`${scope.querySelector('#expiresAt')?.value||'未选择'} 到期`,quotaText=!quota?'不限流量':`每周期 ${scope.querySelector('#quotaGb')?.value||0} GB（${scope.querySelector('#quotaMode')?.selectedOptions?.[0]?.textContent||'总计'}），${reset==='anniversary'?'每月按创建时间重置':scope.querySelector('#nextResetAt')?.value+' 首次重置'}`;preview.textContent=`${expiryText}；${quotaText}。流量用尽会暂停，到下个周期自动恢复；最终到期后不会自动恢复。`}
+function collectRulePolicy(){let lifetimeMode=document.getElementById('lifetimeMode').value,expiryMode=document.getElementById('expiryMode').value,quotaEnabled=document.getElementById('quotaEnabled').checked,body={lifetimeMode,expiryMode,quotaEnabled};if(lifetimeMode==='limited'){if(expiryMode==='months')body.durationMonths=document.getElementById('durationMonths').value;else body.expiresAt=document.getElementById('expiresAt').value}if(quotaEnabled){body.quotaGb=document.getElementById('quotaGb').value;body.quotaMode=document.getElementById('quotaMode').value;body.resetMode=document.getElementById('resetMode').value;if(body.resetMode==='custom')body.nextResetAt=document.getElementById('nextResetAt').value;body.resetPeriodNow=!!document.getElementById('resetPeriodNow')?.checked}return body}
+async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),open=document.getElementById('openFirewall'),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value,openFirewall:open?open.checked:true,...collectRulePolicy()};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});btn.closest('.modal')?.remove();document.querySelector('.target-rules-layer')?.remove();await load()})}
+function resetRulePeriod(lport){confirmDialog('重置本周期流量','确认立即开始新的流量周期？历史累计流量不会清零。',async()=>{await api('/api/rules/reset-period',{method:'POST',body:JSON.stringify({lport}),timeout:30000});await load();toast('本周期流量已重置','success')})}
 function delRules(lports){let layer=modal(`<h2>删除转发</h2><p class=dialog-copy>确认删除该端口转发？</p><label class=firewall-check><input id=closeFirewall type=checkbox checked>删除后同时关闭此端口</label><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>删除</button></div>`);layer.querySelector('[data-cancel]').onclick=()=>layer.remove();layer.querySelector('[data-confirm]').onclick=async e=>{await runAction(e.currentTarget,async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports,closeFirewall:layer.querySelector('#closeFirewall').checked}),timeout:30000});layer.remove();document.querySelector('.target-rules-layer')?.remove();await load()})}}
 function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP</label><input id=tip value="${t?.ip||''}"></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
 async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});btn.closest('.modal')?.remove();await load()})}
@@ -2020,7 +2507,7 @@ async function boot(){try{let publicSettings=await api('/api/public-settings');s
 function mergeBandwidthLive(live){let previous=state.data?.bandwidth||{},history=[...(previous.history||[])];if(live.point){history=history.filter(item=>Number(item.bucketTimestamp??item.timestamp)!==Number(live.point.bucketTimestamp));history.push(live.point);history.sort((a,b)=>Number(a.timestamp)-Number(b.timestamp))}state.data.bandwidth={...previous,...live,history}}
 async function pollBandwidthLive(){if(!state.data||!authToken()||state.view!=='dash'||document.hidden||state.bandwidthLiveBusy)return;state.bandwidthLiveBusy=true;try{let live=await api('/api/bandwidth/live',{timeout:4000});mergeBandwidthLive(live);let download=document.getElementById('bandwidthLiveDownload'),upload=document.getElementById('bandwidthLiveUpload'),networkInterface=document.getElementById('bandwidthLiveInterface'),chart=document.getElementById('bandwidthLiveChart');if(download)download.textContent=`下载 ${fmtBandwidth(live.downloadMbps)}`;if(upload)upload.textContent=`上传 ${fmtBandwidth(live.uploadMbps)}`;if(networkInterface)networkInterface.textContent=live.available?live.interface:'未检测到出口网卡';if(chart)chart.innerHTML=bandwidthChart()}catch(e){if(e.status===401)expireSession()}finally{state.bandwidthLiveBusy=false}}
 function syncBandwidthLive(){let active=!!(state.data&&authToken()&&state.view==='dash'&&!document.hidden);if(!active){if(state.bandwidthLiveTimer)clearInterval(state.bandwidthLiveTimer);state.bandwidthLiveTimer=null;return}if(state.bandwidthLiveTimer)return;pollBandwidthLive();state.bandwidthLiveTimer=setInterval(pollBandwidthLive,1000)}
-function applyRuleRates(payload){state.ruleRates=payload?.rates||{};if(!state.data)return;state.data.rules.forEach(r=>{let rate=ruleRate(r);if(rate&&typeof rate.active==='boolean')r.active=rate.active});document.querySelectorAll('[data-rule-rate]').forEach(node=>{let rule=state.data.rules.find(r=>r.lport===Number(node.dataset.ruleRate));if(rule)node.innerHTML=liveRateMarkup(rule)});document.querySelectorAll('[data-rule-status]').forEach(node=>{let rule=state.data.rules.find(r=>r.lport===Number(node.dataset.ruleStatus));if(!rule)return;let active=ruleIsActive(rule);node.classList.toggle('on',active&&rule.enabled);node.textContent=node.tagName==='P'?`状态：${rule.enabled?(active?'活跃':'空闲'):'已关闭'}`:(rule.enabled?(active?'活跃':'空闲'):'关闭')})}
+function applyRuleRates(payload){state.ruleRates=payload?.rates||{};if(!state.data)return;state.data.rules.forEach(r=>{let rate=ruleRate(r);if(rate&&typeof rate.active==='boolean')r.active=rate.active});document.querySelectorAll('[data-rule-rate]').forEach(node=>{let rule=state.data.rules.find(r=>r.lport===Number(node.dataset.ruleRate));if(rule)node.innerHTML=liveRateMarkup(rule)});document.querySelectorAll('[data-rule-status]').forEach(node=>{let rule=state.data.rules.find(r=>r.lport===Number(node.dataset.ruleStatus));if(rule)node.innerHTML=policyBadge(rule,ruleIsActive(rule))})}
 async function pollRuleRates(){if(!state.data||!authToken()||!['dash','rules'].includes(state.view)||document.hidden||state.ruleRateBusy)return;state.ruleRateBusy=true;try{applyRuleRates(await api('/api/rules/rates',{timeout:4000}))}catch(e){if(e.status===401)expireSession()}finally{state.ruleRateBusy=false}}
 function syncRuleRates(){let active=!!(state.data&&authToken()&&['dash','rules'].includes(state.view)&&!document.hidden);if(!active){if(state.ruleRateTimer)clearInterval(state.ruleRateTimer);state.ruleRateTimer=null;return}if(state.ruleRateTimer)return;pollRuleRates();state.ruleRateTimer=setInterval(pollRuleRates,1000)}
 async function pollDashboard(){if(!state.data||!authToken()||state.view!=='dash'||document.hidden||state.dashboardPollBusy)return;state.dashboardPollBusy=true;try{await load()}finally{state.dashboardPollBusy=false}}
@@ -2183,6 +2670,8 @@ class Handler(BaseHTTPRequestHandler):
                 delete_rules(data)
             elif path == "/api/rules/toggle":
                 toggle_rule(data)
+            elif path == "/api/rules/reset-period":
+                reset_rule_period(data)
             elif path == "/api/rules/connectivity":
                 self.send_json({"results": rule_connectivity_checks(data.get("lport"))})
                 return
@@ -2211,7 +2700,8 @@ def traffic_sampler_loop():
         ticks += 1
         if ticks % max(1, RULE_COUNTER_SAMPLE_INTERVAL // BANDWIDTH_SAMPLE_INTERVAL) == 0:
             try:
-                nft_counters()
+                counters, _ = nft_counters()
+                enforce_rule_policies(counters=counters)
             except Exception:
                 pass
 
@@ -2279,7 +2769,8 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"nft-manager: 防火墙初始化失败，Web 面板继续启动：{e}")
     try:
-        nft_counters()
+        counters, _ = nft_counters()
+        enforce_rule_policies(counters=counters)
     except Exception as e:
         print(f"nft-manager: 流量统计初始化失败，Web 面板继续启动：{e}")
     try:

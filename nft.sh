@@ -5,8 +5,8 @@
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.39"
-WEB_PANEL_VERSION="3.39"
+SCRIPT_VERSION="3.40"
+WEB_PANEL_VERSION="3.40"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -2075,7 +2075,7 @@ do_uninstall_manager() {
     rm -f "${FIREWALL_CONF}" "${FIREWALL_PORTS_FILE}" "${FIREWALL_SSH_PORT_FILE}" 2>/dev/null || true
     rm -f "${UPDATE_URL_FILE}" 2>/dev/null || true
     rm -f "${WEB_AUTH_FILE}" 2>/dev/null || true
-    rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" "${CONF_DIR}/web-bandwidth.db" "${CONF_DIR}/web-bandwidth.db-wal" "${CONF_DIR}/web-bandwidth.db-shm" "${CONF_DIR}/web-settings.json" "${WEB_UPDATE_STATUS_FILE}" "${CONF_DIR}/.web-stats.lock" 2>/dev/null || true
+    rm -f "${CONF_DIR}/web-stats.json" "${CONF_DIR}/web-history.json" "${CONF_DIR}/web-bandwidth.db" "${CONF_DIR}/web-bandwidth.db-wal" "${CONF_DIR}/web-bandwidth.db-shm" "${CONF_DIR}/web-settings.json" "${CONF_DIR}/rule-policies.json" "${WEB_UPDATE_STATUS_FILE}" "${CONF_DIR}/.web-stats.lock" 2>/dev/null || true
     rm -f "${CONF_DIR}"/*.conf.bak.* 2>/dev/null || true
     rm -rf "${CONF_DIR}/backups" 2>/dev/null || true
     rmdir "${CONF_DIR}" 2>/dev/null || true
