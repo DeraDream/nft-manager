@@ -51,7 +51,7 @@ MAX_BATCH_RULES = int(os.environ.get("NFT_MANAGER_MAX_BATCH", "1000"))
 MAX_CONFIG_BYTES = 5 * 1024 * 1024
 MAX_CONFIG_RULES = 10000
 SESSION_MAX_AGE = 86400
-WEB_PANEL_VERSION = "3.44"
+WEB_PANEL_VERSION = "3.45"
 MANAGER_SCRIPT = os.environ.get("NFT_MANAGER_SCRIPT", "/opt/nft-manager/nft.sh")
 FIREWALL_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
@@ -134,8 +134,9 @@ def command_output(value):
 
 
 def nexttrace_route(ip):
-    if not valid_ip(ip):
-        raise ValueError("目标 IP 无效")
+    ip = normalize_host(ip)
+    if not ip:
+        raise ValueError("目标主机格式无效")
     nexttrace = shutil.which("nexttrace")
     if not nexttrace:
         return "未检测到 nexttrace 命令。请在 SSH 菜单选择“更新脚本”，由安装流程自动安装 NextTrace。"
@@ -157,7 +158,7 @@ def nexttrace_route(ip):
 
 
 def ping_target(ip):
-    if not valid_ip(ip):
+    if not valid_host(ip):
         return {"reachable": False, "latency": None}
     try:
         result = run(["ping", "-n", "-c", "1", "-W", "2", ip], timeout=4)
@@ -170,7 +171,7 @@ def ping_target(ip):
 
 
 def tcp_connect_target(ip, port):
-    if not valid_ip(ip) or not valid_port(port):
+    if not valid_host(ip) or not valid_port(port):
         return {"reachable": False, "latency": None}
     started = time.perf_counter()
     try:
@@ -199,8 +200,9 @@ def parallel_probes(items, probe):
 def target_latency_checks(ip=None):
     targets = read_targets()
     if ip is not None:
-        if not valid_ip(ip) or not any(target["ip"] == ip for target in targets):
-            raise ValueError("主机不存在或 IP 无效")
+        ip = normalize_host(ip)
+        if not ip or not any(target["ip"] == ip for target in targets):
+            raise ValueError("主机不存在或格式无效")
         return {ip: ping_target(ip)}
     return parallel_probes({target["ip"]: target["ip"] for target in targets}, ping_target)
 
@@ -736,8 +738,42 @@ def restore_automatic_ssh_port():
 
 
 def valid_ip(ip):
+    if not isinstance(ip, str):
+        return False
     parts = ip.split(".")
     return len(parts) == 4 and all(p.isdigit() and str(int(p)) == p and 0 <= int(p) <= 255 for p in parts)
+
+
+def normalize_host(value):
+    """Return a canonical IPv4 address/domain, or an empty string when invalid."""
+    if not isinstance(value, str):
+        return ""
+    host = value.strip()
+    scheme = re.match(r"(?i)^https?://", host)
+    if scheme:
+        host = host[scheme.end():]
+        if host.endswith("/") and host.count("/") == 1:
+            host = host[:-1]
+    host = host.rstrip(".").lower()
+    if valid_ip(host):
+        return host
+    if not host or len(host) > 253 or "." not in host:
+        return ""
+    labels = host.split(".")
+    if not re.search(r"[a-z]", labels[-1]):
+        return ""
+    if any(
+        not label
+        or len(label) > 63
+        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in labels
+    ):
+        return ""
+    return host
+
+
+def valid_host(value):
+    return bool(normalize_host(value))
 
 
 def valid_port(p):
@@ -1158,8 +1194,8 @@ def read_targets():
         if not line or line.startswith("#"):
             continue
         alias, _, ip = line.partition("|")
-        alias, ip = clean_label(alias), ip.strip()
-        if alias and valid_ip(ip):
+        alias, ip = clean_label(alias), normalize_host(ip)
+        if alias and ip:
             targets.append({"alias": alias, "ip": ip})
     return targets
 
@@ -1199,11 +1235,11 @@ def normalized_config_payload(content):
         if not isinstance(item, dict):
             raise ValueError("配置文件包含无效主机记录")
         alias = clean_label(item.get("alias"))
-        ip = str(item.get("ip", "")).strip()
-        if not alias or not valid_ip(ip):
-            raise ValueError("配置文件包含无效主机别名或 IPv4 地址")
+        ip = normalize_host(str(item.get("ip", "")))
+        if not alias or not ip:
+            raise ValueError("配置文件包含无效主机别名、IP 或域名")
         if ip in target_ips:
-            raise ValueError(f"配置文件中的主机 IP 重复: {ip}")
+            raise ValueError(f"配置文件中的目标主机重复: {ip}")
         target_ips.add(ip)
         targets.append({"alias": alias, "ip": ip})
 
@@ -1223,9 +1259,9 @@ def normalized_config_payload(content):
             raise ValueError("配置文件包含无效端口")
         lport = int(raw_lport)
         dport = int(raw_dport)
-        ip = str(item.get("ip", "")).strip()
-        if not valid_port(lport) or not valid_port(dport) or not valid_ip(ip):
-            raise ValueError("配置文件包含无效入口端口、出口端口或目标 IPv4")
+        ip = normalize_host(str(item.get("ip", "")))
+        if not valid_port(lport) or not valid_port(dport) or not ip:
+            raise ValueError("配置文件包含无效入口端口、出口端口或目标主机")
         if lport in lports:
             raise ValueError(f"配置文件中的入口端口重复: {lport}")
         lports.add(lport)
@@ -1401,7 +1437,8 @@ def parse_rules():
                 lport, ip, dport = int(parts[0]), parts[1], int(parts[2])
             except ValueError:
                 continue
-            if valid_port(lport) and valid_ip(ip) and valid_port(dport):
+            ip = normalize_host(ip)
+            if valid_port(lport) and ip and valid_port(dport):
                 rules.append({
                     "lport": lport,
                     "ip": ip,
@@ -1413,14 +1450,14 @@ def parse_rules():
                 })
                 seen_lports.add(lport)
     for line in text:
-        m = re.search(r"tcp dport (\d+).*dnat to ([0-9.]+):(\d+)", line)
+        m = re.search(r"tcp dport (\d+).*dnat to ([A-Za-z0-9.-]+):(\d+)", line)
         if not m:
             continue
         lport = int(m.group(1))
         if lport in seen_lports:
             continue
-        ip, dport = m.group(2), int(m.group(3))
-        if not (valid_port(lport) and valid_ip(ip) and valid_port(dport)):
+        ip, dport = normalize_host(m.group(2)), int(m.group(3))
+        if not (valid_port(lport) and ip and valid_port(dport)):
             continue
         rules.append({"lport": lport, "ip": ip, "dport": dport, "alias": "", "desc": "", "statsMode": "total", "enabled": True})
         seen_lports.add(lport)
@@ -1432,8 +1469,9 @@ def write_rules_file(path, rules):
     if not valid_ip(lip):
         raise RuntimeError("无法获取有效的本机 IPv4 地址")
     for rule in rules:
-        if not (valid_port(rule.get("lport")) and valid_ip(str(rule.get("ip", ""))) and valid_port(rule.get("dport"))):
-            raise ValueError("转发规则包含无效的端口或 IP，已拒绝写入")
+        rule["ip"] = normalize_host(str(rule.get("ip", "")))
+        if not (valid_port(rule.get("lport")) and rule["ip"] and valid_port(rule.get("dport"))):
+            raise ValueError("转发规则包含无效的端口或目标主机，已拒绝写入")
     with open(path, "w", encoding="utf-8") as f:
         f.write("#!/usr/sbin/nft -f\n\n")
         f.write("# WEB_META|4\n\n")
@@ -2136,9 +2174,9 @@ def parse_port_tokens(tokens):
 
 
 def expand_forward(payload):
-    ip = payload.get("ip", "")
-    if not valid_ip(ip):
-        raise ValueError("目标 IP 无效")
+    ip = normalize_host(payload.get("ip", ""))
+    if not ip:
+        raise ValueError("目标主机必须是有效的 IPv4 地址或域名")
     in_ports = parse_port_tokens(payload.get("ports", []))
     mode = payload.get("mode", "same")
     if mode == "same":
@@ -2467,7 +2505,7 @@ function probeSortValue(result){return result&&result.reachable&&!result.skipped
 function stableNumericSort(items,sort,valueOf){if(!sort.key)return items.slice();let factor=sort.direction==='desc'?-1:1;return items.map((item,index)=>({item,index,value:Number(valueOf(item,sort.key))})).sort((a,b)=>{let av=Number.isFinite(a.value)?a.value:Number.POSITIVE_INFINITY,bv=Number.isFinite(b.value)?b.value:Number.POSITIVE_INFINITY;if(av===bv)return a.index-b.index;return (av<bv?-1:1)*factor}).map(entry=>entry.item)}
 function sortRules(rules){return stableNumericSort(rules,state.ruleSort,(r,key)=>key==='upload'?(r.uploadBytes||0):key==='download'?(r.downloadBytes||0):key==='total'?(r.totalBytes||0):probeSortValue(state.ruleConnectivity[r.lport]))}
 function probePill(result,label,action=''){let stateClass='pending',value='未检测';if(result?.skipped){stateClass='off';value='已关闭'}else if(result&&!result.reachable){stateClass='bad';value='不可达'}else if(result?.reachable){let ms=Number(result.latency||0);stateClass=ms<100?'good':ms<1000?'warn':'slow';value=`${ms.toFixed(ms<10?1:0)} ms`}if(!action&&label==='延迟')action="checkRowProbe(this,'target')";if(!action&&label==='连通性')action="checkRowProbe(this,'rule')";let content=`<i></i>${label}<b>${value}</b>`;return action?`<button type=button class="probe-pill probe-button ${stateClass}" onclick="${action}" title="点击立即检测${label}">${content}</button>`:`<span class="probe-pill ${stateClass}">${content}</span>`}
-function checkRowProbe(btn,kind){let row=btn.closest('tr');if(kind==='target'){let ip=row?.querySelector('[data-label="IP"]')?.textContent.trim();if(ip)checkTargetLatency(btn,false,ip);return}let raw=row?.querySelector('[data-label="入口"]')?.textContent.trim()||btn.closest('.rule-card')?.querySelector('.route')?.textContent.split('→')[0].trim(),lport=Number(raw);if(Number.isInteger(lport)&&lport>=1&&lport<=65535)checkRuleConnectivity(btn,false,lport);else toast('转发端口无效','error')}
+function checkRowProbe(btn,kind){let row=btn.closest('tr');if(kind==='target'){let ip=row?.querySelector('[data-label="IP / 域名"]')?.textContent.trim();if(ip)checkTargetLatency(btn,false,ip);return}let raw=row?.querySelector('[data-label="入口"]')?.textContent.trim()||btn.closest('.rule-card')?.querySelector('.route')?.textContent.split('→')[0].trim(),lport=Number(raw);if(Number.isInteger(lport)&&lport>=1&&lport<=65535)checkRuleConnectivity(btn,false,lport);else toast('转发端口无效','error')}
 function ruleKey(r){return `${r.lport}|${r.ip}|${r.dport}`}
 function ruleRate(r){return state.ruleRates[ruleKey(r)]||null}
 function ruleIsActive(r){let rate=ruleRate(r);return rate&&typeof rate.active==='boolean'?rate.active:!!r.active}
@@ -2484,7 +2522,7 @@ function rulesTable(limit,sourceRules=null){
  return `${controls}<div class=rule-table-wrap><table class=table><thead><tr><th>目标主机</th><th>别名</th><th>入口</th><th>出口</th><th class="metric upload">上传</th><th class="metric download">下载</th><th class="metric total">总计</th><th>策略</th><th>连通性</th><th>状态</th><th>操作</th><th>实时</th></tr></thead><tbody>${rows||'<tr><td colspan=12 class=muted>暂无转发</td></tr>'}</tbody></table></div>`
 }
 async function toggleRule(lport,enabled){try{await api('/api/rules/toggle',{method:'POST',body:JSON.stringify({lport,enabled}),timeout:30000});document.querySelector('.target-rules-layer')?.remove();await load()}catch(e){toast(msg(e),'error');await load()}}
-function targetsTable(){let summary={};state.data.rules.forEach(r=>{let s=summary[r.ip]||(summary[r.ip]={count:0,upload:0,download:0,total:0});s.count++;s.upload+=r.uploadBytes||0;s.download+=r.downloadBytes||0;s.total+=r.totalBytes||0});let items=state.data.targets.map(target=>({target,summary:summary[target.ip]||{count:0,upload:0,download:0,total:0}}));items=stableNumericSort(items,state.targetSort,(item,key)=>key==='upload'?item.summary.upload:key==='download'?item.summary.download:key==='total'?item.summary.total:probeSortValue(state.targetLatency[item.target.ip]));let rows=items.map(item=>{let t=item.target,s=item.summary;return `<tr><td data-label="别名">${t.alias}</td><td data-label="IP">${t.ip}</td><td data-label="规则数">${s.count?`<button class=count-button onclick='openTargetRules(${JSON.stringify(t)})'>${s.count}</button>`:'0'}</td><td data-label="上传" class="metric upload">${fmt(s.upload)}</td><td data-label="下载" class="metric download">${fmt(s.download)}</td><td data-label="总计" class="metric total">${fmt(s.total)}</td><td data-label="延迟">${probePill(state.targetLatency[t.ip],'延迟')}</td><td data-label="操作" class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`}).join(''),controls=sortStrip('target',[['upload','上传'],['download','下载'],['total','总计'],['latency','延迟']]),latency=sortButton('target','latency','延迟'),upload=sortButton('target','upload','上传'),download=sortButton('target','download','下载'),total=sortButton('target','total','总计');return `${controls}<div class=rule-table-wrap><table class=table><thead><tr><th>别名</th><th>IP</th><th>规则数</th><th class="metric upload">${upload}</th><th class="metric download">${download}</th><th class="metric total">${total}</th><th>${latency}</th><th>操作</th></tr></thead><tbody>${rows||'<tr><td colspan=8 class=muted>暂无主机</td></tr>'}</tbody></table></div>`}
+function targetsTable(){let summary={};state.data.rules.forEach(r=>{let s=summary[r.ip]||(summary[r.ip]={count:0,upload:0,download:0,total:0});s.count++;s.upload+=r.uploadBytes||0;s.download+=r.downloadBytes||0;s.total+=r.totalBytes||0});let items=state.data.targets.map(target=>({target,summary:summary[target.ip]||{count:0,upload:0,download:0,total:0}}));items=stableNumericSort(items,state.targetSort,(item,key)=>key==='upload'?item.summary.upload:key==='download'?item.summary.download:key==='total'?item.summary.total:probeSortValue(state.targetLatency[item.target.ip]));let rows=items.map(item=>{let t=item.target,s=item.summary;return `<tr><td data-label="别名">${t.alias}</td><td data-label="IP / 域名">${t.ip}</td><td data-label="规则数">${s.count?`<button class=count-button onclick='openTargetRules(${JSON.stringify(t)})'>${s.count}</button>`:'0'}</td><td data-label="上传" class="metric upload">${fmt(s.upload)}</td><td data-label="下载" class="metric download">${fmt(s.download)}</td><td data-label="总计" class="metric total">${fmt(s.total)}</td><td data-label="延迟">${probePill(state.targetLatency[t.ip],'延迟')}</td><td data-label="操作" class=actions><button onclick='traceTarget(${JSON.stringify(t)})'>NextTrace 路由</button><button onclick='openTarget(${JSON.stringify(t)})'>编辑</button><button class=danger onclick='delTarget(${JSON.stringify(t)})'>删除</button></td></tr>`}).join(''),controls=sortStrip('target',[['upload','上传'],['download','下载'],['total','总计'],['latency','延迟']]),latency=sortButton('target','latency','延迟'),upload=sortButton('target','upload','上传'),download=sortButton('target','download','下载'),total=sortButton('target','total','总计');return `${controls}<div class=rule-table-wrap><table class=table><thead><tr><th>别名</th><th>IP / 域名</th><th>规则数</th><th class="metric upload">${upload}</th><th class="metric download">${download}</th><th class="metric total">${total}</th><th>${latency}</th><th>操作</th></tr></thead><tbody>${rows||'<tr><td colspan=8 class=muted>暂无主机</td></tr>'}</tbody></table></div>`}
 function openTargetRules(t){let rules=state.data.rules.filter(r=>r.ip===t.ip),layer=modal(`<h2>${esc(t.alias)} 的转发规则</h2><p class=dialog-copy>${esc(t.ip)}，共 ${rules.length} 条</p>${rulesTable(false,rules)}<div class=dialog-actions style="margin-top:18px"><button class=primary data-close>关闭</button></div>`);layer.classList.add('target-rules-layer');layer.querySelector('.dialog').classList.add('rules-dialog');layer.querySelector('[data-close]').onclick=()=>layer.remove()}
 function firewallTable(){let ports=state.data.firewall?.ports||[],baseline=state.data.firewall?.baselinePorts||[],rows=ports.map(p=>{let locked=baseline.includes(p.port);return `<tr><td data-label="端口">${p.port}</td><td data-label="协议">${p.protocol}</td><td data-label="来源/说明">${p.label||'-'}</td><td data-label="操作" class=actions>${locked?'<span class=muted>保底端口</span>':`<button class=danger onclick="delFirewall(${p.port},'${p.protocol}')">关闭</button>`}</td></tr>`}).join('');return `<div class=rule-table-wrap><table class=table><thead><tr><th>端口</th><th>协议</th><th>来源/说明</th><th>操作</th></tr></thead><tbody>${rows||'<tr><td colspan=4 class=muted>防火墙尚未初始化</td></tr>'}</tbody></table></div>`}
 function openFirewall(){modal(`<h2>开放端口</h2><div class=grid><div class=field><label>端口</label><input id=fwPort placeholder="例如：8080"></div><div class=field><label>协议</label><select id=fwProtocol><option value=tcp+udp>TCP + UDP</option><option value=tcp>TCP</option><option value=udp>UDP</option></select></div></div><div class=field><label>说明</label><input id=fwLabel value="手动开放"></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="saveFirewall(this)">开放</button></div>`)}
@@ -2514,7 +2552,7 @@ function collectRulePolicy(){let lifetimeMode=document.getElementById('lifetimeM
 async function saveRule(btn){await runAction(btn,async()=>{let mode=document.getElementById('mode').value,out=document.getElementById('out').value.trim(),open=document.getElementById('openFirewall'),body={ip:document.getElementById('ip').value,ports:parsePorts(document.getElementById('ports').value),mode,alias:document.getElementById('alias').value,desc:document.getElementById('desc').value,statsMode:document.getElementById('statsMode').value,openFirewall:open?open.checked:true,...collectRulePolicy()};if(mode==='start')body.outStart=out;if(state.edit){body.oldLport=state.edit.lport;await api('/api/rules/update',{method:'POST',body:JSON.stringify(body),timeout:30000})}else await api('/api/rules/add',{method:'POST',body:JSON.stringify(body),timeout:30000});btn.closest('.modal')?.remove();document.querySelector('.target-rules-layer')?.remove();state.autoProbeView='';state.ruleConnectivity={};await load();if(!['rules','dash'].includes(state.view))await checkRuleConnectivity(null,true)})}
 function resetRulePeriod(lport){confirmDialog('重置本周期流量','确认立即开始新的流量周期？历史累计流量不会清零。',async()=>{await api('/api/rules/reset-period',{method:'POST',body:JSON.stringify({lport}),timeout:30000});await load();toast('本周期流量已重置','success')})}
 function delRules(lports){let layer=modal(`<h2>删除转发</h2><p class=dialog-copy>确认删除该端口转发？</p><label class=firewall-check><input id=closeFirewall type=checkbox checked>删除后同时关闭此端口</label><div class=dialog-actions><button class=ghost data-cancel>取消</button> <button class=primary data-confirm>删除</button></div>`);layer.querySelector('[data-cancel]').onclick=()=>layer.remove();layer.querySelector('[data-confirm]').onclick=async e=>{await runAction(e.currentTarget,async()=>{await api('/api/rules/delete',{method:'POST',body:JSON.stringify({lports,closeFirewall:layer.querySelector('#closeFirewall').checked}),timeout:30000});layer.remove();document.querySelector('.target-rules-layer')?.remove();await load()})}}
-function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP</label><input id=tip value="${t?.ip||''}"></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
+function openTarget(t=null){modal(`<h2>${t?'编辑主机':'新增主机'}</h2><div class=field><label>别名</label><input id=ta value="${t?.alias||''}"></div><div class=field><label>IP 或域名</label><input id=tip value="${t?.ip||''}" placeholder="例如：192.168.1.10 或 node.example.com"></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick='saveTarget(this,${JSON.stringify(t)})'>保存</button></div>`)}
 async function saveTarget(btn,old){await runAction(btn,async()=>{await api('/api/targets/save',{method:'POST',body:JSON.stringify({oldIp:old?.ip,alias:document.getElementById('ta').value,ip:document.getElementById('tip').value})});btn.closest('.modal')?.remove();await load()})}
 function delTarget(t){confirmDialog('删除主机','确认删除该主机？存在转发规则时将阻止删除。',async()=>{await api('/api/targets/delete',{method:'POST',body:JSON.stringify({ip:t.ip}),timeout:30000});await load()})}
 async function savePanelTitle(btn){await runAction(btn,async()=>{await api('/api/settings',{method:'POST',body:JSON.stringify({panelTitle:document.getElementById('panelTitle').value})});await load();toast('顶部标题已保存','success')})}
@@ -2526,7 +2564,7 @@ function showOnlineUpdateProgress(initial={}){document.querySelector('.update-mo
 async function pollOnlineUpdate(layer){if(!layer?.isConnected||!state.updateMonitor)return;try{let status=await api('/api/update/status',{timeout:5000});if(!layer.isConnected)return;applyOnlineUpdateStatus(layer,status);if(status.state==='complete'&&(!status.targetVersion||status.panelVersion===status.targetVersion)){state.updateMonitor=false;state.updateTimer=setTimeout(()=>location.reload(),1100);return}if(status.state==='error'){state.updateMonitor=false;layer.dataset.locked='false';layer.querySelector('.dialog').classList.add('error');return}}catch(e){if(!layer.isConnected)return;applyOnlineUpdateStatus(layer,{state:'running',stage:'restarting',currentVersion:'__WEB_PANEL_VERSION__',targetVersion:'',message:'Web 服务正在重启，等待重新连接...'});if(Date.now()-Number(layer.dataset.started)>10*60*1000){state.updateMonitor=false;layer.dataset.locked='false';layer.querySelector('.dialog').classList.add('error');applyOnlineUpdateStatus(layer,{state:'error',stage:'error',message:'等待 Web 服务恢复超时，请稍后刷新页面检查。'});return}}state.updateTimer=setTimeout(()=>pollOnlineUpdate(layer),1500)}
 async function resumeOnlineUpdate(){if(state.updateMonitor||!authToken())return;try{let status=await api('/api/update/status',{timeout:4000});if(['queued','running'].includes(status.state))showOnlineUpdateProgress(status)}catch(e){}}
 async function exportConfig(btn){await runAction(btn,async()=>{let headers={},token=authToken();if(token)headers.Authorization='Bearer '+token;let response=await fetch('/api/config/export',{credentials:'same-origin',headers});if(!response.ok){let error=await response.json().catch(()=>({}));let e=new Error(error.error||'导出配置失败');e.status=response.status;throw e}let blob=await response.blob(),match=(response.headers.get('Content-Disposition')||'').match(/filename="([^"]+)"/),filename=match?match[1]:'nft-manager-config.nftm',url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=filename;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('配置文件已导出','success')})}
-function openConfigImport(){state.importConfig=null;let layer=modal(`<h2>导入配置</h2><p class=dialog-copy>配置将追加到当前 VPS，现有主机和转发不会被覆盖。</p><input id=configFile type=file accept=".nftm,application/x-nft-manager-config" hidden><div class=drop-zone role=button tabindex=0><div><strong data-drop-title>选择或拖入 .nftm 配置文件</strong><small data-drop-detail>点击打开电脑文件选择器，最大 5 MB</small></div></div><div class=import-summary aria-live=polite><div><span class=muted>文件大小</span><b data-import-size>-</b></div><div><span class=muted>主机 IP</span><b data-import-targets>-</b></div><div><span class=muted>转发规则</span><b data-import-rules>-</b></div><div class=import-note data-import-note></div></div><div class=dialog-actions><button class=ghost data-cancel>取消</button><button class=primary data-confirm disabled>确认导入</button></div>`),input=layer.querySelector('#configFile'),drop=layer.querySelector('.drop-zone');let choose=()=>{input.value='';input.click()};drop.addEventListener('click',choose);drop.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();choose()}});input.addEventListener('change',()=>inspectConfigFile(input.files?.[0],layer));for(let name of ['dragenter','dragover'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.add('dragging')});for(let name of ['dragleave','drop'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.remove('dragging')});drop.addEventListener('drop',e=>inspectConfigFile(e.dataTransfer?.files?.[0],layer));layer.querySelector('[data-cancel]').onclick=()=>{state.importConfig=null;layer.remove()};layer.querySelector('[data-confirm]').onclick=e=>confirmConfigImport(e.currentTarget,layer)}
+function openConfigImport(){state.importConfig=null;let layer=modal(`<h2>导入配置</h2><p class=dialog-copy>配置将追加到当前 VPS，现有主机和转发不会被覆盖。</p><input id=configFile type=file accept=".nftm,application/x-nft-manager-config" hidden><div class=drop-zone role=button tabindex=0><div><strong data-drop-title>选择或拖入 .nftm 配置文件</strong><small data-drop-detail>点击打开电脑文件选择器，最大 5 MB</small></div></div><div class=import-summary aria-live=polite><div><span class=muted>文件大小</span><b data-import-size>-</b></div><div><span class=muted>目标主机</span><b data-import-targets>-</b></div><div><span class=muted>转发规则</span><b data-import-rules>-</b></div><div class=import-note data-import-note></div></div><div class=dialog-actions><button class=ghost data-cancel>取消</button><button class=primary data-confirm disabled>确认导入</button></div>`),input=layer.querySelector('#configFile'),drop=layer.querySelector('.drop-zone');let choose=()=>{input.value='';input.click()};drop.addEventListener('click',choose);drop.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();choose()}});input.addEventListener('change',()=>inspectConfigFile(input.files?.[0],layer));for(let name of ['dragenter','dragover'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.add('dragging')});for(let name of ['dragleave','drop'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.remove('dragging')});drop.addEventListener('drop',e=>inspectConfigFile(e.dataTransfer?.files?.[0],layer));layer.querySelector('[data-cancel]').onclick=()=>{state.importConfig=null;layer.remove()};layer.querySelector('[data-confirm]').onclick=e=>confirmConfigImport(e.currentTarget,layer)}
 async function inspectConfigFile(file,layer){if(!file||!layer?.isConnected)return;clearModalError();state.importConfig=null;let confirm=layer.querySelector('[data-confirm]'),drop=layer.querySelector('.drop-zone'),title=layer.querySelector('[data-drop-title]'),detail=layer.querySelector('[data-drop-detail]'),summary=layer.querySelector('.import-summary');confirm.disabled=true;summary.classList.remove('show');drop.classList.remove('ready');try{if(!file.name.toLowerCase().endsWith('.nftm'))throw new Error('请选择 .nftm 配置文件');if(file.size>5*1024*1024)throw new Error('配置文件不能超过 5 MB');title.textContent=file.name;detail.textContent='正在解析配置...';let content=await file.text(),preview=await api('/api/config/import/preview',{method:'POST',body:JSON.stringify({content}),timeout:15000});if(!layer.isConnected)return;state.importConfig={name:file.name,size:file.size,content,preview};layer.querySelector('[data-import-size]').textContent=fmt(file.size);layer.querySelector('[data-import-targets]').textContent=preview.targetCount;layer.querySelector('[data-import-rules]').textContent=preview.ruleCount;let notes=[`预计新增 ${preview.addTargetCount} 台主机、${preview.addRuleCount} 条转发`];if(preview.skippedRuleCount)notes.push(`${preview.skippedRuleCount} 条入口端口冲突将跳过${preview.skippedPorts?.length?'（'+preview.skippedPorts.join(', ')+'）':''}`);if(preview.renamedHostCount)notes.push(`${preview.renamedHostCount} 个重名主机将自动改名`);layer.querySelector('[data-import-note]').textContent=notes.join('；');summary.classList.add('show');drop.classList.add('ready');detail.textContent='解析完成，确认后才会写入当前 VPS';confirm.disabled=false}catch(e){detail.textContent='文件解析失败，请重新选择';setModalError(msg(e));if(e.status===401){layer.remove();expireSession()}}}
 async function confirmConfigImport(btn,layer){if(!state.importConfig)return;await runAction(btn,async()=>{let result=await api('/api/config/import',{method:'POST',body:JSON.stringify({content:state.importConfig.content}),timeout:60000});state.importConfig=null;layer.remove();await load();let text=`已新增 ${result.addedTargets} 台主机、${result.addedRules} 条转发`;if(result.skippedRules)text+=`，跳过 ${result.skippedRules} 条冲突规则`;toast(text,'success')})}
 function openAccount(){document.querySelector('.user-menu')?.removeAttribute('open');let username=esc(state.data?.username||'admin');modal(`<h2>修改用户名和密码</h2><p class=dialog-copy>修改成功后会退出当前账号，请使用新账号重新登录。</p><div class=field><label>当前密码</label><input id=oldp type=password autocomplete=current-password autofocus></div><div class=field><label>新用户名</label><input id=newu maxlength=32 autocomplete=username value="${username}"></div><div class=field><label>新密码（留空表示不修改）</label><input id=newp type=password minlength=4 autocomplete=new-password></div><div class=field><label>确认新密码</label><input id=confirmp type=password autocomplete=new-password></div><div class=dialog-actions><button class=ghost onclick="this.closest('.modal').remove()">取消</button><button class=primary onclick="saveAccount(this)">保存</button></div>`)}
@@ -2681,12 +2719,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             elif path == "/api/targets/save":
                 targets = read_targets()
-                alias, ip, old = clean_label(data.get("alias")), data.get("ip", ""), data.get("oldIp")
-                if not alias or not valid_ip(ip):
-                    raise ValueError("主机别名或 IP 无效")
+                alias = clean_label(data.get("alias"))
+                ip = normalize_host(data.get("ip", ""))
+                old = normalize_host(data.get("oldIp", ""))
+                if not alias or not ip:
+                    raise ValueError("主机别名无效，或主机不是有效的 IPv4 地址/域名")
                 others = [t for t in targets if t["ip"] != old]
                 if any(t["ip"] == ip for t in others):
-                    raise ValueError("IP 已存在")
+                    raise ValueError("目标主机已存在")
                 if any(t["alias"] == alias for t in others):
                     raise ValueError("别名已存在")
                 write_targets(others + [{"alias": alias, "ip": ip}])

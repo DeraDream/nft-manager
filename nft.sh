@@ -5,8 +5,8 @@
 #
 
 # ============== 常量定义 ==============
-SCRIPT_VERSION="3.44"
-WEB_PANEL_VERSION="3.44"
+SCRIPT_VERSION="3.45"
+WEB_PANEL_VERSION="3.45"
 CONF_DIR="/etc/nftables.d"
 CONF_FILE="${CONF_DIR}/port-forward.conf"
 TARGETS_FILE="${CONF_DIR}/targets.conf"
@@ -135,6 +135,40 @@ validate_ip() {
         fi
     done
     return 0
+}
+
+normalize_host() {
+    local host="$1" had_scheme=0
+    host=$(printf '%s' "$host" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    host="${host,,}"
+    if [[ "$host" == http://* ]]; then
+        host="${host#http://}"
+        had_scheme=1
+    elif [[ "$host" == https://* ]]; then
+        host="${host#https://}"
+        had_scheme=1
+    fi
+    if (( had_scheme )) && [[ "$host" == */ ]] && [[ "${host%/}" != */* ]]; then
+        host="${host%/}"
+    fi
+    host="${host%.}"
+    if validate_ip "$host"; then
+        printf '%s\n' "$host"
+        return 0
+    fi
+    [[ ${#host} -le 253 && "$host" == *.* ]] || return 1
+    local IFS='.' label
+    read -ra labels <<< "$host"
+    [[ "${labels[-1]}" =~ [a-z] ]] || return 1
+    for label in "${labels[@]}"; do
+        [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+        [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+    done
+    printf '%s\n' "$host"
+}
+
+validate_host() {
+    normalize_host "$1" >/dev/null
 }
 
 # ============== 自动获取本机 IP ==============
@@ -565,7 +599,8 @@ load_targets() {
         [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
         IFS='|' read -r alias ip <<< "$line"
         alias=$(clean_label "$alias")
-        if [[ -n "$alias" && "$alias" != "0" ]] && validate_ip "$ip"; then
+        ip=$(normalize_host "$ip" || true)
+        if [[ -n "$alias" && "$alias" != "0" && -n "$ip" ]]; then
             TARGETS+=("${alias}|${ip}")
         fi
     done < "${TARGETS_FILE}"
@@ -645,9 +680,9 @@ choose_or_input_target_ip() {
     if [[ ${#TARGETS[@]} -gt 0 ]]; then
         while true; do
             echo ""
-            echo "请选择目标 IP 来源:"
+            echo "请选择目标主机来源:"
             echo "  1) 从目标主机库选择"
-            echo "  2) 手动输入 IP"
+            echo "  2) 手动输入 IP 或域名"
             read -rp "请选择 [1-2，默认 1]: " choice
             choice="${choice:-1}"
             [[ "$choice" == "1" || "$choice" == "2" ]] && break
@@ -659,7 +694,7 @@ choose_or_input_target_ip() {
 
     if [[ "$choice" == "1" ]]; then
         echo ""
-        printf "\033[1m%-6s %-24s %-16s\033[0m\n" "序号" "别名" "IP"
+        printf "\033[1m%-6s %-24s %-32s\033[0m\n" "序号" "别名" "IP / 域名"
         echo "────────────────────────────────────────────"
         for idx in "${!TARGETS[@]}"; do
             IFS='|' read -r alias ip <<< "${TARGETS[$idx]}"
@@ -681,19 +716,20 @@ choose_or_input_target_ip() {
     fi
 
     while true; do
-        read -rp "请输入目标 IP 地址: " selected_ip
-        if validate_ip "$selected_ip"; then
+        read -rp "请输入目标 IP 或域名: " selected_ip
+        selected_ip=$(normalize_host "$selected_ip" || true)
+        if [[ -n "$selected_ip" ]]; then
             break
         fi
-        err "IP 地址格式无效，请重新输入（如 192.168.1.100，不含前导零）。"
+        err "主机格式无效，请输入 IPv4 或域名（可带 http:// 或 https://）。"
     done
 
     idx=$(find_target_index_by_ip "$selected_ip" || true)
     if [[ -n "$idx" ]]; then
         IFS='|' read -r alias ip <<< "${TARGETS[$idx]}"
-        info "该 IP 已存在于目标主机库: ${alias} (${ip})"
+        info "该目标主机已存在于主机库: ${alias} (${ip})"
     else
-        read -rp "是否将当前 IP 保存到目标主机库？[y/N]: " choice
+        read -rp "是否将当前主机保存到目标主机库？[y/N]: " choice
         if [[ "$choice" =~ ^[Yy]$ ]]; then
             while true; do
                 read -rp "请输入目标主机别名（支持中文，输入 0 或回车取消保存）: " save_alias
@@ -732,7 +768,8 @@ load_rules() {
             [[ "$line" =~ ^[[:space:]]*#[[:space:]]*META_RULE\| ]] || continue
             line="${line#*META_RULE|}"
             IFS='|' read -r lport dip dport alias _group _desc <<< "$line"
-            if validate_port "$lport" && validate_ip "$dip" && validate_port "$dport"; then
+            dip=$(normalize_host "$dip" || true)
+            if validate_port "$lport" && [[ -n "$dip" ]] && validate_port "$dport"; then
                 alias=$(clean_label "$alias")
                 RULES+=("${lport}|${dip}|${dport}|${alias}")
             fi
@@ -743,8 +780,10 @@ load_rules() {
         # 跳过注释行
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         # 只解析 tcp 的 dnat 行（每对 tcp/udp 只记录一次）
-        if [[ "$line" =~ tcp\ dport\ ([0-9]+)\ dnat\ to\ ([0-9.]+):([0-9]+) ]]; then
-            RULES+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}|${BASH_REMATCH[3]}|")
+        if [[ "$line" =~ tcp\ dport\ ([0-9]+)\ dnat\ to\ ([A-Za-z0-9.-]+):([0-9]+) ]]; then
+            local legacy_host
+            legacy_host=$(normalize_host "${BASH_REMATCH[2]}" || true)
+            [[ -n "$legacy_host" ]] && RULES+=("${BASH_REMATCH[1]}|${legacy_host}|${BASH_REMATCH[3]}|")
         fi
     done < "${CONF_FILE}"
 }
@@ -764,8 +803,8 @@ write_conf_file() {
     local rule lport dip dport alias
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport dip dport alias <<< "$rule"
-        if ! validate_port "$lport" || ! validate_ip "$dip" || ! validate_port "$dport"; then
-            err "转发规则包含无效的端口或 IP，已拒绝写入配置。"
+        if ! validate_port "$lport" || ! validate_host "$dip" || ! validate_port "$dport"; then
+            err "转发规则包含无效的端口或目标主机，已拒绝写入配置。"
             return 1
         fi
     done
@@ -2354,7 +2393,7 @@ do_targets_list() {
         return 1
     fi
 
-    printf "\n\033[1m%-6s %-24s %-16s\033[0m\n" "序号" "别名" "IP"
+    printf "\n\033[1m%-6s %-24s %-32s\033[0m\n" "序号" "别名" "IP / 域名"
     echo "────────────────────────────────────────────"
     local idx target alias ip
     for idx in "${!TARGETS[@]}"; do
@@ -2372,17 +2411,18 @@ do_targets_add() {
 
     local ip alias idx alias_idx
     while true; do
-        read -rp "请输入目标 IP 地址: " ip
-        if validate_ip "$ip"; then
+        read -rp "请输入目标 IP 或域名: " ip
+        ip=$(normalize_host "$ip" || true)
+        if [[ -n "$ip" ]]; then
             break
         fi
-        err "IP 地址格式无效，请重新输入。"
+        err "主机格式无效，请输入 IPv4 或域名（可带 http:// 或 https://）。"
     done
 
     idx=$(find_target_index_by_ip "$ip" || true)
     if [[ -n "$idx" ]]; then
         IFS='|' read -r alias _ <<< "${TARGETS[$idx]}"
-        warn "该 IP 已存在: ${alias} (${ip})"
+        warn "该目标主机已存在: ${alias} (${ip})"
         return
     fi
 
@@ -2443,17 +2483,18 @@ do_targets_edit() {
     fi
 
     while true; do
-        read -rp "请输入新 IP [当前: ${old_ip}]: " new_ip
+        read -rp "请输入新 IP 或域名 [当前: ${old_ip}]: " new_ip
         new_ip="${new_ip:-$old_ip}"
-        if validate_ip "$new_ip"; then
+        new_ip=$(normalize_host "$new_ip" || true)
+        if [[ -n "$new_ip" ]]; then
             break
         fi
-        err "IP 地址格式无效，请重新输入。"
+        err "主机格式无效，请输入 IPv4 或域名（可带 http:// 或 https://）。"
     done
     ip_idx=$(find_target_index_by_ip "$new_ip" || true)
     if [[ -n "$ip_idx" && "$ip_idx" != "$edit_idx" ]]; then
         IFS='|' read -r dup_alias dup_ip <<< "${TARGETS[$ip_idx]}"
-        err "IP 已存在: ${dup_alias} (${dup_ip})"
+        err "目标主机已存在: ${dup_alias} (${dup_ip})"
         return
     fi
 
@@ -2461,7 +2502,7 @@ do_targets_edit() {
     if write_targets_file; then
         info "目标主机已修改: ${new_alias} (${new_ip})"
         if [[ "$old_ip" != "$new_ip" ]]; then
-            warn "已有转发规则仍指向旧 IP，如需迁移请删除后重新添加。"
+            warn "已有转发规则仍指向旧主机，如需迁移请删除后重新添加。"
         fi
     else
         err "目标主机保存失败。"
@@ -2628,8 +2669,8 @@ do_add() {
 
     local dip
     choose_or_input_target_ip dip
-    if ! validate_ip "$dip"; then
-        err "目标 IP 为空或无效，已取消添加。"
+    if ! validate_host "$dip"; then
+        err "目标主机为空或无效，已取消添加。"
         return
     fi
 
